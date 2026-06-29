@@ -22,7 +22,7 @@ import ca.uwaterloo.flix.language.dbg.AstPrinter
 import ca.uwaterloo.flix.language.fmt.FormatOptions
 import ca.uwaterloo.flix.language.phase.*
 import ca.uwaterloo.flix.language.phase.jvm.{CodeGen, JvmLoader, JvmWriter}
-import ca.uwaterloo.flix.language.phase.monomorph.Specialization
+import ca.uwaterloo.flix.language.phase.monomorph.{ConstraintCollection, Specialization} // EXPERIMENT
 import ca.uwaterloo.flix.language.phase.optimizer.{LambdaDrop, Optimizer}
 import ca.uwaterloo.flix.language.{CompilationMessage, GenSym}
 import ca.uwaterloo.flix.runtime.CompilationResult
@@ -646,9 +646,27 @@ class Flix {
 
     // Initialize fork-join thread pool.
     initForkJoinPool()
-
     var treeShaker1Ast = TreeShaker1.run(typedAst)
     // Note: Do not null typedAst. It is used later.
+
+    // -------------------------------------------------------------------------
+    // EXPERIMENT: constraint collection prototype — remove this block when done
+    // -------------------------------------------------------------------------
+    locally {
+      println("DEFS:")
+      println(treeShaker1Ast.defs)
+      println("ENUMS:")
+      println(treeShaker1Ast.enums)
+      println("INSTANCES:")
+      println(treeShaker1Ast.instances)
+      val constraints = ConstraintCollection.generate(treeShaker1Ast)
+      println("CONSTRAINTS:")
+      println(constraints)
+      val dotPath = java.nio.file.Paths.get("out/constraints.dot")
+      java.nio.file.Files.writeString(dotPath, ConstraintCollection.toDot(constraints))
+      println(s"Wrote constraint graph to $dotPath")
+    }
+    // -------------------------------------------------------------------------
 
     var monomorpherAst = Specialization.run(typedAst)
     treeShaker1Ast = null // Explicitly null-out such that the memory becomes eligible for GC.
