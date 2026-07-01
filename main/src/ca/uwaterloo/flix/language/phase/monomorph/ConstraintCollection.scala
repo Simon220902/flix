@@ -1,5 +1,5 @@
 /*
- * Copyright 2025 Simon Lykke Andersen
+ * Copyright 2026 Simon Lykke Andersen
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,12 +17,11 @@
 package ca.uwaterloo.flix.language.phase.monomorph
 
 import ca.uwaterloo.flix.api.Flix
-import ca.uwaterloo.flix.language.ast.{Kind, RigidityEnv, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
+import ca.uwaterloo.flix.language.ast.{Kind, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.ast.TypedAst.{Expr, FormalParam, MatchRule, Predicate}
-import ca.uwaterloo.flix.language.ast.shared.RegionScope
-import ca.uwaterloo.flix.util.collection.CofiniteSet
+import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
+import ca.uwaterloo.flix.language.phase.monomorph.Symbols.Defs
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
-import ca.uwaterloo.flix.language.phase.typer.{Progress, TypeReduction2}
 
 
 // TODO: Add general explanation comment.
@@ -64,15 +63,17 @@ object ConstraintCollection {
 
     /**
       * A type constructor applied to symbolic mono-arguments.
+      * `tycon` is itself a MonoArg so higher-kinded type params can appear as the head.
       */
-    case class App(tycon: Type, args: List[MonoArg]) extends MonoArg
+    case class App(tycon: MonoArg, args: List[MonoArg]) extends MonoArg
 
     /**
       * An associated type applied to a symbolic mono-argument.
       * E.g. `Collection.Elm[a]` in a polymorphic context becomes `Assoc(Elm, Param(v, i))`.
       * Resolved to a concrete type by the solver via the EqualityEnv.
+      * `kind` and `loc` are stored so the solver can reconstruct `Type.AssocType` for reduction.
       */
-    case class Assoc(sym: Symbol.AssocTypeSym, arg: MonoArg) extends MonoArg
+    case class Assoc(sym: Symbol.AssocTypeSym, arg: MonoArg, kind: Kind, loc: SourceLocation) extends MonoArg
   }
 
   sealed trait FlowInput
@@ -118,9 +119,15 @@ object ConstraintCollection {
     }.flatten.toSet
 
     val fromInstances = ParOps.parMap(root.instances.values) { inst =>
-      val tparamEnv = inst.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
+      val instTparamEnv = inst.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
       inst.defs.flatMap { instDef =>
-        implicit val ctx: Context = Context(MVar.Def(instDef.sym), tparamEnv, root, flix)
+        // Add spec.tparams that are NOT already covered by inst.tparams (e.g. a, b, ef in
+        // Applicative[Option].ap). Generic instances (e.g. Eq[(a, b)]) duplicate inst.tparams
+        // in spec.tparams, so filtering avoids overwriting the correct instTparam indices.
+        val offset = inst.tparams.length
+        val newSpecTparams = instDef.spec.tparams.filterNot(tp => instTparamEnv.contains(tp.sym))
+        val specTparamEnv = newSpecTparams.zipWithIndex.map { case (tp, j) => tp.sym -> (offset + j) }.toMap
+        implicit val ctx: Context = Context(MVar.Def(instDef.sym), instTparamEnv ++ specTparamEnv, root, flix)
         visitDef(instDef)
       }.toSet
     }.flatten.toSet
@@ -137,7 +144,24 @@ object ConstraintCollection {
       visitStruct(struct)
     }.flatten.toSet
 
-    fromDefs ++ fromEnums ++ fromInstances ++ fromRestrictableEnums ++ fromStructs
+    // Visit default trait implementations (root.sigs with exp.isDefined).
+    // These bodies contain calls to regular defs and need their flows tracked so the solver
+    // can propagate when the sig is dispatched to its default impl.
+    val fromSigs = ParOps.parMap(root.sigs.values.filter(_.exp.isDefined)) { sig =>
+      // The trait's own tparam (e.g. `t` in `Foldable[t]`) is NOT in sig.spec.tparams but IS
+      // a free variable in the default impl body. Include it at index 0 so typeToMonoArg can
+      // represent it as Param(defnSym, 0). Solver tuple layout: [traitType, ...sig-own args].
+      val trt = root.traits(sig.sym.trt)
+      val traitTparam = trt.tparam
+      val allTparams = traitTparam :: sig.spec.tparams
+      val tparamEnv = allTparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
+      val ns = sig.sym.trt.namespace :+ sig.sym.trt.name
+      val defnSym = new Symbol.DefnSym(None, ns, sig.sym.name, sig.sym.loc)
+      implicit val ctx: Context = Context(MVar.Def(defnSym), tparamEnv, root, flix)
+      sig.exp.map(visitExp).getOrElse(Set.empty)
+    }.flatten.toSet
+
+    fromDefs ++ fromEnums ++ fromInstances ++ fromRestrictableEnums ++ fromStructs ++ fromSigs
   }
 
   /**
@@ -198,10 +222,10 @@ object ConstraintCollection {
   // ---- DOT helpers -------------------------------------------------------
 
   private def collectMVars(arg: MonoArg): List[MVar] = arg match {
-    case MonoArg.Const(_)       => Nil
-    case MonoArg.Param(v, _)    => List(v)
-    case MonoArg.App(_, args)   => args.flatMap(collectMVars)
-    case MonoArg.Assoc(_, arg)  => collectMVars(arg)
+    case MonoArg.Const(_)            => Nil
+    case MonoArg.Param(v, _)         => List(v)
+    case MonoArg.App(tc, args)       => collectMVars(tc) ++ args.flatMap(collectMVars)
+    case MonoArg.Assoc(_, arg, _, _) => collectMVars(arg)
   }
 
   private def dotId(mvar: MVar): String = {
@@ -224,10 +248,10 @@ object ConstraintCollection {
   }
 
   private def monoArgLabel(arg: MonoArg): String = arg match {
-    case MonoArg.Const(tpe)     => tpe.toString
-    case MonoArg.Param(v, i)    => s"p(${mvarLabel(v)},$i)"
-    case MonoArg.App(tc, args)  => s"App($tc,${args.map(monoArgLabel).mkString(",")})"
-    case MonoArg.Assoc(sym, a)  => s"Assoc(${sym.name},${monoArgLabel(a)})"
+    case MonoArg.Const(tpe)        => tpe.toString
+    case MonoArg.Param(v, i)       => s"p(${mvarLabel(v)},$i)"
+    case MonoArg.App(tc, args)     => s"App(${monoArgLabel(tc)},${args.map(monoArgLabel).mkString(",")})"
+    case MonoArg.Assoc(sym, a, _, _) => s"Assoc(${sym.name},${monoArgLabel(a)})"
   }
 
   /** Replaces DOT-unsafe characters with underscores in node IDs. */
@@ -244,9 +268,9 @@ object ConstraintCollection {
     * Emits flow constraints for enum type applications occurring in `tpe`.
     */
   private def visitType(tpe: Type)(implicit ctx: Context): Set[Flow] = tpe match {
-    case Type.AssocType(_, arg, _, _) =>
+    case at @ Type.AssocType(_, arg, _, _) =>
       // If the associated type is ground, resolve it and continue; otherwise recurse into arg.
-      if (tpe.typeVars.isEmpty) visitType(reduceAssocType(tpe))
+      if (tpe.typeVars.isEmpty) visitType(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix))
       else visitType(arg)
     case _: Type.BaseType
          | Type.Var(_, _)
@@ -286,10 +310,42 @@ object ConstraintCollection {
   /**
     * Emits flow constraints for the formal parameter types, return type, and body of `defn`.
     */
-  private def visitDef(defn: TypedAst.Def)(implicit ctx: Context): Set[Flow] =
+  private def visitDef(defn: TypedAst.Def)(implicit ctx: Context): Set[Flow] = {
     defn.spec.fparams.flatMap { case FormalParam(_, tpe, _, _, _) => visitType(tpe) }.toSet ++
     visitType(defn.spec.retTpe) ++
-    visitExp(defn.exp)
+    visitExp(defn.exp) ++
+    entryPointHandlerFlows(defn)
+  }
+
+  /**
+    * Emits flow constraints for the default-handler calls that `Lowering.wrapDefWithDefaultHandlers`
+    * synthesizes around entry points (main, `@Test`, `@Export`).
+    *
+    * Mirrors `Lowering.wrapInHandler`: each required default handler is applied in sequence,
+    * instantiated at `(Unit -> retTpe \ ef) -> retTpe \ ((ef - handledEff) + IO)`, where `ef`
+    * starts as `defn.spec.eff` and is threaded through the fold exactly as the lowering does.
+    */
+  private def entryPointHandlerFlows(defn: TypedAst.Def)(implicit ctx: Context): Set[Flow] = {
+    if (!TypedAstOps.isEntryPoint(defn)(ctx.root)) Set.empty
+    else {
+      val loc = defn.spec.eff.loc
+      val defEffects = MonomorphCanon.evalEffect(defn.spec.eff)
+      val requiredHandlers = ctx.root.defaultHandlers.filter(h => defEffects.contains(h.handledSym))
+      var eff = defn.spec.eff
+      requiredHandlers.foldLeft(Set.empty[Flow]) { (acc, handler) =>
+        // Handler signature is `pub def h(f: Unit -> a \ ef): a \ ...` with tparams inferred
+        // in order of first occurrence: [ef, a] (the effect var in the arrow, then the result type).
+        val flow = Flow(
+          FlowInput.FlowArgs(List(typeToMonoArg(eff, loc), typeToMonoArg(defn.spec.retTpe, loc))),
+          MVar.Def(handler.handlerSym)
+        )
+        // Canonicalized to match Lowering.wrapInHandler, which threads the canonical (not raw
+        // formula) effect into the next handler wrap — see canonicalGroundEffect there.
+        eff = MonomorphCanon.canonicalEffect(Type.mkUnion(Type.mkDifference(eff, handler.handledEff, loc), Type.IO, loc))
+        acc + flow
+      }
+    }
+  }
 
   /**
     * Emits flow constraints for all call sites and enum usages in `exp`.
@@ -452,8 +508,19 @@ object ConstraintCollection {
     case Expr.Spawn(exp1, exp2, _, _, _) =>
       visitExp(exp1) ++ visitExp(exp2)
 
-    case Expr.ParYield(frags, exp, _, _, _) =>
-      frags.flatMap(f => visitExp(f.exp)).toSet ++ visitExp(exp)
+    // ParYield: Lowering synthesizes Channel.get, Channel.put, Channel.newChannel calls
+    // for each non-last fragment. Emit flows so the solver pre-populates these.
+    case Expr.ParYield(frags, exp, _, _, loc) =>
+      val chanFlows = frags.init.flatMap { frag =>
+        val elmType = frag.exp.tpe
+        val elmArg = typeToMonoArg(lowerChannelType(elmType), loc)
+        List(
+          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelGet)),
+          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelPut)),
+          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelNew))
+        )
+      }.toSet
+      frags.flatMap(f => visitExp(f.exp)).toSet ++ visitExp(exp) ++ chanFlows
 
     case Expr.InvokeConstructor(_, exps, _, _, _) =>
       exps.flatMap(visitExp).toSet
@@ -483,22 +550,41 @@ object ConstraintCollection {
       constructors.flatMap(c => visitExp(c.exp)).toSet ++
         methods.flatMap(m => visitExp(m.exp)).toSet
 
-    // PRE-LOWERING: NewChannel/GetChannel/PutChannel/SelectChannel must be handled by
-    // pre-lowering. Each node desugars to one or more ApplyDef calls to polymorphic
-    // stdlib defs (ChannelNewTuple, ChannelGet, ChannelPut, ChannelMpmcAdmin,
-    // ChannelSelectFrom, ChannelUnsafeGetAndUnlock). Without pre-lowering those call
-    // sites are invisible here and the corresponding Flow constraints are never emitted.
-    // Until then we only recurse into sub-expressions so nested defs are still captured.
-    case Expr.NewChannel(exp, _, _, _) => visitExp(exp)
+    // Channel nodes: recurse into sub-expressions AND emit flows for the @LoweringTarget
+    // defs that Lowering will synthesize at code-gen time.
+    // GetChannel(<- c) → Channel.get(c): tparam a = element type = tpe
+    case Expr.GetChannel(exp, tpe, _, loc) =>
+      visitExp(exp) + Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(tpe), loc))), MVar.Def(Defs.ChannelGet))
 
-    case Expr.GetChannel(exp, _, _, _) => visitExp(exp)
+    // PutChannel(channel, value) → Channel.put(value, channel): tparam a = exp2.tpe (value type)
+    case Expr.PutChannel(exp1, exp2, _, _, loc) =>
+      visitExp(exp1) ++ visitExp(exp2) +
+        Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(exp2.tpe), loc))), MVar.Def(Defs.ChannelPut))
 
-    case Expr.PutChannel(exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+    // NewChannel → Channel.newChannelTuple(size): tparam a = element type from Mpmc[a, rc]
+    // tpe may be (Mpmc[T, rc], Mpmc[T, rc]) (tuple) or Mpmc[T, rc] (single channel).
+    case Expr.NewChannel(exp, tpe, _, loc) =>
+      val elmType = extractChannelElm(tpe)
+      visitExp(exp) +
+        Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(elmType), loc))), MVar.Def(Defs.ChannelNewTuple))
 
-    case Expr.SelectChannel(rules, default, _, _, _) =>
-      rules.flatMap(r => visitExp(r.chan) ++ visitExp(r.exp)).toSet ++
-        default.map(visitExp).getOrElse(Set.empty)
+    // SelectChannel: Lowering synthesizes, per rule, a Channel.mpmcAdmin call (to build the
+    // admin list passed to the non-parametric Channel.selectFrom) and a Channel.unsafeGetAndUnlock
+    // call (to read the winning channel's value) — NOT Channel.get, which is only for the
+    // simple blocking `<- ch` form (Expr.GetChannel).
+    case Expr.SelectChannel(rules, default, _, _, loc) =>
+      rules.flatMap { r =>
+        val elmType = r.chan.tpe match {
+          case Type.Apply(Type.Apply(_, e, _), _, _) => e  // Mpmc[T, rc] → T
+          case Type.Apply(_, e, _)                    => e  // Sender[T] / Receiver[T] → T
+          case t                                      => t
+        }
+        val elmArg = typeToMonoArg(lowerChannelType(elmType), loc)
+        visitExp(r.chan) ++ visitExp(r.exp) ++ Set(
+          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelMpmcAdmin)),
+          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelUnsafeGetAndUnlock))
+        )
+      }.toSet ++ default.map(visitExp).getOrElse(Set.empty)
 
     // Datalog fixpoint nodes: sub-expressions are traversed so that any defs
     // called inside predicates are captured, but the Box/Unbox/liftN constraints
@@ -548,6 +634,54 @@ object ConstraintCollection {
 
 
   /**
+    * Extracts the element type T for Channel.newChannelTuple.
+    * NewChannel.tpe may be (Sender[T], Receiver[T]) where Sender/Receiver are single-arg aliases,
+    * or (Mpmc[T, rc], Mpmc[T, rc]) where Mpmc is a two-arg type constructor.
+    * In the single-channel case it may be Mpmc[T, rc] or Sender[T].
+    */
+  private def extractChannelElm(tpe: Type): Type = {
+    // Helper: extract T from a single channel type (Sender[T], Receiver[T], or Mpmc[T, rc]).
+    def elmFromChan(chan: Type): Option[Type] = chan match {
+      case Type.Apply(Type.Apply(_, elm, _), _, _) => Some(elm)  // Mpmc[T, rc] → T
+      case Type.Apply(_, elm, _)                   => Some(elm)  // Sender[T] → T
+      case _                                       => None
+    }
+    tpe match {
+      // Tuple: (ChanType1, ChanType2) — extract from first element
+      case Type.Apply(Type.Apply(_, firstChan, _), _, _) =>
+        elmFromChan(firstChan) match {
+          case Some(elm) => elm
+          case None      => tpe  // fallback
+        }
+      case _ => tpe
+    }
+  }
+
+  /**
+    * Rewrites `Sender[t]`/`Receiver[t]` to `Concurrent.Channel.Mpmc[t, IO]`, recursively —
+    * mirrors `Lowering.lowerType`'s Sender/Receiver case.
+    *
+    * Used ONLY when building flows for the `@LoweringTarget` channel defs (`Defs.ChannelGet` /
+    * `ChannelPut` / `ChannelNewTuple`), because `Lowering.mkGetChannel` / `mkPutChannel` /
+    * `mkNewChannel` query `lookupFn` with a type that has already been run through
+    * `Lowering.lowerType`. It must NOT be applied inside `typeToMonoArg` generally: an ordinary
+    * def's own specialization key (e.g. `Channel.send`) is built from `subst(itpe)`, which never
+    * calls `lowerType` and so keeps `Sender`/`Receiver` unexpanded — rewriting those flows too
+    * would corrupt that def's own defTable key instead of fixing the channel-def one.
+    */
+  private[monomorph] def lowerChannelType(tpe: Type): Type = tpe match {
+    case Type.Apply(Type.Cst(TypeConstructor.Sender, loc), elm, _) =>
+      Type.Apply(Type.Apply(Symbols.Types.ChannelMpmc, lowerChannelType(elm), loc), Type.IO, loc)
+    case Type.Apply(Type.Cst(TypeConstructor.Receiver, loc), elm, _) =>
+      Type.Apply(Type.Apply(Symbols.Types.ChannelMpmc, lowerChannelType(elm), loc), Type.IO, loc)
+    case Type.Apply(t1, t2, loc) =>
+      Type.Apply(lowerChannelType(t1), lowerChannelType(t2), loc)
+    case Type.Alias(sym, args, inner, loc) =>
+      Type.Alias(sym, args.map(lowerChannelType), lowerChannelType(inner), loc)
+    case other => other
+  }
+
+  /**
     * Flattens a chain of Type.Apply to find the root type constructor head.
     */
   private def getAppHead(tpe: Type): Type = tpe match {
@@ -593,17 +727,22 @@ object ConstraintCollection {
           // or filtering them out of the flow args.
           MonoArg.Const(tpe)
       }
-    case Type.AssocType(symUse, arg, _, _) =>
+    case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
       // Ground: resolve eagerly. Non-ground: record symbolically for the solver.
-      if (tpe.typeVars.isEmpty) MonoArg.Const(reduceAssocType(tpe))
-      else MonoArg.Assoc(symUse.sym, typeToMonoArg(arg, loc))
+      if (tpe.typeVars.isEmpty) MonoArg.Const(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix))
+      else MonoArg.Assoc(symUse.sym, typeToMonoArg(arg, loc), kind, assocLoc)
+    case Type.Alias(_, _, inner, _) =>
+      typeToMonoArg(inner, loc)
     case Type.Cst(_, _) | _: Type.BaseType =>
       MonoArg.Const(tpe)
     case Type.Apply(_, _, loc) =>
       if (tpe.kind == Kind.Eff && tpe.typeVars.isEmpty)
-        MonoArg.Const(canonicalEffect(tpe))
+        // Guard: effect formulas occasionally contain non-effect constructors (e.g. data types in
+        // complement/union positions). canonicalEffect will throw on those; fall back to Const.
+        try MonoArg.Const(MonomorphCanon.canonicalEffect(tpe))
+        catch { case _: ca.uwaterloo.flix.util.InternalCompilerException => MonoArg.Const(tpe) }
       else
-        MonoArg.App(getAppHead(tpe), getAppArgs(tpe).map(arg => typeToMonoArg(arg, loc)))
+        MonoArg.App(typeToMonoArg(getAppHead(tpe), loc), getAppArgs(tpe).map(arg => typeToMonoArg(arg, loc)))
     case other =>
       MonoArg.Const(other)
   }
@@ -616,44 +755,4 @@ object ConstraintCollection {
       case _ => throw InternalCompilerException(s"ConstraintGen: bad types? ${tpe}", loc)
     }
 
-  /** Reduces a ground associated type to its concrete type via the EqualityEnv. */
-  private def reduceAssocType(assoc: Type)(implicit ctx: Context): Type = {
-    val progress = Progress()
-    val (res, cs) = TypeReduction2.reduce(assoc)(RegionScope.Top, RigidityEnv.empty, progress, ctx.root.eqEnv, ctx.flix)
-    if (cs.nonEmpty) throw InternalCompilerException(s"unexpected constraints: $cs", assoc.loc)
-    if (progress.query()) res
-    else throw InternalCompilerException(s"Could not reduce associated type $assoc", assoc.loc)
-  }
-
-  // TODO: canonicalEffect, evalEffect, and coSetToType are duplicated from Specialization.scala.
-  //       They should be extracted into a shared utility (e.g. MonomorphUtils.scala) since the
-  //       constraint solver will also need to normalize ground effect types after substitution.
-
-  /** Returns the canonical form of the ground effect type `eff`. */
-  private def canonicalEffect(eff: Type): Type =
-    coSetToType(evalEffect(eff), eff.loc)
-
-  /**
-    * Evaluates the ground effect `eff` to a set of effect symbols.
-    *
-    * N.B.: `eff` must be ground (no free type variables).
-    */
-  private def evalEffect(eff: Type): CofiniteSet[Symbol.EffSym] = eff match {
-    case Type.Univ                                                                      => CofiniteSet.universe
-    case Type.Pure                                                                      => CofiniteSet.empty
-    case Type.Cst(TypeConstructor.Effect(sym, _), _)                                    => CofiniteSet.mkSet(sym)
-    case Type.Cst(TypeConstructor.Region(_), _)                                         => CofiniteSet.mkSet(Symbol.IO)
-    case Type.Apply(Type.Cst(TypeConstructor.Complement, _), y, _)                      => CofiniteSet.complement(evalEffect(y))
-    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Union, _), x, _), y, _)         => CofiniteSet.union(evalEffect(x), evalEffect(y))
-    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Intersection, _), x, _), y, _)  => CofiniteSet.intersection(evalEffect(x), evalEffect(y))
-    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Difference, _), x, _), y, _)    => CofiniteSet.difference(evalEffect(x), evalEffect(y))
-    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SymmetricDiff, _), x, _), y, _) => CofiniteSet.xor(evalEffect(x), evalEffect(y))
-    case other => throw InternalCompilerException(s"Unexpected effect $other", other.loc)
-  }
-
-  /** Returns the [[Type]] representation of `set` at `loc`. */
-  private def coSetToType(set: CofiniteSet[Symbol.EffSym], loc: SourceLocation): Type = set match {
-    case CofiniteSet.Set(s)   => Type.mkUnion(s.toList.map(sym => Type.Cst(TypeConstructor.Effect(sym, Kind.Eff), loc)), loc)
-    case CofiniteSet.Compl(s) => Type.mkComplement(Type.mkUnion(s.toList.map(sym => Type.Cst(TypeConstructor.Effect(sym, Kind.Eff), loc)), loc), loc)
-  }
 }
