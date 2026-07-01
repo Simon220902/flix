@@ -240,7 +240,7 @@ object ConstraintCollection {
     s""""$raw""""
   }
 
-  private def mvarLabel(mvar: MVar): String = mvar match {
+  private[monomorph] def mvarLabel(mvar: MVar): String = mvar match {
     case MVar.Def(sym)              => s"Def(${sym.name})"
     case MVar.Enum(sym)             => s"Enum(${sym.name})"
     case MVar.Sig(sym)              => s"Sig(${sym.name})"
