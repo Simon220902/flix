@@ -18,9 +18,9 @@ package ca.uwaterloo.flix.language.phase.monomorph
 
 import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.TypedAst.{Binder, Expr, Instance, StructField}
-import ca.uwaterloo.flix.language.ast.shared.SymUse.{CaseSymUse, DefSymUse, LocalDefSymUse}
+import ca.uwaterloo.flix.language.ast.shared.SymUse.{CaseSymUse, DefSymUse, LocalDefSymUse, StructFieldSymUse}
 import ca.uwaterloo.flix.language.ast.shared.RegionScope
-import ca.uwaterloo.flix.language.ast.{Kind, MonoAst, RigidityEnv, SemanticOp, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
+import ca.uwaterloo.flix.language.ast.{AtomicOp, Kind, MonoAst, RigidityEnv, SemanticOp, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.dbg.AstPrinter.*
 import ca.uwaterloo.flix.language.phase.monomorph.ConstraintSolver.Solution
 import ca.uwaterloo.flix.language.phase.typer.ConstraintSolver2
@@ -45,11 +45,20 @@ object SolutionSpecialization {
     * known upfront from the solver solution.
     *
     * `defTable` maps (original sym, instantiated arrow type) → fresh specialized sym.
+    * `enumTable`/`structTable` map (original sym, ground type-arg tuple) → fresh specialized
+    * sym, mirroring `defTable` — see `lookupCaseSym`/`lookupStructSym` and the `Expr.Tag`/
+    * `StructNew`/`StructGet`/`StructPut`/`Pattern.Tag` cases in `specializeExp`/`specializePat`
+    * that consult them.
     *
     * package-visible (not `private`): `SolutionLowering.scala` (this pipeline's own fork of
     * `Lowering.scala`) needs it as the type its `ctx` implicit is threaded through.
     */
-  private[monomorph] class Context(val defTable: Map[(Symbol.DefnSym, Type), Symbol.DefnSym], val allDefs: Map[Symbol.DefnSym, TypedAst.Def]) {
+  private[monomorph] class Context(
+    val defTable: Map[(Symbol.DefnSym, Type), Symbol.DefnSym],
+    val allDefs: Map[Symbol.DefnSym, TypedAst.Def],
+    val enumTable: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym],
+    val structTable: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym]
+  ) {
     private val specializedDefs: mutable.Map[Symbol.DefnSym, MonoAst.Def] = mutable.Map.empty
 
     def addSpecializedDef(sym: Symbol.DefnSym, defn: MonoAst.Def): Unit =
@@ -86,6 +95,68 @@ object SolutionSpecialization {
           "Extend the constraint generator to cover this call site.", sym.loc)
     }
   }
+
+  /**
+    * Returns the case sym to use for a `Tag`/`Pattern.Tag` whose original case is `caseSym` and
+    * whose ground enum type at this expression/pattern site is `groundEnumTpe`.
+    * - Non-generic enums (`groundEnumTpe` has no type arguments): keep the original case sym —
+    *   there is only one possible instantiation, so nothing was ever entered into `enumTable`
+    *   for it (mirrors `lookupSym`'s "truly non-parametric" case for defs).
+    * - Generic enums: must be in `enumTable` (pre-populated from the solver solution).
+    * - Missing entries: crash with "Solver gap", same failure mode as `lookupSym`.
+    */
+  private def lookupCaseSym(caseSym: Symbol.CaseSym, groundEnumTpe: Type)(implicit ctx: Context): Symbol.CaseSym = {
+    val argTypes = groundEnumTpe.typeArguments
+    ctx.enumTable.get((caseSym.enumSym, argTypes)) match {
+      case Some(freshEnumSym) => new Symbol.CaseSym(freshEnumSym, caseSym.name, caseSym.ordinal, caseSym.loc)
+      case None if argTypes.isEmpty || argTypes.exists(isAnyType) => caseSym
+      case None =>
+        throw InternalCompilerException(
+          s"Solver gap: no enum specialization for ${caseSym.enumSym} at $argTypes. " +
+          "Extend the constraint generator to cover this call site.", caseSym.loc)
+    }
+  }
+
+  /**
+    * True if `tpe` is (or contains) `AnyType` — the defaulted type `MonomorphCanon` assigns to a
+    * stray, otherwise-unconstrained type var (e.g. an unreachable/dead pattern-match arm). A miss
+    * against `enumTable`/`structTable` at such a type isn't a real "Solver gap": the constraint
+    * generator never saw a real value constructed at this type because there isn't one — it's a
+    * typechecking artifact, not code that runs. Keeping the original sym is the same fallback
+    * already used for genuinely non-generic types.
+    */
+  private def isAnyType(tpe: Type): Boolean = tpe match {
+    case Type.Cst(TypeConstructor.AnyType, _) => true
+    case Type.Apply(t1, t2, _) => isAnyType(t1) || isAnyType(t2)
+    case _ => false
+  }
+
+  /**
+    * Returns the struct sym to use for a `StructNew`/`StructGet`/`StructPut` whose original
+    * struct is `sym` and whose ground struct type at this expression site is `groundStructTpe`.
+    * Same "non-generic keeps original / generic must be in `structTable` / miss is a Solver gap"
+    * shape as `lookupCaseSym`.
+    */
+  private def lookupStructSym(sym: Symbol.StructSym, groundStructTpe: Type)(implicit ctx: Context): Symbol.StructSym = {
+    val argTypes = groundStructTpe.typeArguments
+    ctx.structTable.get((sym, argTypes)) match {
+      case Some(freshStructSym) => freshStructSym
+      case None if argTypes.isEmpty || argTypes.exists(isAnyType) => sym
+      case None =>
+        throw InternalCompilerException(
+          s"Solver gap: no struct specialization for $sym at $argTypes. " +
+          "Extend the constraint generator to cover this call site.", groundStructTpe.loc)
+    }
+  }
+
+  /**
+    * Runs `lookup` (a `lookupCaseSym`/`lookupStructSym` call), falling back to `keep` if it
+    * throws — used where a "Solver gap" miss doesn't necessarily mean a real constraint-generator
+    * gap (see `rewriteAtomicOp`'s doc comment for why: post-lowering types don't always match the
+    * pre-lowering keys `enumTable`/`structTable` were built from).
+    */
+  private def tolerant[A](lookup: => A, keep: => A): A =
+    try lookup catch { case _: InternalCompilerException => keep }
 
   // ---- StrictSubstitution (verbatim from Specialization) ----------------------
 
@@ -334,7 +405,11 @@ object SolutionSpecialization {
       Expr.RestrictableChoose(star, specializeExp(exp, env0, subst), rules.map(specializeRestrictableChooseRule(_, env0, subst)), subst(tpe), subst(eff), loc)
 
     case Expr.Tag(symUse, exps, tpe, eff, loc) =>
-      Expr.Tag(symUse, exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
+      // The tag's own result type IS the enum's ground type at this construction site (mirrors
+      // Eraser.specializedCaseSym, which uses the ApplyAtomic's own `t` for the same reason).
+      val t = subst(tpe)
+      val newSym = lookupCaseSym(symUse.sym, t)
+      Expr.Tag(CaseSymUse(newSym, symUse.loc), exps.map(specializeExp(_, env0, subst)), t, subst(eff), loc)
 
     case Expr.RestrictableTag(symUse, exps, tpe, eff, loc) =>
       Expr.RestrictableTag(symUse, exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
@@ -370,13 +445,28 @@ object SolutionSpecialization {
       Expr.ArrayStore(specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), specializeExp(exp3, env0, subst), subst(eff), loc)
 
     case Expr.StructNew(sym, fields0, region0, tpe, eff, loc) =>
-      Expr.StructNew(sym, fields0.map { case (k, v) => (k, specializeExp(v, env0, subst)) }, region0.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
+      // The StructNew's own result type IS the struct's ground type at this construction site.
+      val t = subst(tpe)
+      val newStructSym = lookupStructSym(sym, t)
+      val fields = fields0.map { case (symUse, v) =>
+        val newFieldSym = new Symbol.StructFieldSym(newStructSym, symUse.sym.name, symUse.loc)
+        (StructFieldSymUse(newFieldSym, symUse.loc), specializeExp(v, env0, subst))
+      }
+      Expr.StructNew(newStructSym, fields, region0.map(specializeExp(_, env0, subst)), t, subst(eff), loc)
 
-    case Expr.StructGet(exp, field, tpe, eff, loc) =>
-      Expr.StructGet(specializeExp(exp, env0, subst), field, subst(tpe), subst(eff), loc)
+    case Expr.StructGet(exp, symUse, tpe, eff, loc) =>
+      // Unlike Tag/StructNew (whose own result type IS the enum/struct type), StructGet's own
+      // `tpe` is the FIELD's type — the struct being accessed is `exp`'s type instead.
+      val e = specializeExp(exp, env0, subst)
+      val newStructSym = lookupStructSym(symUse.sym.structSym, subst(exp.tpe))
+      val newFieldSym = new Symbol.StructFieldSym(newStructSym, symUse.sym.name, symUse.loc)
+      Expr.StructGet(e, StructFieldSymUse(newFieldSym, symUse.loc), subst(tpe), subst(eff), loc)
 
-    case Expr.StructPut(exp1, field, exp2, tpe, eff, loc) =>
-      Expr.StructPut(specializeExp(exp1, env0, subst), field, specializeExp(exp2, env0, subst), subst(tpe), subst(eff), loc)
+    case Expr.StructPut(exp1, symUse, exp2, tpe, eff, loc) =>
+      val e1 = specializeExp(exp1, env0, subst)
+      val newStructSym = lookupStructSym(symUse.sym.structSym, subst(exp1.tpe))
+      val newFieldSym = new Symbol.StructFieldSym(newStructSym, symUse.sym.name, symUse.loc)
+      Expr.StructPut(e1, StructFieldSymUse(newFieldSym, symUse.loc), specializeExp(exp2, env0, subst), subst(tpe), subst(eff), loc)
 
     case Expr.VectorLit(exps, tpe, eff, loc) =>
       Expr.VectorLit(exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
@@ -543,7 +633,7 @@ object SolutionSpecialization {
   }
 
   private def specializePats(ps: List[TypedAst.Pattern], env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                             (implicit root: TypedAst.Root, flix: Flix): (List[TypedAst.Pattern], Map[Symbol.VarSym, Symbol.VarSym]) =
+                             (implicit ctx: Context, root: TypedAst.Root, flix: Flix): (List[TypedAst.Pattern], Map[Symbol.VarSym, Symbol.VarSym]) =
     ps.foldRight((Nil: List[TypedAst.Pattern], env0)) {
       case (pat0, (res, env1)) =>
         val (pat, env) = specializePat(pat0, env1, subst)
@@ -598,7 +688,7 @@ object SolutionSpecialization {
   }
 
   private def specializePat(p0: TypedAst.Pattern, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                            (implicit root: TypedAst.Root, flix: Flix): (TypedAst.Pattern, Map[Symbol.VarSym, Symbol.VarSym]) = p0 match {
+                            (implicit ctx: Context, root: TypedAst.Root, flix: Flix): (TypedAst.Pattern, Map[Symbol.VarSym, Symbol.VarSym]) = p0 match {
     case TypedAst.Pattern.Wild(tpe, loc) => (TypedAst.Pattern.Wild(subst(tpe), loc), env0)
 
     case TypedAst.Pattern.Var(bnd, tpe, loc) =>
@@ -609,7 +699,11 @@ object SolutionSpecialization {
 
     case TypedAst.Pattern.Tag(symUse, pats, tpe, loc) =>
       val (ps, env) = specializePats(pats, env0, subst)
-      (TypedAst.Pattern.Tag(symUse, ps, subst(tpe), loc), env)
+      // The pattern's own type IS the scrutinee's enum type (mirrors Eraser.specializedCaseSym,
+      // which uses the scrutinee's `e.tpe` for the same reason).
+      val t = subst(tpe)
+      val newSym = lookupCaseSym(symUse.sym, t)
+      (TypedAst.Pattern.Tag(CaseSymUse(newSym, symUse.loc), ps, t, loc), env)
 
     case TypedAst.Pattern.Tuple(elms, tpe, loc) =>
       val (ps, env) = specializePats(elms.toList, env0, subst)
@@ -703,6 +797,228 @@ object SolutionSpecialization {
       case None        => throw InternalCompilerException(s"Unable to unify: '$tpe1' and '$tpe2'.\nIn '$sym'", tpe1.loc)
     }
 
+  // ---- Enum/struct type rewriting (post-lowering) -----------------------------
+  //
+  // `lookupCaseSym`/`lookupStructSym` (used inside `specializeExp`/`specializePat`, before
+  // lowering) already rewrite the *symbol* on Tag/Is/Untag/StructNew/StructGet/StructPut to the
+  // fresh specialized enum/struct sym. That alone is not enough: every `Type` value elsewhere in
+  // the specialized tree (a `Var`'s type, a `Match`'s scrutinee type, a def's own `functionType`/
+  // `retTpe`, ...) still refers to the *original* enum/struct sym with its *concrete, ground*
+  // type arguments (e.g. `Enum(List, [Int32])`), since `StrictSubstitution.apply` was never
+  // taught about the fresh syms — it just substitutes+canonicalizes, exactly as it always has for
+  // defs (which have no equivalent "symbol vs. type" consistency requirement). A downstream
+  // consistency check (`main/test/.../verifier/TypeVerifier.scala`, run by `RunVerifiers`/
+  // `FlixSuite`) asserts that a `Tag`/`Is`/`Untag`'s case-sym's `enumSym` matches the enum sym
+  // embedded in the surrounding type — confirmed directly from its source (the exact "Mismatched
+  // shape: expected = 'X$Y', found = Enum(X, args)" message) — so once the symbol is specialized,
+  // the type has to be too, everywhere it appears, not just at the Tag/StructNew site itself.
+  //
+  // This is a full post-pass over each already-specialized-and-lowered `MonoAst.Def`, rewriting
+  // every `Type` field via `rewriteEnumStructType`, structurally, wherever it occurs — simplest
+  // correct fix, and lower-risk than trying to thread this through every `subst(tpe)` call inside
+  // `specializeExp` (of which there are around a hundred): those still produce "raw" types keyed
+  // by original sym + concrete args, which is exactly what `lookupCaseSym`/`lookupStructSym`
+  // themselves need to extract `argTypes` from in the first place (rewriting the type *before* that
+  // lookup would make the lookup key already-rewritten and self-defeating).
+
+  /**
+    * Structurally rewrites `tpe`: any `Enum(sym, args)`/`Struct(sym, args)` sub-type whose
+    * `(sym, args)` pair is a key in `ctx.enumTable`/`structTable` becomes `Enum(freshSym, Nil)`/
+    * `Struct(freshSym, Nil)` (fully specialized, no more type arguments); anything else is left
+    * alone except for recursing into its own sub-parts (which may themselves need rewriting,
+    * e.g. `List[Option[Int32]]` needs both `List` and `Option` rewritten if both were specialized).
+    */
+  private def rewriteEnumStructType(tpe: Type)(implicit ctx: Context): Type = tpe match {
+    case Type.Apply(_, _, loc) =>
+      val head = rewriteTypeAppHead(tpe)
+      val args = rewriteTypeAppArgs(tpe)
+      head match {
+        case Type.Cst(TypeConstructor.Enum(sym, _), _) if ctx.enumTable.contains((sym, args)) =>
+          Type.mkEnum(ctx.enumTable((sym, args)), Nil, loc)
+        case Type.Cst(TypeConstructor.Struct(sym, _), _) if ctx.structTable.contains((sym, args)) =>
+          Type.mkStruct(ctx.structTable((sym, args)), Nil, loc)
+        case _ =>
+          args.foldLeft(rewriteEnumStructType(head)) { case (acc, arg) => Type.Apply(acc, rewriteEnumStructType(arg), loc) }
+      }
+    case Type.Alias(sym, args, inner, loc) =>
+      Type.Alias(sym, args.map(rewriteEnumStructType), rewriteEnumStructType(inner), loc)
+    case _ => tpe // Var, Cst (incl. already-nullary Enum/Struct), AssocType, etc. — nothing to rewrite.
+  }
+
+  private def rewriteTypeAppHead(tpe: Type): Type = tpe match {
+    case Type.Apply(t1, _, _) => rewriteTypeAppHead(t1)
+    case t => t
+  }
+
+  private def rewriteTypeAppArgs(tpe: Type): List[Type] = tpe match {
+    case Type.Apply(t1, t2, _) => rewriteTypeAppArgs(t1) :+ t2
+    case _ => Nil
+  }
+
+  private def rewriteDef(defn: MonoAst.Def)(implicit ctx: Context): MonoAst.Def =
+    MonoAst.Def(defn.sym, rewriteSpec(defn.spec), rewriteExpr(defn.exp), defn.loc)
+
+  private def rewriteSpec(spec: MonoAst.Spec)(implicit ctx: Context): MonoAst.Spec =
+    spec.copy(
+      fparams = spec.fparams.map(rewriteFormalParam),
+      functionType = rewriteEnumStructType(spec.functionType),
+      retTpe = rewriteEnumStructType(spec.retTpe),
+      eff = rewriteEnumStructType(spec.eff)
+    )
+
+  private def rewriteFormalParam(fp: MonoAst.FormalParam)(implicit ctx: Context): MonoAst.FormalParam =
+    fp.copy(tpe = rewriteEnumStructType(fp.tpe))
+
+  /**
+    * `Tag`/`StructNew`/`StructGet`/`StructPut` sites built directly by `specializeExp` (from
+    * source `Expr.Tag`/`StructNew`/etc.) already have their symbol rewritten by
+    * `lookupCaseSym`/`lookupStructSym` before lowering. But `SolutionLowering.scala`'s Datalog
+    * desugaring (`mkTag`, struct lowering for `Fixpoint3.Ast.*`) constructs `AtomicOp.Tag`/
+    * `StructNew`/etc. directly as already-lowered `MonoAst`, entirely bypassing `specializeExp` —
+    * those symbols are never touched by the TypedAst-level rewrite. `rewriteEnumStructType` (the
+    * type-level post-pass) rewrites the *type* on these nodes regardless of origin (it's a
+    * structural walk, origin-agnostic), which on its own left such nodes with a rewritten type
+    * but an unrewritten symbol — the reverse of the original type/symbol mismatch, caught by
+    * `TypeVerifier` the same way. Rewriting the symbol here too, using the exact same
+    * `lookupCaseSym`/`lookupStructSym` used at the TypedAst level, closes that gap and is a no-op
+    * (idempotent) on nodes that were already correctly rewritten upstream.
+    *
+    * The lookup can also genuinely miss here for a reason that has nothing to do with a real
+    * "Solver gap": `enumTable`/`structTable` are keyed by *pre-lowering* TypedAst ground types,
+    * but this runs on *post-lowering* MonoAst types — and `SolutionLowering`'s `lowerType`
+    * transforms some type components in ways the key was never built to match (e.g. a struct's
+    * region type parameter becomes an `IO` effect after lowering). When that happens, `resultTpe`
+    * itself is left partially unrewritten by `rewriteEnumStructType` (silently — it has no "miss"
+    * case, it just doesn't rewrite that part), so the symbol should likewise stay exactly as it
+    * already was: if this node's symbol was already correctly specialized upstream (the common
+    * case, since most of these nodes go through `specializeExp` first), leaving it alone is
+    * correct; if it wasn't, leaving it alone keeps it consistent with the equally-unrewritten
+    * type, rather than guessing and risking a new mismatch. Escalating to "Solver gap" here would
+    * conflate this representation mismatch with an actual constraint-generator gap.
+    */
+  private def rewriteAtomicOp(op: AtomicOp, exps: List[MonoAst.Expr], rawResultTpe: Type)(implicit ctx: Context): AtomicOp = {
+    // NB: `lookupCaseSym`/`lookupStructSym` need the *raw* (pre-rewrite) ground type to extract
+    // the original concrete type arguments as a lookup key — passing the already-rewritten type
+    // (whose args are `Nil` once specialized) makes every lookup vacuously hit the "non-generic,
+    // keep original" branch and silently no-op.
+    op match {
+      case AtomicOp.Tag(sym) =>
+        AtomicOp.Tag(tolerant(lookupCaseSym(sym, rawResultTpe), sym))
+      case AtomicOp.StructNew(sym, mutability, fields) =>
+        val newStructSym = tolerant(lookupStructSym(sym, rawResultTpe), sym)
+        AtomicOp.StructNew(newStructSym, mutability, fields.map(f => new Symbol.StructFieldSym(newStructSym, f.name, f.loc)))
+      case AtomicOp.StructGet(sym) =>
+        val newStructSym = tolerant(lookupStructSym(sym.structSym, exps.head.tpe), sym.structSym)
+        AtomicOp.StructGet(new Symbol.StructFieldSym(newStructSym, sym.name, sym.loc))
+      case AtomicOp.StructPut(sym) =>
+        val newStructSym = tolerant(lookupStructSym(sym.structSym, exps.head.tpe), sym.structSym)
+        AtomicOp.StructPut(new Symbol.StructFieldSym(newStructSym, sym.name, sym.loc))
+      case other => other
+    }
+  }
+
+  private def rewriteExpr(exp0: MonoAst.Expr)(implicit ctx: Context): MonoAst.Expr = exp0 match {
+    case MonoAst.Expr.Cst(cst, tpe, loc) => MonoAst.Expr.Cst(cst, rewriteEnumStructType(tpe), loc)
+    case MonoAst.Expr.Var(sym, tpe, loc) => MonoAst.Expr.Var(sym, rewriteEnumStructType(tpe), loc)
+    case MonoAst.Expr.Lambda(fparam, exp, tpe, loc) =>
+      MonoAst.Expr.Lambda(rewriteFormalParam(fparam), rewriteExpr(exp), rewriteEnumStructType(tpe), loc)
+    case MonoAst.Expr.ApplyAtomic(op, exps, tpe, eff, loc) =>
+      MonoAst.Expr.ApplyAtomic(rewriteAtomicOp(op, exps, tpe), exps.map(rewriteExpr), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.ApplyClo(exp1, exp2, tpe, eff, loc) =>
+      MonoAst.Expr.ApplyClo(rewriteExpr(exp1), rewriteExpr(exp2), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.ApplyDef(sym, exps, itpe, tpe, eff, loc) =>
+      MonoAst.Expr.ApplyDef(sym, exps.map(rewriteExpr), rewriteEnumStructType(itpe), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.ApplyLocalDef(sym, exps, tpe, eff, loc) =>
+      MonoAst.Expr.ApplyLocalDef(sym, exps.map(rewriteExpr), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.ApplyOp(sym, exps, tpe, eff, loc) =>
+      MonoAst.Expr.ApplyOp(sym, exps.map(rewriteExpr), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.Let(sym, exp1, exp2, tpe, eff, occur, loc) =>
+      MonoAst.Expr.Let(sym, rewriteExpr(exp1), rewriteExpr(exp2), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), occur, loc)
+    case MonoAst.Expr.LocalDef(sym, fparams, exp1, exp2, tpe, eff, occur, loc) =>
+      MonoAst.Expr.LocalDef(sym, fparams.map(rewriteFormalParam), rewriteExpr(exp1), rewriteExpr(exp2), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), occur, loc)
+    case MonoAst.Expr.Region(sym, regSym, exp, tpe, eff, loc) =>
+      MonoAst.Expr.Region(sym, regSym, rewriteExpr(exp), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.IfThenElse(exp1, exp2, exp3, tpe, eff, loc) =>
+      MonoAst.Expr.IfThenElse(rewriteExpr(exp1), rewriteExpr(exp2), rewriteExpr(exp3), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.Stm(exps, exp, tpe, eff, loc) =>
+      MonoAst.Expr.Stm(exps.map(rewriteExpr), rewriteExpr(exp), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.Discard(exp, eff, loc) =>
+      MonoAst.Expr.Discard(rewriteExpr(exp), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.Match(exp, rules, tpe, eff, loc) =>
+      MonoAst.Expr.Match(rewriteExpr(exp), rules.map(rewriteMatchRule), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.ExtMatch(exp, rules, tpe, eff, loc) =>
+      MonoAst.Expr.ExtMatch(rewriteExpr(exp), rules.map(rewriteExtMatchRule), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.VectorLit(exps, tpe, eff, loc) =>
+      MonoAst.Expr.VectorLit(exps.map(rewriteExpr), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.VectorLoad(exp1, exp2, tpe, eff, loc) =>
+      MonoAst.Expr.VectorLoad(rewriteExpr(exp1), rewriteExpr(exp2), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.VectorLength(exp, loc) =>
+      MonoAst.Expr.VectorLength(rewriteExpr(exp), loc)
+    case MonoAst.Expr.Cast(exp, tpe, eff, loc) =>
+      MonoAst.Expr.Cast(rewriteExpr(exp), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.TryCatch(exp, rules, tpe, eff, loc) =>
+      MonoAst.Expr.TryCatch(rewriteExpr(exp), rules.map(rewriteCatchRule), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.RunWith(exp, effUse, rules, tpe, eff, loc) =>
+      MonoAst.Expr.RunWith(rewriteExpr(exp), effUse, rules.map(rewriteHandlerRule), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
+    case MonoAst.Expr.NewObject(sym, clazz, tpe, eff, constructors, methods, loc) =>
+      MonoAst.Expr.NewObject(sym, clazz, rewriteEnumStructType(tpe), rewriteEnumStructType(eff), constructors.map(rewriteJvmConstructor), methods.map(rewriteJvmMethod), loc)
+  }
+
+  private def rewritePattern(pat0: MonoAst.Pattern)(implicit ctx: Context): MonoAst.Pattern = pat0 match {
+    case MonoAst.Pattern.Wild(tpe, loc) => MonoAst.Pattern.Wild(rewriteEnumStructType(tpe), loc)
+    case MonoAst.Pattern.Var(sym, tpe, occur, loc) => MonoAst.Pattern.Var(sym, rewriteEnumStructType(tpe), occur, loc)
+    case MonoAst.Pattern.Cst(cst, tpe, loc) => MonoAst.Pattern.Cst(cst, rewriteEnumStructType(tpe), loc)
+    case MonoAst.Pattern.Tag(symUse, pats, tpe, loc) =>
+      val newSym = tolerant(lookupCaseSym(symUse.sym, tpe), symUse.sym)
+      MonoAst.Pattern.Tag(symUse.copy(sym = newSym), pats.map(rewritePattern), rewriteEnumStructType(tpe), loc)
+    case MonoAst.Pattern.Tuple(pats, tpe, loc) =>
+      MonoAst.Pattern.Tuple(pats.map(rewritePattern), rewriteEnumStructType(tpe), loc)
+    case MonoAst.Pattern.Record(pats, pat, tpe, loc) =>
+      val ps = pats.map(p => p.copy(pat = rewritePattern(p.pat), tpe = rewriteEnumStructType(p.tpe)))
+      MonoAst.Pattern.Record(ps, rewritePattern(pat), rewriteEnumStructType(tpe), loc)
+  }
+
+  private def rewriteExtPattern(pat0: MonoAst.ExtPattern)(implicit ctx: Context): MonoAst.ExtPattern = pat0 match {
+    case MonoAst.ExtPattern.Default(loc) => MonoAst.ExtPattern.Default(loc)
+    case MonoAst.ExtPattern.Tag(label, pats, loc) => MonoAst.ExtPattern.Tag(label, pats.map(rewriteExtTagPattern), loc)
+  }
+
+  private def rewriteExtTagPattern(pat0: MonoAst.ExtTagPattern)(implicit ctx: Context): MonoAst.ExtTagPattern = pat0 match {
+    case MonoAst.ExtTagPattern.Wild(tpe, loc) => MonoAst.ExtTagPattern.Wild(rewriteEnumStructType(tpe), loc)
+    case MonoAst.ExtTagPattern.Var(sym, tpe, occur, loc) => MonoAst.ExtTagPattern.Var(sym, rewriteEnumStructType(tpe), occur, loc)
+    case MonoAst.ExtTagPattern.Unit(tpe, loc) => MonoAst.ExtTagPattern.Unit(rewriteEnumStructType(tpe), loc)
+  }
+
+  private def rewriteMatchRule(rule: MonoAst.MatchRule)(implicit ctx: Context): MonoAst.MatchRule =
+    MonoAst.MatchRule(rewritePattern(rule.pat), rule.guard.map(rewriteExpr), rewriteExpr(rule.exp))
+
+  private def rewriteExtMatchRule(rule: MonoAst.ExtMatchRule)(implicit ctx: Context): MonoAst.ExtMatchRule =
+    MonoAst.ExtMatchRule(rewriteExtPattern(rule.pat), rewriteExpr(rule.exp), rule.loc)
+
+  private def rewriteCatchRule(rule: MonoAst.CatchRule)(implicit ctx: Context): MonoAst.CatchRule =
+    rule.copy(exp = rewriteExpr(rule.exp))
+
+  private def rewriteHandlerRule(rule: MonoAst.HandlerRule)(implicit ctx: Context): MonoAst.HandlerRule =
+    MonoAst.HandlerRule(rule.op, rule.fparams.map(rewriteFormalParam), rewriteExpr(rule.exp))
+
+  private def rewriteJvmConstructor(c: MonoAst.JvmConstructor)(implicit ctx: Context): MonoAst.JvmConstructor =
+    MonoAst.JvmConstructor(rewriteExpr(c.exp), rewriteEnumStructType(c.retTpe), rewriteEnumStructType(c.eff), c.loc)
+
+  private def rewriteJvmMethod(m: MonoAst.JvmMethod)(implicit ctx: Context): MonoAst.JvmMethod =
+    m.copy(fparams = m.fparams.map(rewriteFormalParam), exp = rewriteExpr(m.exp))
+
+  /**
+    * Effect operations (`MonoAst.Op`, e.g. `Env.getArgs`'s own declared signature) also carry a
+    * `Spec` — same shape as a def's — and, like defs, their embedded types can reference a
+    * specialized enum/struct via a case/handler body elsewhere that HAS gone through
+    * `rewriteDef`. Missing this specifically caused `Sys/Env.flix`'s `Env.getArgs` handler to
+    * disagree with its own operation's declared type (one side rewritten via a def's body, the
+    * effect operation's own signature not) — confirmed via `Test.Exp.Struct.Get.flix`'s
+    * `TypeVerifier` failure citing exactly that mismatch.
+    */
+  private def rewriteEffect(eff: MonoAst.Effect)(implicit ctx: Context): MonoAst.Effect =
+    eff.copy(ops = eff.ops.map(op => op.copy(spec = rewriteSpec(op.spec))))
+
   // ---- run -------------------------------------------------------------------
 
   def run(root: TypedAst.Root, solution: Solution)(implicit flix: Flix): MonoAst.Root = flix.phase("Monomorpher") {
@@ -783,7 +1099,63 @@ object SolutionSpecialization {
     val defTableMap: Map[(Symbol.DefnSym, Type), Symbol.DefnSym] =
       entries.map { case (freshSym, defn, _, it) => (defn.sym, it) -> freshSym }.toMap
 
-    implicit val ctx: Context = new Context(defTableMap, allDefs)
+    // Build enum/struct entries: one per (sym, tuple) pair from the solution, for enums/structs
+    // with a nonempty tparams list (non-generic ones need no specialization at all — see
+    // lookupCaseSym/lookupStructSym's "argTypes.isEmpty" case, which keeps the original sym).
+    // Much simpler than defs' entries above: no instance-tparam-prefix / default-sig-tparam
+    // complexity, just the declaration's own tparams zipped with the solved tuple. Same
+    // speculative-tuple tolerance as defs (drop on InternalCompilerException rather than crash
+    // the whole computation) for consistency, even though it's less likely to matter here (enum
+    // case field types rarely carry trait constraints the way def signatures do).
+    val enumEntries: List[(Symbol.EnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
+      for {
+        (sym, tuples) <- solution.enums.toList
+        enm           <- root.enums.get(sym).toList
+        if enm.tparams.nonEmpty
+        tuple         <- tuples.toList
+        substMap       = enm.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
+        freshSym       = Symbol.freshEnumSym(enm.sym)
+        subst         <- try {
+                           List(StrictSubstitution.mk(Substitution(substMap)))
+                         } catch {
+                           case _: InternalCompilerException => Nil
+                         }
+      } yield {
+        val newCases = enm.cases.map { case (caseSym, TypedAst.Case(_, tpes, sc, cloc)) =>
+          val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, caseSym.ordinal, caseSym.loc)
+          newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
+        }
+        (sym, tuple, freshSym, TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc))
+      }
+
+    val enumTableMap: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym] =
+      enumEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
+
+    val structEntries: List[(Symbol.StructSym, List[Type], Symbol.StructSym, TypedAst.Struct)] =
+      for {
+        (sym, tuples) <- solution.structs.toList
+        struct        <- root.structs.get(sym).toList
+        if struct.tparams.nonEmpty
+        tuple         <- tuples.toList
+        substMap       = struct.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
+        freshSym       = Symbol.freshStructSym(struct.sym)
+        subst         <- try {
+                           List(StrictSubstitution.mk(Substitution(substMap)))
+                         } catch {
+                           case _: InternalCompilerException => Nil
+                         }
+      } yield {
+        val newFields = struct.fields.map { case (fieldSym, TypedAst.StructField(_, tpe, floc)) =>
+          val newFieldSym = new Symbol.StructFieldSym(freshSym, fieldSym.name, fieldSym.loc)
+          newFieldSym -> TypedAst.StructField(newFieldSym, subst(tpe), floc)
+        }
+        (sym, tuple, freshSym, TypedAst.Struct(struct.doc, struct.ann, struct.mod, freshSym, Nil, struct.sc, newFields, struct.loc))
+      }
+
+    val structTableMap: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym] =
+      structEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
+
+    implicit val ctx: Context = new Context(defTableMap, allDefs, enumTableMap, structTableMap)
 
     // Non-parametric defs: those with no spec.tparams AND no instance tparams AND not a
     // default-sig impl (which has trait tparams not in spec.tparams — always goes via entries).
@@ -793,28 +1165,42 @@ object SolutionSpecialization {
       !defaultSigDefs.contains(sym)
     }) {
       case (sym, defn) => flix.profile(defn.sym, defn.loc) {
-        ctx.addSpecializedDef(sym, SolutionLowering.lowerDef(specializeDef(sym, defn, StrictSubstitution.empty)))
+        ctx.addSpecializedDef(sym, rewriteDef(SolutionLowering.lowerDef(specializeDef(sym, defn, StrictSubstitution.empty))))
       }
     }
 
     // Parametric specializations — one parallel pass, no worklist loop.
     ParOps.parMap(entries) { case (freshSym, defn, subst, _) =>
       flix.profile(defn.sym, defn.loc) {
-        ctx.addSpecializedDef(freshSym, SolutionLowering.lowerDef(specializeDef(freshSym, defn, subst)))
+        ctx.addSpecializedDef(freshSym, rewriteDef(SolutionLowering.lowerDef(specializeDef(freshSym, defn, subst))))
       }
     }
 
     val effects = ParOps.parMapValues(root.effects) {
       case TypedAst.Effect(doc, ann, mod, sym, targs, ops0, loc) =>
         val ops = ops0.map(visitEffectOp)
-        SolutionLowering.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc))
+        rewriteEffect(SolutionLowering.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc)))
     }
 
+    // Kept as-is (one polymorphic declaration per original enum/struct), same as before this
+    // feature existed — NOT replaced by the specialized declarations below, added alongside
+    // instead. Two reasons this is additive, not exclusive: (1) some enum/struct constructions
+    // are synthesized directly as MonoAst by SolutionLowering (e.g. the Datalog Fixpoint3.Ast.*
+    // enums built by mkTag), never passing through specializeExp's Expr.Tag/StructNew rewriting
+    // at all — those references still need the original, polymorphic declaration to resolve
+    // against; (2) it costs nothing to keep an unused original declaration around alongside a
+    // specialized one, and doing so is strictly safer than trying to prove it is never needed.
     val enums = ParOps.parMapValues(root.enums) {
       case TypedAst.Enum(doc, ann, mod, sym, tparams0, derives, cases, loc) =>
         val tparams = tparams0.map { case TypedAst.TypeParam(name, sym, loc) => TypedAst.TypeParam(name, sym, loc) }
         SolutionLowering.lowerEnum(TypedAst.Enum(doc, ann, mod, sym, tparams, derives, MapOps.mapValues(cases)(visitEnumCase), loc))
     }
+
+    // One specialized declaration (fresh sym, renamed cases, ground field types, tparams = Nil)
+    // per (sym, tuple) the solver actually found reachable — see enumEntries above and
+    // lookupCaseSym, which is what makes expressions actually reference these fresh syms.
+    val specializedEnums: Map[Symbol.EnumSym, MonoAst.Enum] =
+      ParOps.parMap(enumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SolutionLowering.lowerEnum(newEnum) }.toMap
 
     val restrictableEnums = ParOps.parMapValues(root.restrictableEnums) {
       case TypedAst.RestrictableEnum(doc, ann, mod, sym, index, tparams0, derives, cases, loc) =>
@@ -828,10 +1214,13 @@ object SolutionSpecialization {
         SolutionLowering.lowerStruct(TypedAst.Struct(doc, ann, mod, sym, tparams, sc, MapOps.mapValues(fields)(visitStructField), loc))
     }
 
+    val specializedStructs: Map[Symbol.StructSym, MonoAst.Struct] =
+      ParOps.parMap(structEntries) { case (_, _, freshSym, newStruct) => freshSym -> SolutionLowering.lowerStruct(newStruct) }.toMap
+
     MonoAst.Root(
       ctx.getSpecializedDefs,
-      enums ++ restrictableEnums.map { case (_, v) => v.sym -> v },
-      structs,
+      enums ++ specializedEnums ++ restrictableEnums.map { case (_, v) => v.sym -> v },
+      structs ++ specializedStructs,
       effects,
       root.mainEntryPoint,
       root.entryPoints,

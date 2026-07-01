@@ -286,6 +286,9 @@ object ConstraintCollection {
         case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) =>
           val margs = tpArgs.map(typeToMonoArg(_, loc))
           inner + Flow(FlowInput.FlowArgs(margs), MVar.RestrictableEnum(sym))
+        case Type.Cst(TypeConstructor.Struct(sym, _), _) =>
+          val margs = tpArgs.map(typeToMonoArg(_, loc))
+          inner + Flow(FlowInput.FlowArgs(margs), MVar.Struct(sym))
         case _ => inner
       }
   }
@@ -472,9 +475,14 @@ object ConstraintCollection {
 
     case Expr.VectorLength(exp, _) => visitExp(exp)
 
-    case Expr.StructNew(_, fields, region, _, _, _) =>
+    // StructNew: mirrors Expr.Tag — emits a Flow for the struct's own MVar so a construction
+    // site's concrete type args seed the solver (visitType alone only captures the DECLARATION's
+    // own field-type structure, not where/at-what-types the struct is actually instantiated).
+    case Expr.StructNew(_, fields, region, tpe, _, loc) =>
+      val (mvar, tpArgs) = getEnumMVarAndTypeArgs(tpe, loc)
       fields.flatMap { case (_, e) => visitExp(e) }.toSet ++
-        region.map(visitExp).getOrElse(Set.empty)
+        region.map(visitExp).getOrElse(Set.empty) +
+        Flow(FlowInput.FlowArgs(tpArgs.map(typeToMonoArg(_, loc))), mvar)
 
     case Expr.StructGet(exp, _, _, _, _) => visitExp(exp)
 
@@ -935,11 +943,12 @@ object ConstraintCollection {
       MonoArg.Const(other)
   }
 
-  /** Returns the enum `MVar` and type arguments for a fully-applied enum type. */
+  /** Returns the enum/struct `MVar` and type arguments for a fully-applied enum/struct type. */
   private def getEnumMVarAndTypeArgs(tpe: Type, loc: SourceLocation): (MVar, List[Type]) =
     getAppHead(tpe) match {
       case Type.Cst(TypeConstructor.Enum(sym, _), _)             => (MVar.Enum(sym), getAppArgs(tpe))
       case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => (MVar.RestrictableEnum(sym), getAppArgs(tpe))
+      case Type.Cst(TypeConstructor.Struct(sym, _), _)           => (MVar.Struct(sym), getAppArgs(tpe))
       case _ => throw InternalCompilerException(s"ConstraintGen: bad types? ${tpe}", loc)
     }
 

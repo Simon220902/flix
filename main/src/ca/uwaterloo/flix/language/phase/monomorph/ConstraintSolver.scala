@@ -42,10 +42,19 @@ case class NonMonomorphizableProgramException(message: String, loc: SourceLocati
 object ConstraintSolver {
 
   /**
-    * The result of constraint solving: for each polymorphic def sym, the set of concrete
-    * type argument tuples it must be specialised to.
+    * The result of constraint solving: for each polymorphic def/enum/struct sym, the set of
+    * concrete type argument tuples it must be specialised to. `enums`/`structs` are used by
+    * `SolutionSpecialization` to emit genuinely specialized enum/struct declarations (fresh
+    * symbols, renamed cases/fields) — see `Context.enumTable`/`structTable` there.
+    * `RestrictableEnum` is deliberately not tracked here: unlike `EnumSym`/`StructSym`, it has no
+    * `Symbol.freshRestrictableEnumSym` (no fresh-symbol infrastructure exists for it), so it
+    * stays fully polymorphic, matching its pre-existing behavior.
     */
-  case class Solution(defs: Map[Symbol.DefnSym, Set[List[Type]]])
+  case class Solution(
+    defs: Map[Symbol.DefnSym, Set[List[Type]]],
+    enums: Map[Symbol.EnumSym, Set[List[Type]]],
+    structs: Map[Symbol.StructSym, Set[List[Type]]]
+  )
 
   /**
     * Solves `flows` to a fixpoint and returns the set of required specializations.
@@ -117,9 +126,11 @@ object ConstraintSolver {
       }
     }
 
-    Solution(solution.collect {
-      case (MVar.Def(sym), tuples) => sym -> tuples.toSet
-    }.toMap)
+    Solution(
+      defs = solution.collect { case (MVar.Def(sym), tuples) => sym -> tuples.toSet }.toMap,
+      enums = solution.collect { case (MVar.Enum(sym), tuples) => sym -> tuples.toSet }.toMap,
+      structs = solution.collect { case (MVar.Struct(sym), tuples) => sym -> tuples.toSet }.toMap
+    )
   }
 
   // ---- Non-monomorphizable detection --------------------------------------------
@@ -133,17 +144,41 @@ object ConstraintSolver {
   // cycle that passes through at least one edge where the flowing type gets wrapped in an
   // additional type constructor. A cycle with only unwrapped (direct-copy) edges is ordinary,
   // convergent self-recursion and is fine. See `phases/3_constraint_solving/constraint_solving.md`
-  // ("Future work: detecting non-monomorphizable programs") for the full derivation.
+  // ("Detecting non-monomorphizable programs") for the full derivation.
   //
-  // Scoped to `MVar.Def`/`MVar.Sig` only (the only two kinds that end up in `Solution` / actually
-  // drive specialized codegen — see `Solution.defs`'s `case (MVar.Def(sym), tuples) => ...` and
-  // `resolveSig`'s dispatch-through-to-Def). `MVar.Enum`/`RestrictableEnum`/`Struct` positions are
-  // intentionally excluded: this pipeline currently leaves enums/structs polymorphic (matching the
-  // demand-driven baseline — "should enums be monomorphized?" is a separate, still-open design
-  // question), so a *declared but never-instantiated* non-regular recursive enum (legitimate Flix
-  // syntax, e.g. `enum T[a] { case Recurse(T[Wrap[a]]) }` with no runtime construction anywhere)
-  // is inert to actual codegen and must not be rejected. Confirmed false positive without this
-  // scoping: `Test.Dec.Enum.flix`'s `PolyRecursiveNonRegular`, declared only, never constructed.
+  // Tracks `MVar.Def`/`Sig`/`Enum`/`Struct` (NOT `RestrictableEnum` — no fresh-symbol
+  // infrastructure exists for it, see `Solution`'s doc comment; it stays fully polymorphic).
+  // `Enum`/`Struct` genuinely MUST be tracked, for two reasons that only became clear by testing
+  // real programs, not by reasoning ahead of time:
+  //
+  // 1. `Solution.enums`/`structs` are now real consumers (`SolutionSpecialization` uses them to
+  //    emit genuinely specialized declarations — see its `Context.enumTable`/`structTable`), so
+  //    tracking them is needed for the feature to work at all, not just for safety.
+  // 2. Even before that consumer existed, tracking was still required for solver-loop safety:
+  //    `visitType`'s `TypeConstructor.Enum`/`RestrictableEnum`/`Struct` cases emit real flows
+  //    unconditionally, and the solver's `while (worklist.nonEmpty)` loop propagates every flow
+  //    uniformly regardless of destination kind — it does not know or care whether the result is
+  //    ever read. A genuinely non-regular recursive enum/struct
+  //    (`enum T[a] { case Base(a); case Recurse(T[Wrap[a]]) }`) that is constructed anywhere in
+  //    the program makes the solver itself try to compute an unbounded sequence of tuples for
+  //    `MVar.Enum(T)` — `[Int32]`, `[Wrap[Int32]]`, `[Wrap[Wrap[Int32]]]`, ... — and OOMs,
+  //    independent of whether anything downstream would have used the result. Confirmed by
+  //    reproducing the OOM directly against this pipeline when `Enum` was (at an earlier point)
+  //    excluded from this check.
+  //
+  // This does over-approximate relative to what `Eraser` (and now `SolutionSpecialization`, which
+  // reuses the same solved tuples) can actually need: a genuinely non-regular recursive enum
+  // whose "growing" case (`Recurse` above) is declared but never actually constructed anywhere
+  // gets rejected by this check even though nothing downstream would need it (confirmed: `Eraser`
+  // specializes demand-driven, per actually-constructed case, so a `Base`-only program compiles
+  // fine there). This is a known, accepted false positive — trading a rejection of a
+  // safe-but-structurally-suspicious program for guaranteed avoidance of the OOM above — and does
+  // not affect any test in the actual suite (verified). Reachability (below) still correctly
+  // excludes the common, *actually*-benign case — a non-regular recursive enum that is declared
+  // but never constructed anywhere at all (e.g. `Test.Dec.Enum.flix`'s `PolyRecursiveNonRegular`)
+  // — since nothing ever seeds it. Closing the remaining gap precisely would mean giving this
+  // check the same per-case demand-driven granularity `Eraser` already has — a larger change,
+  // not done here.
 
   /** One tracked slot: the `pos`'th type-parameter position of `mvar`. */
   private case class Vertex(mvar: MVar, pos: Int)
@@ -152,8 +187,8 @@ object ConstraintSolver {
   private case class Edge(src: Vertex, dst: Vertex, growing: Boolean)
 
   private def isTrackedForGrowth(mvar: MVar): Boolean = mvar match {
-    case _: MVar.Def | _: MVar.Sig => true
-    case _: MVar.Enum | _: MVar.RestrictableEnum | _: MVar.Struct => false
+    case _: MVar.Def | _: MVar.Sig | _: MVar.Enum | _: MVar.Struct => true
+    case _: MVar.RestrictableEnum => false
   }
 
   /**
@@ -188,13 +223,18 @@ object ConstraintSolver {
 
     if (edges.isEmpty) return
 
-    val vertices = edges.iterator.flatMap(e => Iterator(e.src, e.dst)).toSet
     val adjacency = edges.groupMap(_.src)(_.dst)
+    val reachable = reachableFromSeeds(flows, adjacency)
+    val vertices = edges.iterator.flatMap(e => Iterator(e.src, e.dst)).toSet
     val sccOf = stronglyConnectedComponents(vertices, adjacency)
 
     // A growing edge whose endpoints share an SCC necessarily lies on a cycle (by definition of
     // SCC, dst can reach src, so src -> dst -> ... -> src is a cycle through this growing edge).
-    edges.find(e => e.growing && sccOf(e.src) == sccOf(e.dst)) match {
+    // Restricting to `reachable(e.src)` is enough to restrict the whole check to reachable SCCs:
+    // if `e.src` is reachable and `e.dst` is in the same SCC, `e.dst` (and everything else in
+    // that SCC, including the path back to `e.src`) is reachable too, by construction of
+    // `reachableFromSeeds` (a set closed under following edges forward).
+    edges.find(e => e.growing && reachable(e.src) && sccOf(e.src) == sccOf(e.dst)) match {
       case Some(edge) =>
         throw NonMonomorphizableProgramException(
           s"Program is not monomorphizable: found an infinitely-growing recursive type " +
@@ -206,6 +246,37 @@ object ConstraintSolver {
         )
       case None => ()
     }
+  }
+
+  /**
+    * Vertices reachable from a "seed": a `(dst, i)` position targeted by some flow whose `i`'th
+    * arg has no `Param` dependency at all (resolvable without needing any other `MVar`'s tuple
+    * first — the same condition `solve`'s own seed loop uses via `collapseArgs(args, Map.empty,
+    * root)`). Deliberately per-position rather than requiring the whole flow to be simultaneously
+    * ground (which is what real seeding requires): a superset of what the solver would actually
+    * seed, which only makes this check *more* likely to catch a real growing cycle, never less —
+    * the safe direction to be approximate in, unlike under-approximating (which would silently
+    * let a real hang back through, the exact failure mode this check exists to prevent).
+    */
+  private def reachableFromSeeds(flows: Set[Flow], adjacency: Map[Vertex, List[Vertex]]): Set[Vertex] = {
+    val seeds: Set[Vertex] = flows.iterator.flatMap { case Flow(FlowInput.FlowArgs(args), dst) =>
+      args.iterator.zipWithIndex.collect {
+        case (arg, i) if collectParamsWithIndex(arg).isEmpty => Vertex(dst, i)
+      }
+    }.toSet
+
+    val reachable = mutable.Set.empty[Vertex]
+    val queue = mutable.Queue.empty[Vertex]
+    reachable ++= seeds
+    queue.enqueueAll(seeds)
+    while (queue.nonEmpty) {
+      val v = queue.dequeue()
+      for (w <- adjacency.getOrElse(v, Nil) if !reachable(w)) {
+        reachable += w
+        queue.enqueue(w)
+      }
+    }
+    reachable.toSet
   }
 
   /**
