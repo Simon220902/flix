@@ -22,7 +22,7 @@ import ca.uwaterloo.flix.language.dbg.AstPrinter
 import ca.uwaterloo.flix.language.fmt.FormatOptions
 import ca.uwaterloo.flix.language.phase.*
 import ca.uwaterloo.flix.language.phase.jvm.{CodeGen, JvmLoader, JvmWriter}
-import ca.uwaterloo.flix.language.phase.monomorph.{ConstraintCollection, Specialization} // EXPERIMENT
+import ca.uwaterloo.flix.language.phase.monomorph.{ConstraintCollection, ConstraintSolver, Specialization, SolutionSpecialization}
 import ca.uwaterloo.flix.language.phase.optimizer.{LambdaDrop, Optimizer}
 import ca.uwaterloo.flix.language.{CompilationMessage, GenSym}
 import ca.uwaterloo.flix.runtime.CompilationResult
@@ -649,26 +649,17 @@ class Flix {
     var treeShaker1Ast = TreeShaker1.run(typedAst)
     // Note: Do not null typedAst. It is used later.
 
-    // -------------------------------------------------------------------------
-    // EXPERIMENT: constraint collection prototype — remove this block when done
-    // -------------------------------------------------------------------------
-    locally {
-      println("DEFS:")
-      println(treeShaker1Ast.defs)
-      println("ENUMS:")
-      println(treeShaker1Ast.enums)
-      println("INSTANCES:")
-      println(treeShaker1Ast.instances)
-      val constraints = ConstraintCollection.generate(treeShaker1Ast)
-      println("CONSTRAINTS:")
-      println(constraints)
-      val dotPath = java.nio.file.Paths.get("out/constraints.dot")
-      java.nio.file.Files.writeString(dotPath, ConstraintCollection.toDot(constraints))
-      println(s"Wrote constraint graph to $dotPath")
-    }
-    // -------------------------------------------------------------------------
-
-    var monomorpherAst = Specialization.run(typedAst)
+    var monomorpherAst =
+      if (true) { // (System.getenv("FLIX_MONO_EXPERIMENT") != null) {
+        // println("Using the new monomorphizer!")
+        // NOTE: It is important that we here use the typedAst otherwise it fails (due to missing functions?)
+        // I don't really understand why we run the treeShaker1Ast really?
+        val constraints = ConstraintCollection.generate(typedAst)
+        val solution    = ConstraintSolver.solve(constraints, typedAst)
+        SolutionSpecialization.run(typedAst, solution)
+      } else {
+        Specialization.run(typedAst)
+      }
     treeShaker1Ast = null // Explicitly null-out such that the memory becomes eligible for GC.
 
     var lambdaDropAst = LambdaDrop.run(monomorpherAst)

@@ -17,10 +17,11 @@
 package ca.uwaterloo.flix.language.phase.monomorph
 
 import ca.uwaterloo.flix.api.Flix
-import ca.uwaterloo.flix.language.ast.{Kind, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
+import ca.uwaterloo.flix.language.ast.{Kind, Name, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.ast.TypedAst.{Expr, FormalParam, MatchRule, Predicate}
 import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
-import ca.uwaterloo.flix.language.phase.monomorph.Symbols.Defs
+import ca.uwaterloo.flix.language.ast.shared.Denotation
+import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Types}
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
 
@@ -586,18 +587,27 @@ object ConstraintCollection {
         )
       }.toSet ++ default.map(visitExp).getOrElse(Set.empty)
 
-    // Datalog fixpoint nodes: sub-expressions are traversed so that any defs
-    // called inside predicates are captured, but the Box/Unbox/liftN constraints
-    // are NOT emitted here. Those require Approach A (see lowering_design.md).
+    // Datalog fixpoint nodes ("Approach A", see plan_datalog_constraints.md): in addition to
+    // recursing into sub-expressions to capture any defs called inside predicates, emit flows
+    // for every Box/Unbox/liftN/lattice/Facts/ProjectInto/ProvenanceOf call that
+    // SolutionLowering.scala will synthesize for these constructs — mirroring exactly the
+    // TypedAst structure lowering itself inspects.
     case Expr.FixpointConstraintSet(cs, _, _) =>
       cs.flatMap { c =>
+        val cparams0 = c.cparams
         val fromHead = c.head match {
-          case Predicate.Head.Atom(_, _, terms, _, _) => terms.flatMap(visitExp).toSet
+          case Predicate.Head.Atom(_, den, terms, _, loc) =>
+            terms.flatMap(visitExp).toSet ++
+              terms.flatMap(headTermFlows(cparams0, _)) ++
+              latticeFlows(den, terms.lastOption.map(_.tpe), loc)
         }
         val fromBody = c.body.flatMap {
-          case Predicate.Body.Guard(e, _)        => visitExp(e)
-          case Predicate.Body.Functional(_, e, _) => visitExp(e)
-          case _: Predicate.Body.Atom             => Set.empty
+          case Predicate.Body.Guard(e, loc) =>
+            visitExp(e) ++ guardLiftFlow(cparams0, e, loc)
+          case Predicate.Body.Functional(outBnds, e, loc) =>
+            visitExp(e) + functionalLiftFlow(cparams0, outBnds.length, e, loc)
+          case Predicate.Body.Atom(_, den, _, _, terms, _, loc) =>
+            bodyAtomTermFlows(cparams0, terms) ++ latticeFlows(den, terms.lastOption.map(_.tpe), loc)
         }.toSet
         fromHead ++ fromBody
       }.toSet
@@ -610,10 +620,38 @@ object ConstraintCollection {
     case Expr.FixpointSolveWithProject(exps, _, _, _, _, _) =>
       exps.flatMap(visitExp).toSet
 
-    case Expr.FixpointInjectInto(exps, _, _, _, _) =>
-      exps.flatMap(visitExp).toSet
+    // InjectInto: Lowering synthesizes a call to Fixpoint3.Solver.injectIntoN(p, ts), generic
+    // over the container type constructor `f` and the tuple's own component types `t1..tn`.
+    case Expr.FixpointInjectInto(exps, _, _, _, loc) =>
+      exps.flatMap { exp =>
+        val (tycon, argTypes) = dealias(exp.tpe) match {
+          case Type.Apply(tc, innerType0, _) =>
+            val innerType = dealias(innerType0)
+            innerType.typeConstructor match {
+              case Some(TypeConstructor.Tuple(_)) => (tc, innerType.typeArguments)
+              case Some(TypeConstructor.Unit)     => (tc, Nil)
+              case _                              => (tc, List(innerType))
+            }
+          case t => throw InternalCompilerException(s"Unexpected non-foldable type: '$t'.", loc)
+        }
+        val flowArgs = (tycon :: argTypes).map(typeToMonoArg(_, loc))
+        visitExp(exp) + Flow(FlowInput.FlowArgs(flowArgs), MVar.Def(Defs.ProjectInto(argTypes.length)))
+      }.toSet
 
-    case Expr.FixpointQueryWithSelect(exps, queryExp, selects, from, where, _, _, _, _) =>
+    // Query-with-select: Lowering synthesizes a call to Fixpoint3.Solver.factsN(p, d), generic
+    // over the N selected terms' own types. (The query's embedded constraint set, reached via
+    // `queryExp`'s recursion into FixpointConstraintSet, already supplies the Box/liftN flows
+    // for the underlying rule itself — `selects`/`from`/`where` here are the same information,
+    // recursed into structurally only, as before.)
+    case Expr.FixpointQueryWithSelect(exps, queryExp, selects, from, where, _, tpe0, _, loc) =>
+      // Facts(arity)'s flow args come from the query's own resolved result type `tpe0`
+      // (Vector[(t1,...,tn)], or Vector[t1] for arity 1 — matching Facts's declared signature),
+      // NOT from `selects`' own term types: those are typed in the query's local/row-polymorphic
+      // scope and may still carry a locally-scoped type var never unified back into this def's
+      // own substitution (unlike an ordinary lexically-bound expression).
+      val arity = selects.length
+      val innerTpe = unwrapVectorType(tpe0, loc)
+      val argTypes = if (arity <= 1) List(innerTpe) else innerTpe.typeArguments
       exps.flatMap(visitExp).toSet ++
         visitExp(queryExp) ++
         selects.flatMap(visitExp).toSet ++
@@ -622,14 +660,164 @@ object ConstraintCollection {
           case Predicate.Body.Functional(_, e, _) => visitExp(e)
           case _: Predicate.Body.Atom             => Set.empty
         }.toSet ++
-        where.flatMap(visitExp).toSet
+        where.flatMap(visitExp).toSet +
+        Flow(FlowInput.FlowArgs(argTypes.map(typeToMonoArg(_, loc))), MVar.Def(Defs.Facts(arity)))
 
-    case Expr.FixpointQueryWithProvenance(exps, select, _, _, _, _) =>
-      exps.flatMap(visitExp).toSet ++ (select match {
-        case Predicate.Head.Atom(_, _, terms, _, _) => terms.flatMap(visitExp).toSet
-      })
+    // Query-with-provenance: Lowering boxes every goal term, unboxes every term type of every
+    // predicate the extensible-variant result type can carry, and calls Solver.provenanceOf and
+    // (internally) Vector.get at a fixed Boxed type. See mkExtVarLambda/mkUnboxedTerm.
+    case Expr.FixpointQueryWithProvenance(exps, select, _, tpe0, _, loc) =>
+      val fromSelect = select match {
+        case Predicate.Head.Atom(_, _, terms, _, _) =>
+          terms.flatMap(visitExp).toSet ++ terms.map(t => boxFlow(t.tpe, t.loc)).toSet
+      }
+      val extVarType = unwrapVectorType(tpe0, loc)
+      val unboxFlows = predicatesOfExtVar(extVarType, loc).flatMap(_._2).map { t =>
+        Flow(FlowInput.FlowArgs(List(typeToMonoArg(t, loc))), MVar.Def(Defs.Unbox))
+      }.toSet
+      exps.flatMap(visitExp).toSet ++ fromSelect ++ unboxFlows +
+        Flow(FlowInput.FlowArgs(List(typeToMonoArg(extVarType, loc))), MVar.Def(Defs.ProvenanceOf)) +
+        Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.Boxed, loc))), MVar.Def(Defs.VectorGet))
 
     case Expr.Error(_, _, _) => Set.empty
+  }
+
+  // ---- Datalog (Approach A) helpers --------------------------------------
+  //
+  // Each of these mirrors, structurally, the corresponding synthesis logic in
+  // SolutionLowering.scala (named in each doc comment) — see plan_datalog_constraints.md.
+
+  /**
+    * Strips `Type.Alias` wrappers before structural matching. Needed only where this file
+    * pattern-matches a raw expression's `.tpe` directly (`typeToMonoArg` already dealiases on its
+    * own path) — unlike `SolutionLowering.scala`, which runs on an already-specialized MonoAst
+    * tree (aliases stripped earlier by `StrictSubstitution`), this file walks the raw, ground
+    * `TypedAst`, where a user type alias (e.g. `type alias X = List[Int32]`) is still intact.
+    */
+  private def dealias(tpe: Type): Type = tpe match {
+    case Type.Alias(_, _, inner, _) => dealias(inner)
+    case t => t
+  }
+
+  private def isQuantifiedVar(sym: Symbol.VarSym, cparams0: List[TypedAst.ConstraintParam]): Boolean =
+    cparams0.exists(p => p.bnd.sym == sym)
+
+  private def quantifiedVars(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr): List[(Symbol.VarSym, Type)] =
+    TypedAstOps.freeVars(exp0).toList.filter { case (sym, _) => isQuantifiedVar(sym, cparams0) }
+
+  /** A flow for `Fixpoint3.Boxable.box` at type `tpe` — mirrors `SolutionLowering.box`. */
+  private def boxFlow(tpe: Type, loc: SourceLocation)(implicit ctx: Context): Flow =
+    Flow(FlowInput.FlowArgs(List(typeToMonoArg(tpe, loc))), MVar.Def(Defs.Box))
+
+  /**
+    * Flows for a head term — mirrors `SolutionLowering.lowerHeadTerm`'s cases 1.2/2/3: a
+    * lexically-bound Var, or a non-Var term with no quantified free vars, is boxed; a non-Var
+    * term WITH quantified free vars is lifted via `lift{arity}` instead (never both). A
+    * quantified Var itself (case 1.1) needs neither flow — it carries no runtime value of its own.
+    */
+  private def headTermFlows(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr)(implicit ctx: Context): Set[Flow] = exp0 match {
+    case Expr.Var(sym, tpe, loc) =>
+      if (isQuantifiedVar(sym, cparams0)) Set.empty else Set(boxFlow(tpe, loc))
+    case _ =>
+      val fvs = quantifiedVars(cparams0, exp0)
+      if (fvs.isEmpty) Set(boxFlow(exp0.tpe, exp0.loc))
+      else Set(Flow(FlowInput.FlowArgs((fvs.map(_._2) :+ exp0.tpe).map(typeToMonoArg(_, exp0.loc))), MVar.Def(Defs.Lift(fvs.length))))
+  }
+
+  /**
+    * Flows for a body atom's terms — mirrors `SolutionLowering.lowerBodyTerm`: `Wild` and a
+    * quantified `Var` need nothing; a non-quantified `Var` or any `Cst` is boxed.
+    */
+  private def bodyAtomTermFlows(cparams0: List[TypedAst.ConstraintParam], terms: List[TypedAst.Pattern])(implicit ctx: Context): Set[Flow] =
+    terms.flatMap {
+      case TypedAst.Pattern.Wild(_, _) => None
+      case TypedAst.Pattern.Var(bnd, tpe, loc) =>
+        if (isQuantifiedVar(bnd.sym, cparams0)) None else Some(boxFlow(tpe, loc))
+      case TypedAst.Pattern.Cst(_, tpe, loc) => Some(boxFlow(tpe, loc))
+      case _ => None
+    }.toSet
+
+  /**
+    * A flow for `lift{arity}b`, mirroring `SolutionLowering.mkGuard`. An arity-0 guard is
+    * lowered to a plain closure with no lift call at all (`Guard0` — there is no `lift0b`), so
+    * nothing is emitted in that case.
+    */
+  private def guardLiftFlow(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, loc: SourceLocation)(implicit ctx: Context): Set[Flow] = {
+    val fvs = quantifiedVars(cparams0, exp0)
+    if (fvs.isEmpty) Set.empty
+    else Set(Flow(FlowInput.FlowArgs(fvs.map(kv => typeToMonoArg(kv._2, loc))), MVar.Def(Defs.LiftB(fvs.length))))
+  }
+
+  /**
+    * A flow for `lift{inArity}X{outArity}`, mirroring `SolutionLowering.mkFunctional`. Whether
+    * `exp0.tpe`'s inner type decomposes into `o1,...,om` or is used whole as the single `o1`
+    * depends on `outArity` (the *count* of out-vars) — NOT on whether that inner type happens to
+    * look like a tuple: an outArity-1 functional can itself bind a single tuple-typed value (as
+    * `lift0X1(f: Vector[(o1)])`'s signature — `(o1)` is just `o1` parenthesized, never a real
+    * tuple type), so a structural "is this a Tuple" check would wrongly decompose it.
+    */
+  private def functionalLiftFlow(cparams0: List[TypedAst.ConstraintParam], outArity: Int, exp0: TypedAst.Expr, loc: SourceLocation)(implicit ctx: Context): Flow = {
+    val inVars = quantifiedVars(cparams0, exp0)
+    val inner = dealias(exp0.tpe) match {
+      case Type.Apply(Type.Cst(TypeConstructor.Vector, _), t, _) => dealias(t)
+      case t => throw InternalCompilerException(s"Expected Vector[_], but got $t", loc)
+    }
+    val outTypes = if (outArity <= 1) List(inner) else inner.typeArguments
+    Flow(FlowInput.FlowArgs((inVars.map(_._2) ++ outTypes).map(typeToMonoArg(_, loc))), MVar.Def(Defs.LiftXM(inVars.length, outArity)))
+  }
+
+  /** Flows for `Fixpoint3.Ast.Shared.lattice`/`box`, mirroring `SolutionLowering.mkDenotation`. */
+  private def latticeFlows(den: Denotation, lastTermType: Option[Type], loc: SourceLocation)(implicit ctx: Context): Set[Flow] = den match {
+    case Denotation.Relational => Set.empty
+    case Denotation.Latticenal =>
+      val tpe = lastTermType.getOrElse(throw InternalCompilerException("Unexpected nullary lattice predicate.", loc))
+      Set(
+        Flow(FlowInput.FlowArgs(List(typeToMonoArg(tpe, loc))), MVar.Def(Defs.Lattice)),
+        Flow(FlowInput.FlowArgs(List(typeToMonoArg(tpe, loc))), MVar.Def(Defs.LatticeBox))
+      )
+  }
+
+  /** Returns `t` from `Vector[t]` — mirrors `SolutionLowering.unwrapVectorType`. */
+  private def unwrapVectorType(tpe: Type, loc: SourceLocation): Type = dealias(tpe) match {
+    case Type.Apply(Type.Cst(TypeConstructor.Vector, _), extType, _) => dealias(extType)
+    case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Vector, _), _, _), but got $t", loc)
+  }
+
+  /** Mirrors `SolutionLowering.predicatesOfExtVar`. */
+  private def predicatesOfExtVar(tpe: Type, loc: SourceLocation): List[(Name.Pred, List[Type])] = dealias(tpe) match {
+    case Type.Apply(Type.Cst(TypeConstructor.Extensible, _), tpe1, loc1) => predicatesOfSchemaRow(dealias(tpe1), loc1)
+    case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Extensible, _), _, _), but got $t", loc)
+  }
+
+  /** Mirrors `SolutionLowering.predicatesOfSchemaRow`. */
+  private def predicatesOfSchemaRow(row: Type, loc: SourceLocation): List[(Name.Pred, List[Type])] = row match {
+    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SchemaRowExtend(pred), _), rel, loc2), tpe2, loc1) =>
+      (pred, termTypesOfRelation(rel, loc2)) :: predicatesOfSchemaRow(tpe2, loc1)
+    case Type.Var(_, _) => Nil
+    case Type.SchemaRowEmpty => Nil
+    case t => throw InternalCompilerException(s"Got unexpected $t", loc)
+  }
+
+  /**
+    * Mirrors `SolutionLowering.termTypesOfRelation`, with one addition: `SolutionLowering` runs
+    * post-solve, where a stray `Kind.Star` var reaching this point has already been defaulted to
+    * `AnyType` (its own `AnyType` case, kept below); this file runs pre-solve, on raw `TypedAst`,
+    * where a relation belonging to an unused/under-constrained provenance predicate can still be
+    * a genuinely-unresolved bare `Type.Var` at this point. Per the "Correctness requirement" in
+    * plan_datalog_constraints.md, such a var must NOT be defaulted through to an Unbox flow (that
+    * defaulting is unsound specifically for Box/Unbox/liftN) — so it is simply skipped here
+    * (no term types recoverable for this relation) rather than defaulted or thrown: a genuine miss
+    * still surfaces as a clean Solver gap downstream, exactly as it would if no flow existed here.
+    */
+  private def termTypesOfRelation(rel: Type, loc: SourceLocation): List[Type] = {
+    def flattenApply(rel0: Type, loc0: SourceLocation): List[Type] = rel0 match {
+      case Type.Cst(TypeConstructor.Relation(_), _) => Nil
+      case Type.Apply(rest, t, loc1) => t :: flattenApply(rest, loc1)
+      case _ if rel0.typeConstructor.contains(TypeConstructor.AnyType) => Nil
+      case Type.Var(_, _) => Nil
+      case t => throw InternalCompilerException(s"Expected Type.Apply(_, _, _), but got $t", loc0)
+    }
+    flattenApply(rel, loc).reverse
   }
 
 

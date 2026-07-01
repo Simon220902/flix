@@ -44,6 +44,21 @@ object Symbols {
 
     def Facts(arity: Int): Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Solver.facts$arity")
 
+    // The liftN/liftNb/liftNXM family (not fixed defs — one generic def per arity). Names must
+    // stay byte-identical to SolutionLowering.scala's own ad hoc Symbol.mkDefnSym constructions
+    // (liftX/liftXb/liftXY) or the solver's "solved" symbol won't match SolutionLowering.lookup's
+    // query and the defTableMap lookup will miss despite the solver having solved a def.
+    def Lift(arity: Int): Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Boxable.lift$arity")
+
+    def LiftB(arity: Int): Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Boxable.lift${arity}b")
+
+    def LiftXM(inArity: Int, outArity: Int): Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Boxable.lift${inArity}X$outArity")
+
+    lazy val Lattice: Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Ast.Shared.lattice")
+    lazy val LatticeBox: Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Ast.Shared.box")
+
+    lazy val VectorGet: Symbol.DefnSym = Symbol.mkDefnSym("Vector.get")
+
   }
 
   protected[monomorph] object Enums {
