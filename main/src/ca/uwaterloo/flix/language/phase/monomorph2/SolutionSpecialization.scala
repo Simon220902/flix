@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package ca.uwaterloo.flix.language.phase.monomorph
+package ca.uwaterloo.flix.language.phase.monomorph2
 
 import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.TypedAst.{Binder, Expr, Instance, StructField}
@@ -22,7 +22,8 @@ import ca.uwaterloo.flix.language.ast.shared.SymUse.{CaseSymUse, DefSymUse, Loca
 import ca.uwaterloo.flix.language.ast.shared.RegionScope
 import ca.uwaterloo.flix.language.ast.{AtomicOp, Kind, MonoAst, RigidityEnv, SemanticOp, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.dbg.AstPrinter.*
-import ca.uwaterloo.flix.language.phase.monomorph.ConstraintSolver.Solution
+import ca.uwaterloo.flix.language.phase.monomorph.Symbols
+import ca.uwaterloo.flix.language.phase.monomorph2.ConstraintSolver.Solution
 import ca.uwaterloo.flix.language.phase.typer.ConstraintSolver2
 import ca.uwaterloo.flix.language.phase.unification.Substitution
 import ca.uwaterloo.flix.util.collection.{ListOps, MapOps, Nel}
@@ -53,7 +54,7 @@ object SolutionSpecialization {
     * package-visible (not `private`): `SolutionLowering.scala` (this pipeline's own fork of
     * `Lowering.scala`) needs it as the type its `ctx` implicit is threaded through.
     */
-  private[monomorph] class Context(
+  private[monomorph2] class Context(
     val defTable: Map[(Symbol.DefnSym, Type), Symbol.DefnSym],
     val allDefs: Map[Symbol.DefnSym, TypedAst.Def],
     val enumTable: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym],
@@ -81,7 +82,7 @@ object SolutionSpecialization {
     * `Specialization.specializeDefnSym` — same "Solver gap" failure mode as every other call
     * site in this pipeline, no demand-driven fallback.
     */
-  private[monomorph] def lookupSym(sym: Symbol.DefnSym, it: Type)
+  private[monomorph2] def lookupSym(sym: Symbol.DefnSym, it: Type)
                        (implicit ctx: Context, root: TypedAst.Root): Symbol.DefnSym = {
     val defn = ctx.allDefs.getOrElse(sym, throw InternalCompilerException(s"lookupSym: sym not in allDefs: $sym", sym.loc))
     // Check defTable first: polymorphic instance defs and default-sig impls may have empty

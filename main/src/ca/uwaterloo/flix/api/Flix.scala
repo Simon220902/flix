@@ -22,7 +22,8 @@ import ca.uwaterloo.flix.language.dbg.AstPrinter
 import ca.uwaterloo.flix.language.fmt.FormatOptions
 import ca.uwaterloo.flix.language.phase.*
 import ca.uwaterloo.flix.language.phase.jvm.{CodeGen, JvmLoader, JvmWriter}
-import ca.uwaterloo.flix.language.phase.monomorph.{ConstraintCollection, ConstraintSolver, Specialization, SolutionSpecialization}
+import ca.uwaterloo.flix.language.phase.monomorph.Specialization
+import ca.uwaterloo.flix.language.phase.monomorph2.{ConstraintCollection, ConstraintSolver, SolutionSpecialization}
 import ca.uwaterloo.flix.language.phase.optimizer.{LambdaDrop, Optimizer}
 import ca.uwaterloo.flix.language.{CompilationMessage, GenSym}
 import ca.uwaterloo.flix.runtime.CompilationResult

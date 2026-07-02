@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-package ca.uwaterloo.flix.language.phase.monomorph
+package ca.uwaterloo.flix.language.phase.monomorph2
 
 import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.{Kind, RigidityEnv, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.ast.shared.RegionScope
-import ca.uwaterloo.flix.language.phase.monomorph.ConstraintCollection._
+import ca.uwaterloo.flix.language.phase.monomorph2.ConstraintCollection._
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols.Defs
 import ca.uwaterloo.flix.language.phase.typer.ConstraintSolver2
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}

@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-package ca.uwaterloo.flix.language.phase.monomorph
+package ca.uwaterloo.flix.language.phase.monomorph2
 
 import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.{Kind, Name, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.ast.TypedAst.{Expr, FormalParam, MatchRule, Predicate}
 import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.shared.Denotation
+import ca.uwaterloo.flix.language.phase.monomorph.Symbols
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Types}
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
@@ -240,7 +241,7 @@ object ConstraintCollection {
     s""""$raw""""
   }
 
-  private[monomorph] def mvarLabel(mvar: MVar): String = mvar match {
+  private[monomorph2] def mvarLabel(mvar: MVar): String = mvar match {
     case MVar.Def(sym)              => s"Def(${sym.name})"
     case MVar.Enum(sym)             => s"Enum(${sym.name})"
     case MVar.Sig(sym)              => s"Sig(${sym.name})"
@@ -865,7 +866,7 @@ object ConstraintCollection {
     * calls `lowerType` and so keeps `Sender`/`Receiver` unexpanded — rewriting those flows too
     * would corrupt that def's own defTable key instead of fixing the channel-def one.
     */
-  private[monomorph] def lowerChannelType(tpe: Type): Type = tpe match {
+  private[monomorph2] def lowerChannelType(tpe: Type): Type = tpe match {
     case Type.Apply(Type.Cst(TypeConstructor.Sender, loc), elm, _) =>
       Type.Apply(Type.Apply(Symbols.Types.ChannelMpmc, lowerChannelType(elm), loc), Type.IO, loc)
     case Type.Apply(Type.Cst(TypeConstructor.Receiver, loc), elm, _) =>

@@ -20,7 +20,7 @@ package ca.uwaterloo.flix.language.phase.monomorph
 import ca.uwaterloo.flix.language.ast.{Kind, SourceLocation, Symbol, Type, TypeConstructor}
 
 object Symbols {
-  protected[monomorph] object Defs {
+  protected[phase] object Defs {
 
     lazy val ChannelGet: Symbol.DefnSym = Symbol.mkDefnSym("Concurrent.Channel.get")
     lazy val ChannelNew: Symbol.DefnSym = Symbol.mkDefnSym("Concurrent.Channel.newChannel")
@@ -61,7 +61,7 @@ object Symbols {
 
   }
 
-  protected[monomorph] object Enums {
+  protected[phase] object Enums {
     lazy val ChannelMpmc: Symbol.EnumSym = Symbol.mkEnumSym("Concurrent.Channel.Mpmc")
     lazy val ChannelMpmcAdmin: Symbol.EnumSym = Symbol.mkEnumSym("Concurrent.Channel.MpmcAdmin")
     lazy val ConcurrentReentrantLock: Symbol.EnumSym = Symbol.mkEnumSym("Concurrent.ReentrantLock")
@@ -90,7 +90,7 @@ object Symbols {
     lazy val JvmValue: Symbol.EnumSym = Symbol.mkEnumSym("Reflect.JvmValue")
   }
 
-  protected[monomorph] object Types {
+  protected[phase] object Types {
     lazy val ChannelMpmc: Type = Type.Cst(TypeConstructor.Enum(Enums.ChannelMpmc, Kind.Star ->: Kind.Eff ->: Kind.Star), SourceLocation.Unknown)
     lazy val ChannelMpmcAdmin: Type = Type.mkEnum(Enums.ChannelMpmcAdmin, Nil, SourceLocation.Unknown)
     lazy val ConcurrentReentrantLock: Type = Type.mkEnum(Enums.ConcurrentReentrantLock, Nil, SourceLocation.Unknown)

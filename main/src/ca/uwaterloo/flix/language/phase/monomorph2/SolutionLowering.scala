@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package ca.uwaterloo.flix.language.phase.monomorph
+package ca.uwaterloo.flix.language.phase.monomorph2
 
 import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.TypedAst.{DefaultHandler, Predicate}
@@ -24,7 +24,7 @@ import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.TypedAst.ApplyPosition
 import ca.uwaterloo.flix.language.ast.shared.{BoundBy, Constant, Decreasing, Denotation, Fixity, Mutability, Polarity, PredicateAndArity, RegionScope, SolveMode, SymUse, TypeSource}
 import ca.uwaterloo.flix.language.ast.{AtomicOp, MonoAst, Name, SemanticOp, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
-import ca.uwaterloo.flix.language.phase.monomorph.SolutionSpecialization.{Context, lookupSym}
+import ca.uwaterloo.flix.language.phase.monomorph2.SolutionSpecialization.{Context, lookupSym}
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Enums, Types}
 import ca.uwaterloo.flix.util.{InternalCompilerException, Result}
 import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
@@ -96,7 +96,7 @@ object SolutionLowering {
   /**
     * Lowers the given def `defn`.
     */
-  protected[monomorph] def lowerDef(defn0: TypedAst.Def)(implicit ctx: Context, root: TypedAst.Root, flix: Flix): MonoAst.Def = {
+  protected[monomorph2] def lowerDef(defn0: TypedAst.Def)(implicit ctx: Context, root: TypedAst.Root, flix: Flix): MonoAst.Def = {
     implicit val lctx: LocalContext = LocalContext.empty
     /*
      If the definition is an entry point it is wrapped with the required default handlers before the rest of lowering.
@@ -121,7 +121,7 @@ object SolutionLowering {
   /**
     * Lowers the given enum `enum0`.
     */
-  protected[monomorph] def lowerEnum(enum0: TypedAst.Enum): MonoAst.Enum = enum0 match {
+  protected[monomorph2] def lowerEnum(enum0: TypedAst.Enum): MonoAst.Enum = enum0 match {
     case TypedAst.Enum(doc, ann, mod, sym, tparams0, _, cases0, loc) =>
       val tparams = tparams0.map(lowerTypeParam)
       val cases = cases0.map {
@@ -135,7 +135,7 @@ object SolutionLowering {
   /**
     * Lowers the given enum `enum0` from a restrictable enum into a regular enum.
     */
-  protected[monomorph] def lowerRestrictableEnum(enum0: TypedAst.RestrictableEnum): MonoAst.Enum = enum0 match {
+  protected[monomorph2] def lowerRestrictableEnum(enum0: TypedAst.RestrictableEnum): MonoAst.Enum = enum0 match {
     case TypedAst.RestrictableEnum(doc, ann, mod, sym0, index0, tparams0, _, cases0, loc) =>
       // index is erased since related checking has concluded.
       // Restrictable tag is lowered into a regular tag
@@ -154,7 +154,7 @@ object SolutionLowering {
   /**
     * Lowers the given `effect`.
     */
-  protected[monomorph] def lowerEffect(effect: TypedAst.Effect): MonoAst.Effect = effect match {
+  protected[monomorph2] def lowerEffect(effect: TypedAst.Effect): MonoAst.Effect = effect match {
     case TypedAst.Effect(doc, ann, mod, sym, _, ops0, loc) =>
       // TODO EFFECT-TPARAMS use tparams
       val ops = ops0.map(lowerOp)
@@ -164,7 +164,7 @@ object SolutionLowering {
   /**
     * Lowers the given struct `struct0`.
     */
-  protected[monomorph] def lowerStruct(struct0: TypedAst.Struct): MonoAst.Struct = struct0 match {
+  protected[monomorph2] def lowerStruct(struct0: TypedAst.Struct): MonoAst.Struct = struct0 match {
     case TypedAst.Struct(doc, ann, mod, sym, tparams0, _, fields0, loc) =>
       val tparams = tparams0.map(lowerTypeParam)
       val fields = fields0.map {

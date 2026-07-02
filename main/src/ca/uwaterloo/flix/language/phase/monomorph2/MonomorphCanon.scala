@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package ca.uwaterloo.flix.language.phase.monomorph
+package ca.uwaterloo.flix.language.phase.monomorph2
 
 import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.{Kind, Name, RigidityEnv, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
@@ -38,7 +38,7 @@ import scala.collection.immutable.SortedSet
   * of truth for what canonicalization should produce). `Specialization.scala` (the demand-driven
   * baseline) keeps its own separate copy — out of scope, see that plan doc.
   */
-private[monomorph] object MonomorphCanon {
+private[monomorph2] object MonomorphCanon {
 
   /**
     * Builds a lookup map from `(trait, type constructor)` to the instance implementing it.
