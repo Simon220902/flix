@@ -156,6 +156,35 @@ private[monomorph2] object MonomorphCanon {
     case Kind.Error         => throw InternalCompilerException(s"Unexpected type '$tpe0'.", tpe0.loc)
   }
 
+  /**
+    * True iff `tpe` is one of the 8 unboxed primitive types. This is the "specialize wrt.
+    * primitive types only" test: an enum/struct instantiation only gets its own specialized
+    * declaration when every type argument is primitive (`Option[Int32]`); if any argument is
+    * not (`Option[String]`, `Option[Result[String, Int32]]`), the instantiation is not
+    * specialized at all — it keeps using the original polymorphic declaration, the same
+    * already-existing fallback non-generic types and dead-code `AnyType` defaults use (see
+    * `lookupCaseSym`/`lookupStructSym` in `SolutionSpecialization.scala`). Deliberately does NOT
+    * erase the non-primitive case to `AnyType` and share one specialized declaration the way
+    * `Eraser.scala` does downstream — that would need cast insertion at every construction/
+    * extraction site and risks depending on field-type precision some later phase (e.g. pattern
+    * compilation) might still need; "don't specialize, stay polymorphic" carries none of that
+    * risk since it reuses an already-correct, already-tested path.
+    *
+    * `tpe` is assumed ground (no free type variables) — the caller only ever applies this to
+    * already-solved instantiation tuples.
+    */
+  def isPrimitive(tpe: Type): Boolean = tpe match {
+    case Type.Cst(TypeConstructor.Bool, _)    => true
+    case Type.Cst(TypeConstructor.Char, _)    => true
+    case Type.Cst(TypeConstructor.Float32, _) => true
+    case Type.Cst(TypeConstructor.Float64, _) => true
+    case Type.Cst(TypeConstructor.Int8, _)    => true
+    case Type.Cst(TypeConstructor.Int16, _)   => true
+    case Type.Cst(TypeConstructor.Int32, _)   => true
+    case Type.Cst(TypeConstructor.Int64, _)   => true
+    case _                                    => false
+  }
+
   // ---- Record / schema helpers (used only by normalizeApply) ------------------
 
   private def mkRecordExtendSorted(label: Name.Label, tpe: Type, rest: Type, loc: SourceLocation): Type = rest match {

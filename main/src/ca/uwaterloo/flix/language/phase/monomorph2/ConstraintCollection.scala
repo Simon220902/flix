@@ -22,7 +22,7 @@ import ca.uwaterloo.flix.language.ast.TypedAst.{Expr, FormalParam, MatchRule, Pr
 import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.shared.Denotation
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols
-import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Types}
+import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Enums, Types}
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
 
@@ -581,7 +581,11 @@ object ConstraintCollection {
     // SelectChannel: Lowering synthesizes, per rule, a Channel.mpmcAdmin call (to build the
     // admin list passed to the non-parametric Channel.selectFrom) and a Channel.unsafeGetAndUnlock
     // call (to read the winning channel's value) — NOT Channel.get, which is only for the
-    // simple blocking `<- ch` form (Expr.GetChannel).
+    // simple blocking `<- ch` form (Expr.GetChannel). The admin values are collected into a
+    // `List[ChannelMpmcAdmin]` built directly via `mkTag`/`mkList` (SolutionLowering.mkAdmins),
+    // same bypass-the-ordinary-rewrite-path situation as latticeFlows/FixpointLambda above — the
+    // `List[ChannelMpmcAdmin]` instantiation is fixed (not per-rule/per-elmType) and must be
+    // predicted here too.
     case Expr.SelectChannel(rules, default, _, _, loc) =>
       rules.flatMap { r =>
         val elmType = r.chan.tpe match {
@@ -594,7 +598,8 @@ object ConstraintCollection {
           Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelMpmcAdmin)),
           Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelUnsafeGetAndUnlock))
         )
-      }.toSet ++ default.map(visitExp).getOrElse(Set.empty)
+      }.toSet ++ default.map(visitExp).getOrElse(Set.empty) +
+        Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.ChannelMpmcAdmin, loc))), MVar.Enum(Enums.FList))
 
     // Datalog fixpoint nodes ("Approach A", see plan_datalog_constraints.md): in addition to
     // recursing into sub-expressions to capture any defs called inside predicates, emit flows
@@ -621,7 +626,12 @@ object ConstraintCollection {
         fromHead ++ fromBody
       }.toSet
 
-    case Expr.FixpointLambda(_, exp, _, _, _) => visitExp(exp)
+    // FixpointLambda: Lowering builds a `List[PredSym]` value directly via `mkTag`/`mkList`
+    // (SolutionLowering.mkList, called from its FixpointLambda case) to pass to Solver.rename —
+    // same bypass-the-ordinary-rewrite-path situation as latticeFlows' Denotation.Relational case
+    // above, so the `List[PredSym]` instantiation must be predicted here too.
+    case Expr.FixpointLambda(_, exp, _, _, loc) =>
+      visitExp(exp) + Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.PredSym, loc))), MVar.Enum(Enums.FList))
 
     case Expr.FixpointMerge(exp1, exp2, _, _, _) =>
       visitExp(exp1) ++ visitExp(exp2)
@@ -775,9 +785,18 @@ object ConstraintCollection {
     Flow(FlowInput.FlowArgs((inVars.map(_._2) ++ outTypes).map(typeToMonoArg(_, loc))), MVar.Def(Defs.LiftXM(inVars.length, outArity)))
   }
 
-  /** Flows for `Fixpoint3.Ast.Shared.lattice`/`box`, mirroring `SolutionLowering.mkDenotation`. */
+  /**
+    * Flows for `Fixpoint3.Ast.Shared.lattice`/`box`/`Denotation`, mirroring
+    * `SolutionLowering.mkDenotation`. The `Relational` case constructs a `Denotation[Boxed]` value
+    * directly via `mkTag` (bypassing the ordinary TypedAst-level rewrite path entirely — see
+    * "Two coexisting representations" in `pipeline_design_overview.md`), so its enum-construction
+    * flow must be predicted here the same way channels/Box/Unbox/liftN already are, or
+    * `enumTable` never gets an entry for it and `SolutionSpecialization`'s post-lowering rewrite
+    * pass silently falls back to the original, unspecialized `Denotation` declaration.
+    */
   private def latticeFlows(den: Denotation, lastTermType: Option[Type], loc: SourceLocation)(implicit ctx: Context): Set[Flow] = den match {
-    case Denotation.Relational => Set.empty
+    case Denotation.Relational =>
+      Set(Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.Boxed, loc))), MVar.Enum(Enums.Denotation)))
     case Denotation.Latticenal =>
       val tpe = lastTermType.getOrElse(throw InternalCompilerException("Unexpected nullary lattice predicate.", loc))
       Set(

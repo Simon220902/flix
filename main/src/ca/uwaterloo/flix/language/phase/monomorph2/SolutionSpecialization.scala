@@ -103,14 +103,20 @@ object SolutionSpecialization {
     * - Non-generic enums (`groundEnumTpe` has no type arguments): keep the original case sym —
     *   there is only one possible instantiation, so nothing was ever entered into `enumTable`
     *   for it (mirrors `lookupSym`'s "truly non-parametric" case for defs).
-    * - Generic enums: must be in `enumTable` (pre-populated from the solver solution).
-    * - Missing entries: crash with "Solver gap", same failure mode as `lookupSym`.
+    * - No type argument is primitive (`MonomorphCanon.isPrimitive`): keep the original case sym
+    *   too — this instantiation was never specialized at all (see `enumEntries` in `run`: a
+    *   partial specialization needs at least one primitive argument to pin), and this also
+    *   covers dead-code `AnyType` defaults (`AnyType` is never primitive) without a separate
+    *   check. If *some but not all* arguments are primitive, this is expected to be a hit below
+    *   (a partial specialization), not this fallback.
+    * - Otherwise: must be in `enumTable` (pre-populated from the solver solution); a miss is a
+    *   genuine "Solver gap", same failure mode as `lookupSym`.
     */
   private def lookupCaseSym(caseSym: Symbol.CaseSym, groundEnumTpe: Type)(implicit ctx: Context): Symbol.CaseSym = {
     val argTypes = groundEnumTpe.typeArguments
     ctx.enumTable.get((caseSym.enumSym, argTypes)) match {
       case Some(freshEnumSym) => new Symbol.CaseSym(freshEnumSym, caseSym.name, caseSym.ordinal, caseSym.loc)
-      case None if argTypes.isEmpty || argTypes.exists(isAnyType) => caseSym
+      case None if argTypes.isEmpty || !argTypes.exists(MonomorphCanon.isPrimitive) => caseSym
       case None =>
         throw InternalCompilerException(
           s"Solver gap: no enum specialization for ${caseSym.enumSym} at $argTypes. " +
@@ -119,30 +125,16 @@ object SolutionSpecialization {
   }
 
   /**
-    * True if `tpe` is (or contains) `AnyType` — the defaulted type `MonomorphCanon` assigns to a
-    * stray, otherwise-unconstrained type var (e.g. an unreachable/dead pattern-match arm). A miss
-    * against `enumTable`/`structTable` at such a type isn't a real "Solver gap": the constraint
-    * generator never saw a real value constructed at this type because there isn't one — it's a
-    * typechecking artifact, not code that runs. Keeping the original sym is the same fallback
-    * already used for genuinely non-generic types.
-    */
-  private def isAnyType(tpe: Type): Boolean = tpe match {
-    case Type.Cst(TypeConstructor.AnyType, _) => true
-    case Type.Apply(t1, t2, _) => isAnyType(t1) || isAnyType(t2)
-    case _ => false
-  }
-
-  /**
     * Returns the struct sym to use for a `StructNew`/`StructGet`/`StructPut` whose original
     * struct is `sym` and whose ground struct type at this expression site is `groundStructTpe`.
-    * Same "non-generic keeps original / generic must be in `structTable` / miss is a Solver gap"
-    * shape as `lookupCaseSym`.
+    * Same "non-generic / no-primitive-argument keeps original, otherwise must be in
+    * `structTable`, miss is a Solver gap" shape as `lookupCaseSym`.
     */
   private def lookupStructSym(sym: Symbol.StructSym, groundStructTpe: Type)(implicit ctx: Context): Symbol.StructSym = {
     val argTypes = groundStructTpe.typeArguments
     ctx.structTable.get((sym, argTypes)) match {
       case Some(freshStructSym) => freshStructSym
-      case None if argTypes.isEmpty || argTypes.exists(isAnyType) => sym
+      case None if argTypes.isEmpty || !argTypes.exists(MonomorphCanon.isPrimitive) => sym
       case None =>
         throw InternalCompilerException(
           s"Solver gap: no struct specialization for $sym at $argTypes. " +
@@ -158,6 +150,46 @@ object SolutionSpecialization {
     */
   private def tolerant[A](lookup: => A, keep: => A): A =
     try lookup catch { case _: InternalCompilerException => keep }
+
+  /**
+    * Projects `tuple` to its "specialization signature" for grouping: a primitive argument is
+    * kept exactly (two tuples only share a declaration if they agree on every primitive
+    * position), a non-primitive argument collapses to a single `AnyType` marker used *only* as a
+    * grouping key (`Type.Cst` equality ignores `loc`, so this groups correctly regardless of
+    * where each non-primitive type came from) — never used to build an actual field type, see
+    * `partialSubst`.
+    */
+  private def specializationSignature(tuple: List[Type]): List[Type] =
+    tuple.map(t => if (MonomorphCanon.isPrimitive(t)) t else Type.mkAnyType(t.loc))
+
+  /**
+    * Builds the substitution — and the surviving type parameter list — for one partially
+    * specialized declaration from its `signature` (see `specializationSignature`): a primitive
+    * position substitutes the declaration's tparam with the pinned concrete type; a non-primitive
+    * position substitutes it with a *fresh* type variable instead, kept (in original order) in
+    * the returned `survivingTparams` list so the specialized declaration stays genuinely generic
+    * in that position — e.g. `Result[Int32, String]`/`Result[Int32, Option[Int32]]` share
+    * `Result$N[b] { case Ok(Int32), case Err(b) }`.
+    *
+    * Deliberately does NOT go through `StrictSubstitution`/`MonomorphCanon.default`: `default`
+    * would treat the fresh variable as an unconstrained stray var and default it straight to
+    * `AnyType`, silently collapsing this back into "erase to Object" — the design explicitly
+    * rejected in favor of this one. Instead this mirrors how `visitEnumCase`/`visitStructField`
+    * already treat the *original*, still-polymorphic declaration's field types
+    * (`MonomorphCanon.simplify(_, isGround = false)`, at the call sites below): fold structural
+    * type formulas without forcing groundness or defaulting anything.
+    */
+  private def partialSubst(tparams: List[TypedAst.TypeParam], signature: List[Type])
+                           (implicit flix: Flix): (Map[Symbol.KindedTypeVarSym, Type], List[TypedAst.TypeParam]) = {
+    implicit val scope: RegionScope = RegionScope.Top
+    val pairs = tparams.zip(signature).map {
+      case (tp, sig) if MonomorphCanon.isPrimitive(sig) => (tp.sym -> sig, None)
+      case (tp, _) =>
+        val fv = Type.freshVar(tp.sym.kind, tp.loc)
+        (tp.sym -> fv, Some(TypedAst.TypeParam(tp.name, fv.sym, tp.loc)))
+    }
+    (pairs.map(_._1).toMap, pairs.flatMap(_._2))
+  }
 
   // ---- StrictSubstitution (verbatim from Specialization) ----------------------
 
@@ -834,10 +866,15 @@ object SolutionSpecialization {
       val head = rewriteTypeAppHead(tpe)
       val args = rewriteTypeAppArgs(tpe)
       head match {
+        // Partial specialization (see `partialSubst`): the specialized declaration only kept the
+        // non-primitive positions as real type arguments, in original order — the primitive ones
+        // were pinned into the declaration itself, so they're dropped here too, not passed as Nil.
         case Type.Cst(TypeConstructor.Enum(sym, _), _) if ctx.enumTable.contains((sym, args)) =>
-          Type.mkEnum(ctx.enumTable((sym, args)), Nil, loc)
+          val survivingArgs = args.filterNot(MonomorphCanon.isPrimitive).map(rewriteEnumStructType)
+          Type.mkEnum(ctx.enumTable((sym, args)), survivingArgs, loc)
         case Type.Cst(TypeConstructor.Struct(sym, _), _) if ctx.structTable.contains((sym, args)) =>
-          Type.mkStruct(ctx.structTable((sym, args)), Nil, loc)
+          val survivingArgs = args.filterNot(MonomorphCanon.isPrimitive).map(rewriteEnumStructType)
+          Type.mkStruct(ctx.structTable((sym, args)), survivingArgs, loc)
         case _ =>
           args.foldLeft(rewriteEnumStructType(head)) { case (acc, arg) => Type.Apply(acc, rewriteEnumStructType(arg), loc) }
       }
@@ -1103,31 +1140,36 @@ object SolutionSpecialization {
     // Build enum/struct entries: one per (sym, tuple) pair from the solution, for enums/structs
     // with a nonempty tparams list (non-generic ones need no specialization at all — see
     // lookupCaseSym/lookupStructSym's "argTypes.isEmpty" case, which keeps the original sym).
-    // Much simpler than defs' entries above: no instance-tparam-prefix / default-sig-tparam
-    // complexity, just the declaration's own tparams zipped with the solved tuple. Same
-    // speculative-tuple tolerance as defs (drop on InternalCompilerException rather than crash
-    // the whole computation) for consistency, even though it's less likely to matter here (enum
-    // case field types rarely carry trait constraints the way def signatures do).
+    //
+    // Specialize wrt. primitive types only, per-position (design settled with Magnus/refined by
+    // Simon, see notes/design_questions.md's "✅ Resolved by Magnus directly"): each type argument
+    // is judged independently. Solved tuples are grouped by their "signature" — primitive
+    // arguments kept exact, non-primitive arguments collapsed to a single AnyType marker purely
+    // for grouping — so e.g. Result[Int32, String] and Result[Int32, Option[Int32]] share one
+    // declaration (position 0 pinned to Int32, position 1 stays generic), while Result[String,
+    // Int32] gets a different one (position 1 pinned instead). A tuple with *no* primitive
+    // argument at all (e.g. Result[String, String]) is dropped entirely — nothing would be
+    // pinned, so it's the same as the original declaration; `lookupCaseSym`/`lookupStructSym`'s
+    // "keep original" fallback (`!argTypes.exists(isPrimitive)`) covers exactly this case.
     val enumEntries: List[(Symbol.EnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
       for {
         (sym, tuples) <- solution.enums.toList
         enm           <- root.enums.get(sym).toList
         if enm.tparams.nonEmpty
-        tuple         <- tuples.toList
-        substMap       = enm.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
+        (signature, exactTuples) <- tuples.toList.groupBy(specializationSignature).toList
+        if signature.exists(MonomorphCanon.isPrimitive)
         freshSym       = Symbol.freshEnumSym(enm.sym)
-        subst         <- try {
-                           List(StrictSubstitution.mk(Substitution(substMap)))
-                         } catch {
-                           case _: InternalCompilerException => Nil
+        (substMap, survivingTparams) = partialSubst(enm.tparams, signature)
+        newEnum        = {
+                           val newCases = enm.cases.map { case (caseSym, TypedAst.Case(_, tpes, sc, cloc)) =>
+                             val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, caseSym.ordinal, caseSym.loc)
+                             val newTpes = tpes.map(t => MonomorphCanon.simplify(Substitution(substMap)(t), isGround = false))
+                             newCaseSym -> TypedAst.Case(newCaseSym, newTpes, sc, cloc)
+                           }
+                           TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, survivingTparams, enm.derives, newCases, enm.loc)
                          }
-      } yield {
-        val newCases = enm.cases.map { case (caseSym, TypedAst.Case(_, tpes, sc, cloc)) =>
-          val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, caseSym.ordinal, caseSym.loc)
-          newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
-        }
-        (sym, tuple, freshSym, TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc))
-      }
+        exactTuple    <- exactTuples
+      } yield (sym, exactTuple, freshSym, newEnum)
 
     val enumTableMap: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym] =
       enumEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
@@ -1137,21 +1179,20 @@ object SolutionSpecialization {
         (sym, tuples) <- solution.structs.toList
         struct        <- root.structs.get(sym).toList
         if struct.tparams.nonEmpty
-        tuple         <- tuples.toList
-        substMap       = struct.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
+        (signature, exactTuples) <- tuples.toList.groupBy(specializationSignature).toList
+        if signature.exists(MonomorphCanon.isPrimitive)
         freshSym       = Symbol.freshStructSym(struct.sym)
-        subst         <- try {
-                           List(StrictSubstitution.mk(Substitution(substMap)))
-                         } catch {
-                           case _: InternalCompilerException => Nil
+        (substMap, survivingTparams) = partialSubst(struct.tparams, signature)
+        newStruct      = {
+                           val newFields = struct.fields.map { case (fieldSym, TypedAst.StructField(_, tpe, floc)) =>
+                             val newFieldSym = new Symbol.StructFieldSym(freshSym, fieldSym.name, fieldSym.loc)
+                             val newTpe = MonomorphCanon.simplify(Substitution(substMap)(tpe), isGround = false)
+                             newFieldSym -> TypedAst.StructField(newFieldSym, newTpe, floc)
+                           }
+                           TypedAst.Struct(struct.doc, struct.ann, struct.mod, freshSym, survivingTparams, struct.sc, newFields, struct.loc)
                          }
-      } yield {
-        val newFields = struct.fields.map { case (fieldSym, TypedAst.StructField(_, tpe, floc)) =>
-          val newFieldSym = new Symbol.StructFieldSym(freshSym, fieldSym.name, fieldSym.loc)
-          newFieldSym -> TypedAst.StructField(newFieldSym, subst(tpe), floc)
-        }
-        (sym, tuple, freshSym, TypedAst.Struct(struct.doc, struct.ann, struct.mod, freshSym, Nil, struct.sc, newFields, struct.loc))
-      }
+        exactTuple    <- exactTuples
+      } yield (sym, exactTuple, freshSym, newStruct)
 
     val structTableMap: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym] =
       structEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
