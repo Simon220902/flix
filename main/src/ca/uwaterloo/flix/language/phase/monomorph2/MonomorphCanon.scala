@@ -32,11 +32,11 @@ import scala.collection.immutable.SortedSet
   * Both the solver (`ConstraintSolver`, which computes types symbolically, ahead of time) and the
   * specializer (`SolutionSpecialization`, which computes the logically same types concretely, at
   * an actual call site) must agree on this, or their `(sym, type)` defTable keys diverge for the
-  * same instantiation. See `notes/plan_canonicalization_unification.md` for the full argument.
+  * same instantiation.
   *
   * Lifted from `SolutionSpecialization.scala`'s `StrictSubstitution` (the pipeline's actual source
   * of truth for what canonicalization should produce). `Specialization.scala` (the demand-driven
-  * baseline) keeps its own separate copy — out of scope, see that plan doc.
+  * baseline) keeps its own separate copy — out of scope for this unification.
   */
 private[monomorph2] object MonomorphCanon {
 
@@ -45,7 +45,7 @@ private[monomorph2] object MonomorphCanon {
     * Shared by the solver (sig dispatch, `resolveSig`) and the specializer (`ApplySig`
     * resolution) — pure data reshaping, not part of canonicalization proper, but duplicated
     * the same way across both, so it lives here too. `Specialization.scala` (the demand-driven
-    * baseline) keeps its own separate copy — out of scope, see the plan doc.
+    * baseline) keeps its own separate copy — out of scope for this unification.
     */
   def mkInstanceMap(instances: ListMap[Symbol.TraitSym, TypedAst.Instance]): Map[(Symbol.TraitSym, TypeConstructor), TypedAst.Instance] =
     instances.map { case (sym, inst) => ((sym, inst.tpe.typeConstructor.get), inst) }.toMap
@@ -98,9 +98,12 @@ private[monomorph2] object MonomorphCanon {
     val Type.Apply(tpe1, tpe2, loc) = app
     val x = normalize(tpe1)
     val y = normalize(tpe2)
-    // ponytail: check result's kind, not original's — substitution may change a higher-kinded var's kind
+    // Check x's kind, not the original app's — substitution may change a higher-kinded var's
+    // kind. Type.Apply(x, y, _).kind is computed purely from x.kind (Kind.Arrow's codomain); y
+    // never enters into it, so checking x.kind directly is equivalent and avoids allocating a
+    // throwaway Type.Apply just to read the kind.
     (x, y) match {
-      case _ if isGround && Type.Apply(x, y, loc).kind == Kind.Eff => canonicalEffect(Type.Apply(x, y, loc))
+      case _ if isGround && (x.kind match { case Kind.Arrow(_, k) => k == Kind.Eff; case _ => false }) => canonicalEffect(Type.Apply(x, y, loc))
       case (Type.Cst(TypeConstructor.Complement, _), y) => Type.mkComplement(y, loc)
       case (Type.Apply(Type.Cst(TypeConstructor.Union, _), x, _), y) => Type.mkUnion(x, y, loc)
       case (Type.Apply(Type.Cst(TypeConstructor.Intersection, _), x, _), y) => Type.mkIntersection(x, y, loc)
@@ -138,51 +141,21 @@ private[monomorph2] object MonomorphCanon {
   /**
     * Defaults an unresolved (stray) type to its kind's ground default: `Star` (and other
     * value-like kinds) → `AnyType`, `Eff` → `Pure`, `CaseSet` → the empty case set, `SchemaRow` →
-    * the empty row. Unconditional — see `notes/plan_canonicalization_unification.md` Part B for
-    * why defaulting a trait-constrained `Star` var can only fail safely, not unsoundly.
+    * the empty row. Unconditional: a `Star` var can only be stray here because nothing in the
+    * program actually constrained it to a concrete type, so defaulting it to `AnyType` can at
+    * worst make an unreachable/dead code path fail a downstream lookup cleanly — it can't silently
+    * produce a wrong-but-plausible specialization, since a real call site would have supplied a
+    * concrete type instead of leaving the var free.
     */
   def default(tpe0: Type): Type = tpe0.kind match {
-    case Kind.Wild          => Type.mkAnyType(tpe0.loc)
-    case Kind.WildCaseSet   => Type.mkAnyType(tpe0.loc)
-    case Kind.Star          => Type.mkAnyType(tpe0.loc)
-    case Kind.Eff           => Type.Pure
-    case Kind.Bool          => Type.mkAnyType(tpe0.loc)
-    case Kind.RecordRow     => Type.RecordRowEmpty
-    case Kind.SchemaRow     => Type.SchemaRowEmpty
-    case Kind.Predicate     => Type.mkAnyType(tpe0.loc)
-    case Kind.CaseSet(sym)  => Type.Cst(TypeConstructor.CaseSet(SortedSet.empty, sym), tpe0.loc)
-    case Kind.Arrow(_, _)   => Type.mkAnyType(tpe0.loc)
-    case Kind.Jvm           => throw InternalCompilerException(s"Unexpected type: '$tpe0'.", tpe0.loc)
-    case Kind.Error         => throw InternalCompilerException(s"Unexpected type '$tpe0'.", tpe0.loc)
-  }
-
-  /**
-    * True iff `tpe` is one of the 8 unboxed primitive types. This is the "specialize wrt.
-    * primitive types only" test: an enum/struct instantiation only gets its own specialized
-    * declaration when every type argument is primitive (`Option[Int32]`); if any argument is
-    * not (`Option[String]`, `Option[Result[String, Int32]]`), the instantiation is not
-    * specialized at all — it keeps using the original polymorphic declaration, the same
-    * already-existing fallback non-generic types and dead-code `AnyType` defaults use (see
-    * `lookupCaseSym`/`lookupStructSym` in `SolutionSpecialization.scala`). Deliberately does NOT
-    * erase the non-primitive case to `AnyType` and share one specialized declaration the way
-    * `Eraser.scala` does downstream — that would need cast insertion at every construction/
-    * extraction site and risks depending on field-type precision some later phase (e.g. pattern
-    * compilation) might still need; "don't specialize, stay polymorphic" carries none of that
-    * risk since it reuses an already-correct, already-tested path.
-    *
-    * `tpe` is assumed ground (no free type variables) — the caller only ever applies this to
-    * already-solved instantiation tuples.
-    */
-  def isPrimitive(tpe: Type): Boolean = tpe match {
-    case Type.Cst(TypeConstructor.Bool, _)    => true
-    case Type.Cst(TypeConstructor.Char, _)    => true
-    case Type.Cst(TypeConstructor.Float32, _) => true
-    case Type.Cst(TypeConstructor.Float64, _) => true
-    case Type.Cst(TypeConstructor.Int8, _)    => true
-    case Type.Cst(TypeConstructor.Int16, _)   => true
-    case Type.Cst(TypeConstructor.Int32, _)   => true
-    case Type.Cst(TypeConstructor.Int64, _)   => true
-    case _                                    => false
+    case Kind.Wild | Kind.WildCaseSet | Kind.Star | Kind.Bool | Kind.Predicate | Kind.Arrow(_, _) =>
+      Type.mkAnyType(tpe0.loc)
+    case Kind.Eff          => Type.Pure
+    case Kind.RecordRow    => Type.RecordRowEmpty
+    case Kind.SchemaRow    => Type.SchemaRowEmpty
+    case Kind.CaseSet(sym) => Type.Cst(TypeConstructor.CaseSet(SortedSet.empty, sym), tpe0.loc)
+    case Kind.Jvm          => throw InternalCompilerException(s"Unexpected type: '$tpe0'.", tpe0.loc)
+    case Kind.Error        => throw InternalCompilerException(s"Unexpected type '$tpe0'.", tpe0.loc)
   }
 
   // ---- Record / schema helpers (used only by normalizeApply) ------------------

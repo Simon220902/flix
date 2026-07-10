@@ -16,25 +16,31 @@
 
 package ca.uwaterloo.flix.language.phase.monomorph2
 
-import ca.uwaterloo.flix.api.Flix
-import ca.uwaterloo.flix.language.ast.TypedAst.{Binder, Expr, Instance, StructField}
-import ca.uwaterloo.flix.language.ast.shared.SymUse.{CaseSymUse, DefSymUse, LocalDefSymUse, StructFieldSymUse}
+import ca.uwaterloo.flix.api.{Flix, FlixEvent}
+import ca.uwaterloo.flix.language.ast.TypedAst.{Binder, Instance}
 import ca.uwaterloo.flix.language.ast.shared.RegionScope
-import ca.uwaterloo.flix.language.ast.{AtomicOp, Kind, MonoAst, RigidityEnv, SemanticOp, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
+import ca.uwaterloo.flix.language.ast.{Kind, MonoAst, RigidityEnv, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.dbg.AstPrinter.*
-import ca.uwaterloo.flix.language.phase.monomorph.Symbols
 import ca.uwaterloo.flix.language.phase.monomorph2.ConstraintSolver.Solution
 import ca.uwaterloo.flix.language.phase.typer.ConstraintSolver2
 import ca.uwaterloo.flix.language.phase.unification.Substitution
-import ca.uwaterloo.flix.util.collection.{ListOps, MapOps, Nel}
+import ca.uwaterloo.flix.util.collection.MapOps
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
+import scala.annotation.tailrec
 import scala.collection.mutable
 
 /**
   * Solution-driven specialization: uses the solver solution from Phase 3 to specialize
   * all defs in a single parallel pass, with no demand-driven fallback. Crashes on any
   * call site not covered by the solution ("solver gap"), which identifies missing constraints.
+  *
+  * Interplay with `SolutionLowering.scala`: this object is the entry point (`run`) and owns the
+  * `Context` lookup tables (`defTable`/`enumTable`/`structTable`), built here from the solution —
+  * but the actual per-def specialize+lower walk lives in `SolutionLowering.visitDef`, which calls
+  * back into this object's `lookupSym`/`lookupCaseSym`/`lookupStructSym`/`resolveSigSym` mid-walk
+  * to resolve each call/tag/struct site. Not a one-directional pipeline: `run` calls
+  * `SolutionLowering.visitDef`, which calls back into functions defined here.
   */
 object SolutionSpecialization {
 
@@ -48,8 +54,8 @@ object SolutionSpecialization {
     * `defTable` maps (original sym, instantiated arrow type) → fresh specialized sym.
     * `enumTable`/`structTable` map (original sym, ground type-arg tuple) → fresh specialized
     * sym, mirroring `defTable` — see `lookupCaseSym`/`lookupStructSym` and the `Expr.Tag`/
-    * `StructNew`/`StructGet`/`StructPut`/`Pattern.Tag` cases in `specializeExp`/`specializePat`
-    * that consult them.
+    * `StructNew`/`StructGet`/`StructPut`/`Pattern.Tag` cases in `SolutionLowering.visitExp`/
+    * `visitPat` (the fused specialize+lower walk) that consult them.
     *
     * package-visible (not `private`): `SolutionLowering.scala` (this pipeline's own fork of
     * `Lowering.scala`) needs it as the type its `ctx` implicit is threaded through.
@@ -58,7 +64,10 @@ object SolutionSpecialization {
     val defTable: Map[(Symbol.DefnSym, Type), Symbol.DefnSym],
     val allDefs: Map[Symbol.DefnSym, TypedAst.Def],
     val enumTable: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym],
-    val structTable: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym]
+    val structTable: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym],
+    // Carried here (rather than as a separate implicit threaded through every SolutionLowering
+    // helper) solely for the fused walk's ApplySig case, which calls resolveSigSym.
+    val instances: Map[(Symbol.TraitSym, TypeConstructor), Instance]
   ) {
     private val specializedDefs: mutable.Map[Symbol.DefnSym, MonoAst.Def] = mutable.Map.empty
 
@@ -67,6 +76,17 @@ object SolutionSpecialization {
 
     def getSpecializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
       synchronized { specializedDefs.toMap }
+
+    // Tracks which of "regularDefs"/"instanceDefs"/"defaultSigImpls" each specialized def came
+    // from (by original, pre-specialization sym) — diagnostic only, for `MonomorphBench`'s
+    // `Xmonobench` table. Tagged at both `run`'s non-parametric and parametric specialization
+    // sites, where `defToInst`/`defaultSigDefs` are already in scope to make the call.
+    private val defCategoryCounts: mutable.Map[String, Int] = mutable.Map.empty.withDefaultValue(0)
+
+    def incrementDefCategory(category: String): Unit =
+      synchronized { defCategoryCounts(category) = defCategoryCounts(category) + 1 }
+
+    def getDefCategoryCounts: Map[String, Int] = synchronized { defCategoryCounts.toMap }
   }
 
   // ---- lookupSym -------------------------------------------------------------
@@ -83,7 +103,7 @@ object SolutionSpecialization {
     * site in this pipeline, no demand-driven fallback.
     */
   private[monomorph2] def lookupSym(sym: Symbol.DefnSym, it: Type)
-                       (implicit ctx: Context, root: TypedAst.Root): Symbol.DefnSym = {
+                       (implicit ctx: Context): Symbol.DefnSym = {
     val defn = ctx.allDefs.getOrElse(sym, throw InternalCompilerException(s"lookupSym: sym not in allDefs: $sym", sym.loc))
     // Check defTable first: polymorphic instance defs and default-sig impls may have empty
     // spec.tparams but still need specialization (via instTparams / traitTparams).
@@ -103,20 +123,15 @@ object SolutionSpecialization {
     * - Non-generic enums (`groundEnumTpe` has no type arguments): keep the original case sym —
     *   there is only one possible instantiation, so nothing was ever entered into `enumTable`
     *   for it (mirrors `lookupSym`'s "truly non-parametric" case for defs).
-    * - No type argument is primitive (`MonomorphCanon.isPrimitive`): keep the original case sym
-    *   too — this instantiation was never specialized at all (see `enumEntries` in `run`: a
-    *   partial specialization needs at least one primitive argument to pin), and this also
-    *   covers dead-code `AnyType` defaults (`AnyType` is never primitive) without a separate
-    *   check. If *some but not all* arguments are primitive, this is expected to be a hit below
-    *   (a partial specialization), not this fallback.
-    * - Otherwise: must be in `enumTable` (pre-populated from the solver solution); a miss is a
-    *   genuine "Solver gap", same failure mode as `lookupSym`.
+    * - Generic enums: must be in `enumTable` (pre-populated from the solver solution).
+    * - Missing entries: crash with "Solver gap", same failure mode as `lookupSym` — except for a
+    *   dead-code `AnyType` default (`isAnyType`), which isn't a real gap (see its own doc comment).
     */
-  private def lookupCaseSym(caseSym: Symbol.CaseSym, groundEnumTpe: Type)(implicit ctx: Context): Symbol.CaseSym = {
+  private[monomorph2] def lookupCaseSym(caseSym: Symbol.CaseSym, groundEnumTpe: Type)(implicit ctx: Context): Symbol.CaseSym = {
     val argTypes = groundEnumTpe.typeArguments
     ctx.enumTable.get((caseSym.enumSym, argTypes)) match {
       case Some(freshEnumSym) => new Symbol.CaseSym(freshEnumSym, caseSym.name, caseSym.ordinal, caseSym.loc)
-      case None if argTypes.isEmpty || !argTypes.exists(MonomorphCanon.isPrimitive) => caseSym
+      case None if argTypes.isEmpty || argTypes.exists(isAnyType) => caseSym
       case None =>
         throw InternalCompilerException(
           s"Solver gap: no enum specialization for ${caseSym.enumSym} at $argTypes. " +
@@ -125,16 +140,30 @@ object SolutionSpecialization {
   }
 
   /**
+    * True if `tpe` is (or contains) `AnyType` — the defaulted type `MonomorphCanon` assigns to a
+    * stray, otherwise-unconstrained type var (e.g. an unreachable/dead pattern-match arm). A miss
+    * against `enumTable`/`structTable` at such a type isn't a real "Solver gap": the constraint
+    * generator never saw a real value constructed at this type because there isn't one — it's a
+    * typechecking artifact, not code that runs. Keeping the original sym is the same fallback
+    * already used for genuinely non-generic types.
+    */
+  private def isAnyType(tpe: Type): Boolean = tpe match {
+    case Type.Cst(TypeConstructor.AnyType, _) => true
+    case Type.Apply(t1, t2, _) => isAnyType(t1) || isAnyType(t2)
+    case _ => false
+  }
+
+  /**
     * Returns the struct sym to use for a `StructNew`/`StructGet`/`StructPut` whose original
     * struct is `sym` and whose ground struct type at this expression site is `groundStructTpe`.
-    * Same "non-generic / no-primitive-argument keeps original, otherwise must be in
-    * `structTable`, miss is a Solver gap" shape as `lookupCaseSym`.
+    * Same "non-generic keeps original / generic must be in `structTable` / miss is a Solver gap"
+    * shape as `lookupCaseSym`.
     */
-  private def lookupStructSym(sym: Symbol.StructSym, groundStructTpe: Type)(implicit ctx: Context): Symbol.StructSym = {
+  private[monomorph2] def lookupStructSym(sym: Symbol.StructSym, groundStructTpe: Type)(implicit ctx: Context): Symbol.StructSym = {
     val argTypes = groundStructTpe.typeArguments
     ctx.structTable.get((sym, argTypes)) match {
       case Some(freshStructSym) => freshStructSym
-      case None if argTypes.isEmpty || !argTypes.exists(MonomorphCanon.isPrimitive) => sym
+      case None if argTypes.isEmpty || argTypes.exists(isAnyType) => sym
       case None =>
         throw InternalCompilerException(
           s"Solver gap: no struct specialization for $sym at $argTypes. " +
@@ -145,51 +174,12 @@ object SolutionSpecialization {
   /**
     * Runs `lookup` (a `lookupCaseSym`/`lookupStructSym` call), falling back to `keep` if it
     * throws — used where a "Solver gap" miss doesn't necessarily mean a real constraint-generator
-    * gap (see `rewriteAtomicOp`'s doc comment for why: post-lowering types don't always match the
-    * pre-lowering keys `enumTable`/`structTable` were built from).
+    * gap: post-lowering types don't always match the pre-lowering keys `enumTable`/`structTable`
+    * were built from. Package-visible: `SolutionLowering.mkTag`, which synthesizes `Tag`
+    * expressions outside the ordinary `Expr.Tag` rewrite path, is the sole caller.
     */
-  private def tolerant[A](lookup: => A, keep: => A): A =
+  private[monomorph2] def tolerant[A](lookup: => A, keep: => A): A =
     try lookup catch { case _: InternalCompilerException => keep }
-
-  /**
-    * Projects `tuple` to its "specialization signature" for grouping: a primitive argument is
-    * kept exactly (two tuples only share a declaration if they agree on every primitive
-    * position), a non-primitive argument collapses to a single `AnyType` marker used *only* as a
-    * grouping key (`Type.Cst` equality ignores `loc`, so this groups correctly regardless of
-    * where each non-primitive type came from) — never used to build an actual field type, see
-    * `partialSubst`.
-    */
-  private def specializationSignature(tuple: List[Type]): List[Type] =
-    tuple.map(t => if (MonomorphCanon.isPrimitive(t)) t else Type.mkAnyType(t.loc))
-
-  /**
-    * Builds the substitution — and the surviving type parameter list — for one partially
-    * specialized declaration from its `signature` (see `specializationSignature`): a primitive
-    * position substitutes the declaration's tparam with the pinned concrete type; a non-primitive
-    * position substitutes it with a *fresh* type variable instead, kept (in original order) in
-    * the returned `survivingTparams` list so the specialized declaration stays genuinely generic
-    * in that position — e.g. `Result[Int32, String]`/`Result[Int32, Option[Int32]]` share
-    * `Result$N[b] { case Ok(Int32), case Err(b) }`.
-    *
-    * Deliberately does NOT go through `StrictSubstitution`/`MonomorphCanon.default`: `default`
-    * would treat the fresh variable as an unconstrained stray var and default it straight to
-    * `AnyType`, silently collapsing this back into "erase to Object" — the design explicitly
-    * rejected in favor of this one. Instead this mirrors how `visitEnumCase`/`visitStructField`
-    * already treat the *original*, still-polymorphic declaration's field types
-    * (`MonomorphCanon.simplify(_, isGround = false)`, at the call sites below): fold structural
-    * type formulas without forcing groundness or defaulting anything.
-    */
-  private def partialSubst(tparams: List[TypedAst.TypeParam], signature: List[Type])
-                           (implicit flix: Flix): (Map[Symbol.KindedTypeVarSym, Type], List[TypedAst.TypeParam]) = {
-    implicit val scope: RegionScope = RegionScope.Top
-    val pairs = tparams.zip(signature).map {
-      case (tp, sig) if MonomorphCanon.isPrimitive(sig) => (tp.sym -> sig, None)
-      case (tp, _) =>
-        val fv = Type.freshVar(tp.sym.kind, tp.loc)
-        (tp.sym -> fv, Some(TypedAst.TypeParam(tp.name, fv.sym, tp.loc)))
-    }
-    (pairs.map(_._1).toMap, pairs.flatMap(_._2))
-  }
 
   // ---- StrictSubstitution (verbatim from Specialization) ----------------------
 
@@ -197,7 +187,7 @@ object SolutionSpecialization {
   private val RegionInstantiation: TypeConstructor.Effect =
     TypeConstructor.Effect(Symbol.IO, Kind.Eff)
 
-  private object StrictSubstitution {
+  private[monomorph2] object StrictSubstitution {
     val empty: StrictSubstitution = StrictSubstitution(Substitution.empty)
 
     def mk(s: Substitution)(implicit root: TypedAst.Root, flix: Flix): StrictSubstitution = {
@@ -208,7 +198,7 @@ object SolutionSpecialization {
     }
   }
 
-  private case class StrictSubstitution(s: Substitution) {
+  private[monomorph2] case class StrictSubstitution(s: Substitution) {
     def apply(tpe0: Type)(implicit root: TypedAst.Root, flix: Flix): Type = tpe0 match {
       case v@Type.Var(sym, _) => s.m.get(sym) match {
         case None    => MonomorphCanon.default(v)
@@ -233,19 +223,19 @@ object SolutionSpecialization {
 
   // ---- Helpers (verbatim from Specialization) ---------------------------------
 
-  def visitStructField(field: TypedAst.StructField)(implicit root: TypedAst.Root, flix: Flix): TypedAst.StructField =
+  private def visitStructField(field: TypedAst.StructField)(implicit root: TypedAst.Root, flix: Flix): TypedAst.StructField =
     field match {
       case TypedAst.StructField(fieldSym, tpe, loc) =>
         TypedAst.StructField(fieldSym, MonomorphCanon.simplify(tpe, isGround = false), loc)
     }
 
-  def visitEnumCase(caze: TypedAst.Case)(implicit root: TypedAst.Root, flix: Flix): TypedAst.Case =
+  private def visitEnumCase(caze: TypedAst.Case)(implicit root: TypedAst.Root, flix: Flix): TypedAst.Case =
     caze match {
       case TypedAst.Case(sym, tpes, sc, loc) =>
         TypedAst.Case(sym, tpes.map(MonomorphCanon.simplify(_, isGround = false)), sc, loc)
     }
 
-  def visitRestrictableEnumCase(caze: TypedAst.RestrictableCase)(implicit root: TypedAst.Root, flix: Flix): TypedAst.RestrictableCase =
+  private def visitRestrictableEnumCase(caze: TypedAst.RestrictableCase)(implicit root: TypedAst.Root, flix: Flix): TypedAst.RestrictableCase =
     caze match {
       case TypedAst.RestrictableCase(caseSym0, tpes, sc, loc) =>
         TypedAst.RestrictableCase(caseSym0, tpes.map(MonomorphCanon.simplify(_, isGround = false)), sc, loc)
@@ -262,531 +252,7 @@ object SolutionSpecialization {
         TypedAst.Op(sym, spec, loc)
     }
 
-  private def specializeDef(freshSym: Symbol.DefnSym, defn: TypedAst.Def, subst: StrictSubstitution)
-                            (implicit ctx: Context, instances: Map[(Symbol.TraitSym, TypeConstructor), Instance], root: TypedAst.Root, flix: Flix): TypedAst.Def = {
-    try {
-      val (specializedFparams, env0) = specializeFormalParams(defn.spec.fparams, subst)
-      val specializedExp = specializeExp(defn.exp, env0, subst)
-      val spec0 = defn.spec
-      val declaredScheme = spec0.declaredScheme.copy(base = subst(spec0.declaredScheme.base))
-      val spec = TypedAst.Spec(spec0.doc, spec0.ann, spec0.mod, spec0.tparams, specializedFparams,
-        declaredScheme, subst(spec0.retTpe), subst(spec0.eff), spec0.tconstrs, spec0.econstrs)
-      TypedAst.Def(freshSym, spec, specializedExp, defn.loc)
-    } catch {
-      case e: InternalCompilerException =>
-        throw InternalCompilerException(s"[in ${defn.sym} (subst: $subst)]: ${e.message}", e.loc)
-    }
-  }
-
-  // ---- specializeExp (verbatim from Specialization except ApplyDef/ApplySig) --
-
-  private def specializeExp(exp0: TypedAst.Expr, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                            (implicit ctx: Context, instances: Map[(Symbol.TraitSym, TypeConstructor), Instance], root: TypedAst.Root, flix: Flix): TypedAst.Expr = exp0 match {
-
-    case Expr.Var(sym, tpe, loc) =>
-      Expr.Var(env0(sym), subst(tpe), loc)
-
-    case Expr.Cst(cst, tpe, loc) =>
-      Expr.Cst(cst, subst(tpe), loc)
-
-    case Expr.Hole(sym, scp, tpe, eff, loc) =>
-      Expr.Hole(sym, scp, subst(tpe), subst(eff), loc)
-
-    case Expr.HoleWithExp(exp, scp, tpe, eff, loc) =>
-      Expr.HoleWithExp(specializeExp(exp, env0, subst), scp, subst(tpe), subst(eff), loc)
-
-    case Expr.OpenAs(symUse, exp, tpe, loc) =>
-      Expr.OpenAs(symUse, specializeExp(exp, env0, subst), subst(tpe), loc)
-
-    case Expr.Use(symbol, alias, exp, loc) =>
-      Expr.Use(symbol, alias, specializeExp(exp, env0, subst), loc)
-
-    case Expr.Lambda(fparam, exp, tpe, loc) =>
-      val (p, env1) = specializeFormalParam(fparam, subst)
-      Expr.Lambda(p, specializeExp(exp, env0 ++ env1, subst), subst(tpe), loc)
-
-    case Expr.ApplyClo(exp1, exp2, tpe, eff, pos, loc) =>
-      Expr.ApplyClo(specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), subst(tpe), subst(eff), pos, loc)
-
-    case Expr.ApplyDef(symUse, exps, targs, itpe, tpe, eff, pos, loc) =>
-      val it = subst(itpe)
-      // ponytail: crash on solver gaps instead of demand-driven fallback
-      val newSym = lookupSym(symUse.sym, it)
-      val es = exps.map(specializeExp(_, env0, subst))
-      Expr.ApplyDef(DefSymUse(newSym, symUse.loc), es, targs, it, subst(tpe), subst(eff), pos, loc)
-
-    case Expr.ApplyLocalDef(symUse, exps, arrowTpe, tpe, eff, pos, loc) =>
-      Expr.ApplyLocalDef(LocalDefSymUse(env0(symUse.sym), symUse.loc),
-        exps.map(specializeExp(_, env0, subst)), subst(arrowTpe), subst(tpe), subst(eff), pos, loc)
-
-    case Expr.ApplyOp(sym, exps, tpe, eff, pos, loc) =>
-      Expr.ApplyOp(sym, exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), pos, loc)
-
-    case Expr.ApplySig(symUse, exps, _, targs, itpe, tpe, eff, pos, loc) =>
-      val it = subst(itpe)
-      val resolvedDef = resolveSigSym(symUse.sym, it)
-      val newSym = lookupSym(resolvedDef.sym, it)
-      val es = exps.map(specializeExp(_, env0, subst))
-      Expr.ApplyDef(DefSymUse(newSym, symUse.loc), es, targs, it, subst(tpe), subst(eff), pos, loc)
-
-    case Expr.Unary(sop, exp, tpe, eff, loc) => sop match {
-      case SemanticOp.ReflectOp.ReflectEff =>
-        val expTpe = subst(exp.tpe)
-        val typeArg = expTpe.typeArguments.headOption.getOrElse(
-          throw InternalCompilerException(s"Expected ProxyEff[ef] type, got $expTpe", loc))
-        val purityEnumSym = Symbols.Enums.Purity
-        val caseName = typeArg match {
-          case Type.Cst(TypeConstructor.Pure, _) => "Pure"
-          case _                                 => "Impure"
-        }
-        val caseSym = root.enums(purityEnumSym).cases.values.find(_.sym.name == caseName).get.sym
-        Expr.Tag(CaseSymUse(caseSym, loc), Nil, Type.mkEnum(purityEnumSym, Nil, loc), Type.Pure, loc)
-
-      case SemanticOp.ReflectOp.ReflectType =>
-        val expTpe = subst(exp.tpe)
-        val typeArg = expTpe.typeArguments.headOption.getOrElse(
-          throw InternalCompilerException(s"Expected Proxy[t] type, got $expTpe", loc))
-        val jvmTypeEnumSym = Symbols.Enums.JvmType
-        val caseName = typeArg.baseType match {
-          case Type.Cst(TypeConstructor.Bool, _)    => "JvmBool"
-          case Type.Cst(TypeConstructor.Char, _)    => "JvmChar"
-          case Type.Cst(TypeConstructor.Int8, _)    => "JvmInt8"
-          case Type.Cst(TypeConstructor.Int16, _)   => "JvmInt16"
-          case Type.Cst(TypeConstructor.Int32, _)   => "JvmInt32"
-          case Type.Cst(TypeConstructor.Int64, _)   => "JvmInt64"
-          case Type.Cst(TypeConstructor.Float32, _) => "JvmFloat32"
-          case Type.Cst(TypeConstructor.Float64, _) => "JvmFloat64"
-          case _                                    => "JvmObject"
-        }
-        val caseSym = root.enums(jvmTypeEnumSym).cases.values.find(_.sym.name == caseName).get.sym
-        Expr.Tag(CaseSymUse(caseSym, loc), Nil, Type.mkEnum(jvmTypeEnumSym, Nil, loc), Type.Pure, loc)
-
-      case SemanticOp.ReflectOp.ReflectValue =>
-        val e = specializeExp(exp, env0, subst)
-        val expTpe = subst(exp.tpe)
-        val jvmValueEnumSym = Symbols.Enums.JvmValue
-        val resultType = Type.mkEnum(jvmValueEnumSym, Nil, loc)
-        val caseName = expTpe.baseType match {
-          case Type.Cst(TypeConstructor.Bool, _)    => "JvmBool"
-          case Type.Cst(TypeConstructor.Char, _)    => "JvmChar"
-          case Type.Cst(TypeConstructor.Int8, _)    => "JvmInt8"
-          case Type.Cst(TypeConstructor.Int16, _)   => "JvmInt16"
-          case Type.Cst(TypeConstructor.Int32, _)   => "JvmInt32"
-          case Type.Cst(TypeConstructor.Int64, _)   => "JvmInt64"
-          case Type.Cst(TypeConstructor.Float32, _) => "JvmFloat32"
-          case Type.Cst(TypeConstructor.Float64, _) => "JvmFloat64"
-          case _                                    => "JvmObject"
-        }
-        val caseSym = root.enums(jvmValueEnumSym).cases.values.find(_.sym.name == caseName).get.sym
-        val tagArg = if (caseName == "JvmObject") {
-          val objType = Type.mkNative(classOf[java.lang.Object], loc)
-          Expr.UncheckedCast(e, Some(objType), None, objType, Type.Pure, loc)
-        } else { e }
-        Expr.Tag(CaseSymUse(caseSym, loc), List(tagArg), resultType, subst(eff), loc)
-
-      case _ =>
-        Expr.Unary(sop, specializeExp(exp, env0, subst), subst(tpe), subst(eff), loc)
-    }
-
-    case Expr.Binary(sop, exp1, exp2, tpe, eff, loc) =>
-      Expr.Binary(sop, specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.Let(bnd, exp1, exp2, tpe, eff, loc) =>
-      val freshSym = Symbol.freshVarSym(bnd.sym)
-      val env1 = env0 + (bnd.sym -> freshSym)
-      Expr.Let(Binder(freshSym, subst(bnd.tpe)), specializeExp(exp1, env0, subst), specializeExp(exp2, env1, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.LocalDef(ann, bnd, fparams, exp1, exp2, tpe, eff, loc) =>
-      val freshSym = Symbol.freshVarSym(bnd.sym)
-      val env1 = env0 + (bnd.sym -> freshSym)
-      val (fps, env2) = specializeFormalParams(fparams, subst)
-      Expr.LocalDef(ann, Binder(freshSym, subst(bnd.tpe)), fps,
-        specializeExp(exp1, env1 ++ env2, subst), specializeExp(exp2, env1, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.Region(bnd, regionVar, exp, tpe, eff, loc) =>
-      val freshSym = Symbol.freshVarSym(bnd.sym)
-      val env1 = env0 + (bnd.sym -> freshSym)
-      Expr.Region(Binder(freshSym, subst(bnd.tpe)), regionVar, specializeExp(exp, env1, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.IfThenElse(exp1, exp2, exp3, tpe, eff, loc) =>
-      Expr.IfThenElse(specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), specializeExp(exp3, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.Stm(exps, exp, tpe, eff, loc) =>
-      Expr.Stm(exps.map(specializeExp(_, env0, subst)), specializeExp(exp, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.Discard(exp, eff, loc) =>
-      Expr.Discard(specializeExp(exp, env0, subst), subst(eff), loc)
-
-    case Expr.Match(exp, rules, tpe, eff, loc0) =>
-      val rs = rules.map {
-        case TypedAst.MatchRule(pat, guard, body, loc) =>
-          val (p, env1) = specializePat(pat, Map(), subst)
-          val extendedEnv = env0 ++ env1
-          TypedAst.MatchRule(p, guard.map(specializeExp(_, extendedEnv, subst)), specializeExp(body, extendedEnv, subst), loc)
-      }
-      Expr.Match(specializeExp(exp, env0, subst), rs, subst(tpe), subst(eff), loc0)
-
-    case Expr.ExtMatch(exp, rules, tpe, eff, loc) =>
-      val rs = rules.map {
-        case TypedAst.ExtMatchRule(pat, exp1, loc1) =>
-          val (p, env1) = specializeExtPat(pat, subst)
-          TypedAst.ExtMatchRule(p, specializeExp(exp1, env0 ++ env1, subst), loc1)
-      }
-      Expr.ExtMatch(specializeExp(exp, env0, subst), rs, subst(tpe), subst(eff), loc)
-
-    case Expr.RestrictableChoose(star, exp, rules, tpe, eff, loc) =>
-      Expr.RestrictableChoose(star, specializeExp(exp, env0, subst), rules.map(specializeRestrictableChooseRule(_, env0, subst)), subst(tpe), subst(eff), loc)
-
-    case Expr.Tag(symUse, exps, tpe, eff, loc) =>
-      // The tag's own result type IS the enum's ground type at this construction site (mirrors
-      // Eraser.specializedCaseSym, which uses the ApplyAtomic's own `t` for the same reason).
-      val t = subst(tpe)
-      val newSym = lookupCaseSym(symUse.sym, t)
-      Expr.Tag(CaseSymUse(newSym, symUse.loc), exps.map(specializeExp(_, env0, subst)), t, subst(eff), loc)
-
-    case Expr.RestrictableTag(symUse, exps, tpe, eff, loc) =>
-      Expr.RestrictableTag(symUse, exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
-
-    case Expr.ExtTag(label, exps, tpe, eff, loc) =>
-      Expr.ExtTag(label, exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
-
-    case Expr.Tuple(exps, tpe, eff, loc) =>
-      Expr.Tuple(exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
-
-    case Expr.RecordSelect(exp, label, tpe, eff, loc) =>
-      Expr.RecordSelect(specializeExp(exp, env0, subst), label, subst(tpe), subst(eff), loc)
-
-    case Expr.RecordExtend(label, exp1, exp2, tpe, eff, loc) =>
-      Expr.RecordExtend(label, specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.RecordRestrict(label, exp, tpe, eff, loc) =>
-      Expr.RecordRestrict(label, specializeExp(exp, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.ArrayLit(exps, exp, tpe, eff, loc) =>
-      Expr.ArrayLit(exps.map(specializeExp(_, env0, subst)), specializeExp(exp, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.ArrayNew(exp1, exp2, exp3, tpe, eff, loc) =>
-      Expr.ArrayNew(specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), specializeExp(exp3, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.ArrayLoad(exp1, exp2, tpe, eff, loc) =>
-      Expr.ArrayLoad(specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.ArrayLength(exp, eff, loc) =>
-      Expr.ArrayLength(specializeExp(exp, env0, subst), subst(eff), loc)
-
-    case Expr.ArrayStore(exp1, exp2, exp3, eff, loc) =>
-      Expr.ArrayStore(specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), specializeExp(exp3, env0, subst), subst(eff), loc)
-
-    case Expr.StructNew(sym, fields0, region0, tpe, eff, loc) =>
-      // The StructNew's own result type IS the struct's ground type at this construction site.
-      val t = subst(tpe)
-      val newStructSym = lookupStructSym(sym, t)
-      val fields = fields0.map { case (symUse, v) =>
-        val newFieldSym = new Symbol.StructFieldSym(newStructSym, symUse.sym.name, symUse.loc)
-        (StructFieldSymUse(newFieldSym, symUse.loc), specializeExp(v, env0, subst))
-      }
-      Expr.StructNew(newStructSym, fields, region0.map(specializeExp(_, env0, subst)), t, subst(eff), loc)
-
-    case Expr.StructGet(exp, symUse, tpe, eff, loc) =>
-      // Unlike Tag/StructNew (whose own result type IS the enum/struct type), StructGet's own
-      // `tpe` is the FIELD's type — the struct being accessed is `exp`'s type instead.
-      val e = specializeExp(exp, env0, subst)
-      val newStructSym = lookupStructSym(symUse.sym.structSym, subst(exp.tpe))
-      val newFieldSym = new Symbol.StructFieldSym(newStructSym, symUse.sym.name, symUse.loc)
-      Expr.StructGet(e, StructFieldSymUse(newFieldSym, symUse.loc), subst(tpe), subst(eff), loc)
-
-    case Expr.StructPut(exp1, symUse, exp2, tpe, eff, loc) =>
-      val e1 = specializeExp(exp1, env0, subst)
-      val newStructSym = lookupStructSym(symUse.sym.structSym, subst(exp1.tpe))
-      val newFieldSym = new Symbol.StructFieldSym(newStructSym, symUse.sym.name, symUse.loc)
-      Expr.StructPut(e1, StructFieldSymUse(newFieldSym, symUse.loc), specializeExp(exp2, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.VectorLit(exps, tpe, eff, loc) =>
-      Expr.VectorLit(exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
-
-    case Expr.VectorLoad(exp1, exp2, tpe, eff, loc) =>
-      Expr.VectorLoad(specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.VectorLength(exp, loc) =>
-      Expr.VectorLength(specializeExp(exp, env0, subst), loc)
-
-    case Expr.Ascribe(exp, expectedType, expectedEff, tpe, eff, loc) =>
-      Expr.Ascribe(specializeExp(exp, env0, subst), expectedType.map(subst.apply), expectedEff.map(subst.apply), subst(tpe), subst(eff), loc)
-
-    case Expr.InstanceOf(exp, clazz, loc) =>
-      Expr.InstanceOf(specializeExp(exp, env0, subst), clazz, loc)
-
-    case Expr.UncheckedCast(exp, declaredType, declaredEff, tpe, eff, loc) =>
-      Expr.UncheckedCast(specializeExp(exp, env0, subst), declaredType.map(subst.apply), declaredEff.map(subst.apply), subst(tpe), subst(eff), loc)
-
-    case Expr.CheckedCast(cast, exp, tpe, eff, loc) =>
-      Expr.CheckedCast(cast, specializeExp(exp, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.Unsafe(exp, runEff, asEff0, tpe, eff, loc) =>
-      Expr.Unsafe(specializeExp(exp, env0, subst), subst(runEff), asEff0.map(subst.apply), subst(tpe), subst(eff), loc)
-
-    case Expr.TryCatch(exp, rules, tpe, eff, loc0) =>
-      val rs = rules.map {
-        case TypedAst.CatchRule(bnd, clazz, body, loc) =>
-          val freshSym = Symbol.freshVarSym(bnd.sym)
-          val env1 = env0 + (bnd.sym -> freshSym)
-          TypedAst.CatchRule(Binder(freshSym, subst(bnd.tpe)), clazz, specializeExp(body, env1, subst), loc)
-      }
-      Expr.TryCatch(specializeExp(exp, env0, subst), rs, subst(tpe), subst(eff), loc0)
-
-    case Expr.Throw(exp, tpe, eff, loc) =>
-      Expr.Throw(specializeExp(exp, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.Handler(symUse0, rules0, bodyTpe, bodyEff, handledEff, tpe, loc0) =>
-      val rules = rules0.map {
-        case TypedAst.HandlerRule(symUse, fparams0, exp, loc) =>
-          val (fparams, env1) = specializeFormalParams(fparams0, subst)
-          TypedAst.HandlerRule(symUse, fparams, specializeExp(exp, env0 ++ env1, subst), loc)
-      }
-      Expr.Handler(symUse0, rules, subst(bodyTpe), subst(bodyEff), subst(handledEff), subst(tpe), loc0)
-
-    case Expr.RunWith(exp1, exp2, tpe, eff, loc) =>
-      Expr.RunWith(specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.InvokeConstructor(constructor, exps, tpe, eff, loc) =>
-      Expr.InvokeConstructor(constructor, exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
-
-    case Expr.InvokeSuperConstructor(constructor, exps, tpe, eff, loc) =>
-      Expr.InvokeSuperConstructor(constructor, exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
-
-    case Expr.InvokeMethod(method, exp, exps, tpe, eff, loc) =>
-      Expr.InvokeMethod(method, specializeExp(exp, env0, subst), exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
-
-    case Expr.InvokeSuperMethod(method, exps, tpe, eff, loc) =>
-      Expr.InvokeSuperMethod(method, exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
-
-    case Expr.InvokeStaticMethod(method, exps, tpe, eff, loc) =>
-      Expr.InvokeStaticMethod(method, exps.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc)
-
-    case Expr.GetField(field, exp, tpe, eff, loc) =>
-      Expr.GetField(field, specializeExp(exp, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.PutField(field, exp1, exp2, tpe, eff, loc) =>
-      Expr.PutField(field, specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.GetStaticField(field, tpe, eff, loc) =>
-      Expr.GetStaticField(field, subst(tpe), subst(eff), loc)
-
-    case Expr.PutStaticField(field, exp, tpe, eff, loc) =>
-      Expr.PutStaticField(field, specializeExp(exp, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.NewObject(sym, clazz, tpe, eff, constructors0, methods0, loc) =>
-      Expr.NewObject(sym, clazz, subst(tpe), subst(eff),
-        constructors0.map(specializeJvmConstructor(_, env0, subst)),
-        methods0.map(specializeJvmMethod(_, env0, subst)), loc)
-
-    case Expr.NewChannel(innerExp, tpe, eff, loc) =>
-      Expr.NewChannel(specializeExp(innerExp, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.GetChannel(innerExp, tpe, eff, loc) =>
-      Expr.GetChannel(specializeExp(innerExp, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.PutChannel(innerExp1, innerExp2, tpe, eff, loc) =>
-      Expr.PutChannel(specializeExp(innerExp1, env0, subst), specializeExp(innerExp2, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.SelectChannel(rules0, default0, tpe, eff, loc0) =>
-      val rules = rules0.map {
-        case TypedAst.SelectChannelRule(bnd, chan0, exp, loc) =>
-          val freshSym = Symbol.freshVarSym(bnd.sym)
-          val env1 = env0 + (bnd.sym -> freshSym)
-          TypedAst.SelectChannelRule(Binder(freshSym, subst(bnd.tpe)), specializeExp(chan0, env1, subst), specializeExp(exp, env1, subst), loc)
-      }
-      Expr.SelectChannel(rules, default0.map(specializeExp(_, env0, subst)), subst(tpe), subst(eff), loc0)
-
-    case Expr.Spawn(exp1, exp2, tpe, eff, loc) =>
-      Expr.Spawn(specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.ParYield(frags, exp, tpe, eff, loc) =>
-      var curEnv = env0
-      val fs = frags.map {
-        case TypedAst.ParYieldFragment(pat, fragExp, fragLoc) =>
-          val (p, env1) = specializePat(pat, Map(), subst)
-          curEnv ++= env1
-          TypedAst.ParYieldFragment(p, specializeExp(fragExp, curEnv, subst), fragLoc)
-      }
-      Expr.ParYield(fs, specializeExp(exp, curEnv, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.Lazy(exp, tpe, loc) =>
-      Expr.Lazy(specializeExp(exp, env0, subst), subst(tpe), loc)
-
-    case Expr.Force(exp, tpe, eff, loc) =>
-      Expr.Force(specializeExp(exp, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.FixpointConstraintSet(cs0, tpe, loc) =>
-      Expr.FixpointConstraintSet(cs0.map(specializeConstraint(_, env0, subst)), subst(tpe), loc)
-
-    case Expr.FixpointLambda(pparams0, exp, tpe, eff, loc) =>
-      val pparams = pparams0.map {
-        case TypedAst.PredicateParam(pred, tpe0, loc0) => TypedAst.PredicateParam(pred, subst(tpe0), loc0)
-      }
-      Expr.FixpointLambda(pparams, specializeExp(exp, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.FixpointMerge(exp1, exp2, tpe, eff, loc) =>
-      Expr.FixpointMerge(specializeExp(exp1, env0, subst), specializeExp(exp2, env0, subst), subst(tpe), subst(eff), loc)
-
-    case Expr.FixpointQueryWithProvenance(exps0, select0, withh, tpe, eff, loc) =>
-      Expr.FixpointQueryWithProvenance(exps0.map(specializeExp(_, env0, subst)), specializeHeadPred(select0, env0, subst), withh, subst(tpe), subst(eff), loc)
-
-    case Expr.FixpointQueryWithSelect(exps0, queryExp0, selects0, from0, where0, pred, tpe, eff, loc) =>
-      Expr.FixpointQueryWithSelect(exps0.map(specializeExp(_, env0, subst)), specializeExp(queryExp0, env0, subst), selects0, from0, where0, pred, subst(tpe), subst(eff), loc)
-
-    case Expr.FixpointSolveWithProject(exps0, optPreds, mode, tpe, eff, loc) =>
-      Expr.FixpointSolveWithProject(exps0.map(specializeExp(_, env0, subst)), optPreds, mode, subst(tpe), subst(eff), loc)
-
-    case Expr.FixpointInjectInto(exps0, predsAndArities, tpe, eff, loc) =>
-      Expr.FixpointInjectInto(exps0.map(specializeExp(_, env0, subst)), predsAndArities, subst(tpe), subst(eff), loc)
-
-    case Expr.Error(m, _, _) =>
-      throw InternalCompilerException(s"Unexpected error expression near", m.loc)
-  }
-
-  // ---- specializeExp sub-helpers (verbatim from Specialization) ---------------
-
-  private def specializeHeadPred(p: TypedAst.Predicate.Head, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                                 (implicit ctx: Context, instances: Map[(Symbol.TraitSym, TypeConstructor), Instance], root: TypedAst.Root, flix: Flix): TypedAst.Predicate.Head = p match {
-    case TypedAst.Predicate.Head.Atom(pred, den, terms, tpe, loc) =>
-      TypedAst.Predicate.Head.Atom(pred, den, terms.map(specializeExp(_, env0, subst)), subst(tpe), loc)
-  }
-
-  private def specializeBodyPred(b0: TypedAst.Predicate.Body, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                                 (implicit ctx: Context, instances: Map[(Symbol.TraitSym, TypeConstructor), Instance], root: TypedAst.Root, flix: Flix): (TypedAst.Predicate.Body, Map[Symbol.VarSym, Symbol.VarSym]) = b0 match {
-    case TypedAst.Predicate.Body.Atom(pred0, den, polarity, fixity, terms0, tpe, loc) =>
-      val (terms, env) = specializePats(terms0, env0, subst)
-      (TypedAst.Predicate.Body.Atom(pred0, den, polarity, fixity, terms, subst(tpe), loc), env)
-    case TypedAst.Predicate.Body.Functional(outSyms0, exp, loc) =>
-      val outSyms = outSyms0.map(bnd => Binder(env0(bnd.sym), subst(bnd.tpe)))
-      (TypedAst.Predicate.Body.Functional(outSyms, specializeExp(exp, env0, subst), loc), env0)
-    case TypedAst.Predicate.Body.Guard(exp, loc) =>
-      (TypedAst.Predicate.Body.Guard(specializeExp(exp, env0, subst), loc), env0)
-  }
-
-  private def specializePats(ps: List[TypedAst.Pattern], env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                             (implicit ctx: Context, root: TypedAst.Root, flix: Flix): (List[TypedAst.Pattern], Map[Symbol.VarSym, Symbol.VarSym]) =
-    ps.foldRight((Nil: List[TypedAst.Pattern], env0)) {
-      case (pat0, (res, env1)) =>
-        val (pat, env) = specializePat(pat0, env1, subst)
-        (pat :: res, env)
-    }
-
-  private def specializeBodies(bodies: List[TypedAst.Predicate.Body], env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                               (implicit ctx: Context, instances: Map[(Symbol.TraitSym, TypeConstructor), Instance], root: TypedAst.Root, flix: Flix): (List[TypedAst.Predicate.Body], Map[Symbol.VarSym, Symbol.VarSym]) =
-    bodies.foldRight((Nil: List[TypedAst.Predicate.Body], env0)) {
-      case (body, (res, env1)) =>
-        val (pat, env) = specializeBodyPred(body, env1, subst)
-        (pat :: res, env)
-    }
-
-  private def specializeConstraint(c0: TypedAst.Constraint, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                                   (implicit ctx: Context, instances: Map[(Symbol.TraitSym, TypeConstructor), Instance], root: TypedAst.Root, flix: Flix): TypedAst.Constraint = c0 match {
-    case TypedAst.Constraint(cparams0, head0, body0, loc0) =>
-      val env = cparams0.foldLeft(env0) {
-        case (env1, TypedAst.ConstraintParam(bnd, _, _)) =>
-          if (env1.contains(bnd.sym)) env1
-          else { val freshSym = Symbol.freshVarSym(bnd.sym); env1 + (bnd.sym -> freshSym) }
-      }
-      val cparams = cparams0.map {
-        case TypedAst.ConstraintParam(bnd, tpe, loc) =>
-          TypedAst.ConstraintParam(Binder(env(bnd.sym), subst(bnd.tpe)), subst(tpe), loc)
-      }
-      val (body, env2) = specializeBodies(body0, env, subst)
-      TypedAst.Constraint(cparams, specializeHeadPred(head0, env2, subst), body, loc0)
-  }
-
-  private def specializeRestrictableChooseRule(rule0: TypedAst.RestrictableChooseRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                                               (implicit ctx: Context, instances: Map[(Symbol.TraitSym, TypeConstructor), Instance], root: TypedAst.Root, flix: Flix): TypedAst.RestrictableChooseRule = rule0 match {
-    case TypedAst.RestrictableChooseRule(pat, exp) =>
-      pat match {
-        case TypedAst.RestrictableChoosePattern.Tag(symUse, pat0, tpe, loc) =>
-          val env = pat0.foldLeft(env0) {
-            case (env1, TypedAst.RestrictableChoosePattern.Var(bnd, _, _)) =>
-              env1 + (bnd.sym -> Symbol.freshVarSym(bnd.sym))
-            case (env1, TypedAst.RestrictableChoosePattern.Wild(_, _)) => env1
-            case (_, TypedAst.RestrictableChoosePattern.Error(_, errLoc)) => throw InternalCompilerException("unexpected restrictable choose variable", errLoc)
-          }
-          val pats = pat0.map {
-            case TypedAst.RestrictableChoosePattern.Var(bnd, varTpe, varLoc) =>
-              TypedAst.RestrictableChoosePattern.Var(Binder(env(bnd.sym), subst(bnd.tpe)), subst(varTpe), varLoc)
-            case TypedAst.RestrictableChoosePattern.Wild(wildTpe, wildLoc) =>
-              TypedAst.RestrictableChoosePattern.Wild(subst(wildTpe), wildLoc)
-            case TypedAst.RestrictableChoosePattern.Error(_, errLoc) => throw InternalCompilerException("unexpected restrictable choose variable", errLoc)
-          }
-          TypedAst.RestrictableChooseRule(TypedAst.RestrictableChoosePattern.Tag(symUse, pats, subst(tpe), loc), specializeExp(exp, env, subst))
-        case TypedAst.RestrictableChoosePattern.Error(_, loc) => throw InternalCompilerException("unexpected error restrictable choose pattern", loc)
-      }
-  }
-
-  private def specializePat(p0: TypedAst.Pattern, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                            (implicit ctx: Context, root: TypedAst.Root, flix: Flix): (TypedAst.Pattern, Map[Symbol.VarSym, Symbol.VarSym]) = p0 match {
-    case TypedAst.Pattern.Wild(tpe, loc) => (TypedAst.Pattern.Wild(subst(tpe), loc), env0)
-
-    case TypedAst.Pattern.Var(bnd, tpe, loc) =>
-      val env = if (env0.contains(bnd.sym)) env0 else env0 + (bnd.sym -> Symbol.freshVarSym(bnd.sym))
-      (TypedAst.Pattern.Var(Binder(env(bnd.sym), subst(bnd.tpe)), subst(tpe), loc), env)
-
-    case TypedAst.Pattern.Cst(cst, tpe, loc) => (TypedAst.Pattern.Cst(cst, subst(tpe), loc), env0)
-
-    case TypedAst.Pattern.Tag(symUse, pats, tpe, loc) =>
-      val (ps, env) = specializePats(pats, env0, subst)
-      // The pattern's own type IS the scrutinee's enum type (mirrors Eraser.specializedCaseSym,
-      // which uses the scrutinee's `e.tpe` for the same reason).
-      val t = subst(tpe)
-      val newSym = lookupCaseSym(symUse.sym, t)
-      (TypedAst.Pattern.Tag(CaseSymUse(newSym, symUse.loc), ps, t, loc), env)
-
-    case TypedAst.Pattern.Tuple(elms, tpe, loc) =>
-      val (ps, env) = specializePats(elms.toList, env0, subst)
-      (TypedAst.Pattern.Tuple(Nel(ps.head, ps.tail), subst(tpe), loc), env)
-
-    case TypedAst.Pattern.Record(pats, pat, tpe, loc) =>
-      val (ps, envs) = pats.map {
-        case TypedAst.Pattern.Record.RecordLabelPattern(label, pat1, tpe1, loc1) =>
-          val (p1, env1) = specializePat(pat1, env0, subst)
-          (TypedAst.Pattern.Record.RecordLabelPattern(label, p1, subst(tpe1), loc1), env1)
-      }.unzip
-      val (p, env1) = specializePat(pat, env0, subst)
-      (TypedAst.Pattern.Record(ps, p, subst(tpe), loc), combineEnvs(env1 :: envs))
-
-    case TypedAst.Pattern.Error(_, loc) => throw InternalCompilerException(s"Unexpected pattern: '$p0'.", loc)
-  }
-
-  private def specializeExtPat(pat0: TypedAst.ExtPattern, subst: StrictSubstitution)
-                               (implicit root: TypedAst.Root, flix: Flix): (TypedAst.ExtPattern, Map[Symbol.VarSym, Symbol.VarSym]) = pat0 match {
-    case TypedAst.ExtPattern.Default(loc) => (TypedAst.ExtPattern.Default(loc), Map.empty)
-    case TypedAst.ExtPattern.Tag(label, pats, loc) =>
-      val (ps, symMaps) = pats.map(specializeExtTagPat(_, subst)).unzip
-      (TypedAst.ExtPattern.Tag(label, ps, loc), symMaps.foldLeft(Map.empty[Symbol.VarSym, Symbol.VarSym])(_ ++ _))
-    case TypedAst.ExtPattern.Error(loc) => throw InternalCompilerException("unexpected error ext pattern", loc)
-  }
-
-  private def specializeExtTagPat(pat0: TypedAst.ExtTagPattern, subst: StrictSubstitution)
-                                  (implicit root: TypedAst.Root, flix: Flix): (TypedAst.ExtTagPattern, Map[Symbol.VarSym, Symbol.VarSym]) = pat0 match {
-    case TypedAst.ExtTagPattern.Wild(tpe, loc)     => (TypedAst.ExtTagPattern.Wild(subst(tpe), loc), Map.empty)
-    case TypedAst.ExtTagPattern.Var(bnd, tpe, loc) =>
-      val freshSym = Symbol.freshVarSym(bnd.sym)
-      (TypedAst.ExtTagPattern.Var(Binder(freshSym, subst(bnd.tpe)), subst(tpe), loc), Map(bnd.sym -> freshSym))
-    case TypedAst.ExtTagPattern.Unit(tpe, loc)     => (TypedAst.ExtTagPattern.Unit(subst(tpe), loc), Map.empty)
-    case TypedAst.ExtTagPattern.Error(_, loc)      => throw InternalCompilerException("unexpected error ext pattern", loc)
-  }
-
-  private def specializeJvmConstructor(constructor: TypedAst.JvmConstructor, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                                       (implicit ctx: Context, instances: Map[(Symbol.TraitSym, TypeConstructor), Instance], root: TypedAst.Root, flix: Flix): TypedAst.JvmConstructor = constructor match {
-    case TypedAst.JvmConstructor(exp0, tpe, eff, loc) =>
-      TypedAst.JvmConstructor(specializeExp(exp0, env0, subst), subst(tpe), subst(eff), loc)
-  }
-
-  private def specializeJvmMethod(method: TypedAst.JvmMethod, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)
-                                  (implicit ctx: Context, instances: Map[(Symbol.TraitSym, TypeConstructor), Instance], root: TypedAst.Root, flix: Flix): TypedAst.JvmMethod = method match {
-    case TypedAst.JvmMethod(ann, ident, fparams0, exp0, tpe, eff, loc) =>
-      val (fparams, env1) = specializeFormalParams(fparams0, subst)
-      TypedAst.JvmMethod(ann, ident, fparams, specializeExp(exp0, env0 ++ env1, subst), subst(tpe), subst(eff), loc)
-  }
-
-  private def resolveSigSym(sym: Symbol.SigSym, tpe: Type)
+  private[monomorph2] def resolveSigSym(sym: Symbol.SigSym, tpe: Type)
                             (implicit instances: Map[(Symbol.TraitSym, TypeConstructor), Instance], root: TypedAst.Root, flix: Flix): TypedAst.Def = {
     val sig = root.sigs(sym)
     val trt = root.traits(sym.trt)
@@ -809,50 +275,40 @@ object SolutionSpecialization {
   private def combineEnvs(envs: Iterable[Map[Symbol.VarSym, Symbol.VarSym]]): Map[Symbol.VarSym, Symbol.VarSym] =
     envs.foldLeft(Map.empty[Symbol.VarSym, Symbol.VarSym])(_ ++ _)
 
-  private def specializeFormalParams(fparams0: List[TypedAst.FormalParam], subst0: StrictSubstitution)
+  private[monomorph2] def specializeFormalParams(fparams0: List[TypedAst.FormalParam], subst0: StrictSubstitution)
                                      (implicit root: TypedAst.Root, flix: Flix): (List[TypedAst.FormalParam], Map[Symbol.VarSym, Symbol.VarSym]) = {
     val (params, envs) = fparams0.map(specializeFormalParam(_, subst0)).unzip
     (params, combineEnvs(envs))
   }
 
-  private def specializeFormalParam(fparam0: TypedAst.FormalParam, subst0: StrictSubstitution)
+  private[monomorph2] def specializeFormalParam(fparam0: TypedAst.FormalParam, subst0: StrictSubstitution)
                                     (implicit root: TypedAst.Root, flix: Flix): (TypedAst.FormalParam, Map[Symbol.VarSym, Symbol.VarSym]) = {
     val TypedAst.FormalParam(bnd, tpe, src, decreasing, loc) = fparam0
     val freshSym = Symbol.freshVarSym(bnd.sym)
     (TypedAst.FormalParam(Binder(freshSym, subst0(bnd.tpe)), subst0(tpe), src, decreasing, loc), Map(bnd.sym -> freshSym))
   }
 
-  // ---- Type normalization helpers (verbatim from Specialization) --------------
-
-  private def infallibleUnify(tpe1: Type, tpe2: Type, sym: Symbol.DefnSym)(implicit root: TypedAst.Root, flix: Flix): StrictSubstitution =
-    ConstraintSolver2.fullyUnify(tpe1, tpe2, RegionScope.Top, RigidityEnv.empty)(root.eqEnv, flix) match {
-      case Some(subst) => StrictSubstitution.mk(subst)
-      case None        => throw InternalCompilerException(s"Unable to unify: '$tpe1' and '$tpe2'.\nIn '$sym'", tpe1.loc)
-    }
-
-  // ---- Enum/struct type rewriting (post-lowering) -----------------------------
+  // ---- Enum/struct type rewriting -----------------------------------------------------------
   //
-  // `lookupCaseSym`/`lookupStructSym` (used inside `specializeExp`/`specializePat`, before
-  // lowering) already rewrite the *symbol* on Tag/Is/Untag/StructNew/StructGet/StructPut to the
-  // fresh specialized enum/struct sym. That alone is not enough: every `Type` value elsewhere in
-  // the specialized tree (a `Var`'s type, a `Match`'s scrutinee type, a def's own `functionType`/
-  // `retTpe`, ...) still refers to the *original* enum/struct sym with its *concrete, ground*
-  // type arguments (e.g. `Enum(List, [Int32])`), since `StrictSubstitution.apply` was never
-  // taught about the fresh syms — it just substitutes+canonicalizes, exactly as it always has for
-  // defs (which have no equivalent "symbol vs. type" consistency requirement). A downstream
+  // `lookupCaseSym`/`lookupStructSym` rewrite the *symbol* on Tag/Is/Untag/StructNew/StructGet/
+  // StructPut to the fresh specialized enum/struct sym. That alone is not enough: every `Type`
+  // value elsewhere in the tree (a `Var`'s type, a `Match`'s scrutinee type, a def's own
+  // `functionType`/`retTpe`, ...) still refers to the *original* enum/struct sym with its
+  // *concrete, ground* type arguments (e.g. `Enum(List, [Int32])`), since `StrictSubstitution`
+  // only substitutes+canonicalizes — it has no notion of the fresh specialized syms. A downstream
   // consistency check (`main/test/.../verifier/TypeVerifier.scala`, run by `RunVerifiers`/
   // `FlixSuite`) asserts that a `Tag`/`Is`/`Untag`'s case-sym's `enumSym` matches the enum sym
-  // embedded in the surrounding type — confirmed directly from its source (the exact "Mismatched
-  // shape: expected = 'X$Y', found = Enum(X, args)" message) — so once the symbol is specialized,
-  // the type has to be too, everywhere it appears, not just at the Tag/StructNew site itself.
+  // embedded in the surrounding type, so once the symbol is specialized, the type has to be too,
+  // everywhere it appears, not just at the Tag/StructNew site itself.
   //
-  // This is a full post-pass over each already-specialized-and-lowered `MonoAst.Def`, rewriting
-  // every `Type` field via `rewriteEnumStructType`, structurally, wherever it occurs — simplest
-  // correct fix, and lower-risk than trying to thread this through every `subst(tpe)` call inside
-  // `specializeExp` (of which there are around a hundred): those still produce "raw" types keyed
-  // by original sym + concrete args, which is exactly what `lookupCaseSym`/`lookupStructSym`
-  // themselves need to extract `argTypes` from in the first place (rewriting the type *before* that
-  // lookup would make the lookup key already-rewritten and self-defeating).
+  // `rewriteEnumStructType` performs this rewrite. Wiring it in has two shapes, because it must
+  // run *after* `lookupCaseSym`/`lookupStructSym` build their lookup keys from the raw, un-rewritten
+  // type (rewriting first would make the lookup key already-rewritten and self-defeating):
+  //   - Defs: `SolutionLowering.visitType` calls it inline at every type-construction site in the
+  //     fused specialize+lower walk, right after lowering.
+  //   - Effects: an op's `Spec` is lowered independently of any def body, so `rewriteEffect`/
+  //     `rewriteSpec`/`rewriteFormalParam` below apply the same rewrite as an explicit post-pass
+  //     over the already-lowered `MonoAst.Effect`.
 
   /**
     * Structurally rewrites `tpe`: any `Enum(sym, args)`/`Struct(sym, args)` sub-type whose
@@ -860,41 +316,36 @@ object SolutionSpecialization {
     * `Struct(freshSym, Nil)` (fully specialized, no more type arguments); anything else is left
     * alone except for recursing into its own sub-parts (which may themselves need rewriting,
     * e.g. `List[Option[Int32]]` needs both `List` and `Option` rewritten if both were specialized).
+    *
+    * Package-visible: `SolutionLowering.visitType` calls this inline at every type-construction
+    * site in the fused walk (folding this rewrite into the same pass instead of a separate
+    * post-pass over the whole tree).
     */
-  private def rewriteEnumStructType(tpe: Type)(implicit ctx: Context): Type = tpe match {
+  private[monomorph2] def rewriteEnumStructType(tpe: Type)(implicit ctx: Context): Type = tpe match {
     case Type.Apply(_, _, loc) =>
-      val head = rewriteTypeAppHead(tpe)
-      val args = rewriteTypeAppArgs(tpe)
+      val (head, args) = flattenApply(tpe)
       head match {
-        // Partial specialization (see `partialSubst`): the specialized declaration only kept the
-        // non-primitive positions as real type arguments, in original order — the primitive ones
-        // were pinned into the declaration itself, so they're dropped here too, not passed as Nil.
         case Type.Cst(TypeConstructor.Enum(sym, _), _) if ctx.enumTable.contains((sym, args)) =>
-          val survivingArgs = args.filterNot(MonomorphCanon.isPrimitive).map(rewriteEnumStructType)
-          Type.mkEnum(ctx.enumTable((sym, args)), survivingArgs, loc)
+          Type.mkEnum(ctx.enumTable((sym, args)), Nil, loc)
         case Type.Cst(TypeConstructor.Struct(sym, _), _) if ctx.structTable.contains((sym, args)) =>
-          val survivingArgs = args.filterNot(MonomorphCanon.isPrimitive).map(rewriteEnumStructType)
-          Type.mkStruct(ctx.structTable((sym, args)), survivingArgs, loc)
+          Type.mkStruct(ctx.structTable((sym, args)), Nil, loc)
         case _ =>
           args.foldLeft(rewriteEnumStructType(head)) { case (acc, arg) => Type.Apply(acc, rewriteEnumStructType(arg), loc) }
       }
     case Type.Alias(sym, args, inner, loc) =>
       Type.Alias(sym, args.map(rewriteEnumStructType), rewriteEnumStructType(inner), loc)
-    case _ => tpe // Var, Cst (incl. already-nullary Enum/Struct), AssocType, etc. — nothing to rewrite.
+    case _ => tpe // Var, other Cst, AssocType, etc. — nothing to rewrite.
   }
 
-  private def rewriteTypeAppHead(tpe: Type): Type = tpe match {
-    case Type.Apply(t1, _, _) => rewriteTypeAppHead(t1)
-    case t => t
+  /** Walks `tpe`'s `Type.Apply` chain once, returning its head and its args in left-to-right order. */
+  private def flattenApply(tpe: Type): (Type, List[Type]) = {
+    @tailrec
+    def loop(t: Type, argsAcc: List[Type]): (Type, List[Type]) = t match {
+      case Type.Apply(t1, t2, _) => loop(t1, t2 :: argsAcc)
+      case head => (head, argsAcc)
+    }
+    loop(tpe, Nil)
   }
-
-  private def rewriteTypeAppArgs(tpe: Type): List[Type] = tpe match {
-    case Type.Apply(t1, t2, _) => rewriteTypeAppArgs(t1) :+ t2
-    case _ => Nil
-  }
-
-  private def rewriteDef(defn: MonoAst.Def)(implicit ctx: Context): MonoAst.Def =
-    MonoAst.Def(defn.sym, rewriteSpec(defn.spec), rewriteExpr(defn.exp), defn.loc)
 
   private def rewriteSpec(spec: MonoAst.Spec)(implicit ctx: Context): MonoAst.Spec =
     spec.copy(
@@ -904,155 +355,18 @@ object SolutionSpecialization {
       eff = rewriteEnumStructType(spec.eff)
     )
 
-  private def rewriteFormalParam(fp: MonoAst.FormalParam)(implicit ctx: Context): MonoAst.FormalParam =
+  // Package-visible: SolutionLowering's per-def walk calls this directly wherever it lowers an
+  // already-specialized formal param (Step 2 — see rewriteEnumStructType's doc comment).
+  private[monomorph2] def rewriteFormalParam(fp: MonoAst.FormalParam)(implicit ctx: Context): MonoAst.FormalParam =
     fp.copy(tpe = rewriteEnumStructType(fp.tpe))
 
   /**
-    * `Tag`/`StructNew`/`StructGet`/`StructPut` sites built directly by `specializeExp` (from
-    * source `Expr.Tag`/`StructNew`/etc.) already have their symbol rewritten by
-    * `lookupCaseSym`/`lookupStructSym` before lowering. But `SolutionLowering.scala`'s Datalog
-    * desugaring (`mkTag`, struct lowering for `Fixpoint3.Ast.*`) constructs `AtomicOp.Tag`/
-    * `StructNew`/etc. directly as already-lowered `MonoAst`, entirely bypassing `specializeExp` —
-    * those symbols are never touched by the TypedAst-level rewrite. `rewriteEnumStructType` (the
-    * type-level post-pass) rewrites the *type* on these nodes regardless of origin (it's a
-    * structural walk, origin-agnostic), which on its own left such nodes with a rewritten type
-    * but an unrewritten symbol — the reverse of the original type/symbol mismatch, caught by
-    * `TypeVerifier` the same way. Rewriting the symbol here too, using the exact same
-    * `lookupCaseSym`/`lookupStructSym` used at the TypedAst level, closes that gap and is a no-op
-    * (idempotent) on nodes that were already correctly rewritten upstream.
-    *
-    * The lookup can also genuinely miss here for a reason that has nothing to do with a real
-    * "Solver gap": `enumTable`/`structTable` are keyed by *pre-lowering* TypedAst ground types,
-    * but this runs on *post-lowering* MonoAst types — and `SolutionLowering`'s `lowerType`
-    * transforms some type components in ways the key was never built to match (e.g. a struct's
-    * region type parameter becomes an `IO` effect after lowering). When that happens, `resultTpe`
-    * itself is left partially unrewritten by `rewriteEnumStructType` (silently — it has no "miss"
-    * case, it just doesn't rewrite that part), so the symbol should likewise stay exactly as it
-    * already was: if this node's symbol was already correctly specialized upstream (the common
-    * case, since most of these nodes go through `specializeExp` first), leaving it alone is
-    * correct; if it wasn't, leaving it alone keeps it consistent with the equally-unrewritten
-    * type, rather than guessing and risking a new mismatch. Escalating to "Solver gap" here would
-    * conflate this representation mismatch with an actual constraint-generator gap.
-    */
-  private def rewriteAtomicOp(op: AtomicOp, exps: List[MonoAst.Expr], rawResultTpe: Type)(implicit ctx: Context): AtomicOp = {
-    // NB: `lookupCaseSym`/`lookupStructSym` need the *raw* (pre-rewrite) ground type to extract
-    // the original concrete type arguments as a lookup key — passing the already-rewritten type
-    // (whose args are `Nil` once specialized) makes every lookup vacuously hit the "non-generic,
-    // keep original" branch and silently no-op.
-    op match {
-      case AtomicOp.Tag(sym) =>
-        AtomicOp.Tag(tolerant(lookupCaseSym(sym, rawResultTpe), sym))
-      case AtomicOp.StructNew(sym, mutability, fields) =>
-        val newStructSym = tolerant(lookupStructSym(sym, rawResultTpe), sym)
-        AtomicOp.StructNew(newStructSym, mutability, fields.map(f => new Symbol.StructFieldSym(newStructSym, f.name, f.loc)))
-      case AtomicOp.StructGet(sym) =>
-        val newStructSym = tolerant(lookupStructSym(sym.structSym, exps.head.tpe), sym.structSym)
-        AtomicOp.StructGet(new Symbol.StructFieldSym(newStructSym, sym.name, sym.loc))
-      case AtomicOp.StructPut(sym) =>
-        val newStructSym = tolerant(lookupStructSym(sym.structSym, exps.head.tpe), sym.structSym)
-        AtomicOp.StructPut(new Symbol.StructFieldSym(newStructSym, sym.name, sym.loc))
-      case other => other
-    }
-  }
-
-  private def rewriteExpr(exp0: MonoAst.Expr)(implicit ctx: Context): MonoAst.Expr = exp0 match {
-    case MonoAst.Expr.Cst(cst, tpe, loc) => MonoAst.Expr.Cst(cst, rewriteEnumStructType(tpe), loc)
-    case MonoAst.Expr.Var(sym, tpe, loc) => MonoAst.Expr.Var(sym, rewriteEnumStructType(tpe), loc)
-    case MonoAst.Expr.Lambda(fparam, exp, tpe, loc) =>
-      MonoAst.Expr.Lambda(rewriteFormalParam(fparam), rewriteExpr(exp), rewriteEnumStructType(tpe), loc)
-    case MonoAst.Expr.ApplyAtomic(op, exps, tpe, eff, loc) =>
-      MonoAst.Expr.ApplyAtomic(rewriteAtomicOp(op, exps, tpe), exps.map(rewriteExpr), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.ApplyClo(exp1, exp2, tpe, eff, loc) =>
-      MonoAst.Expr.ApplyClo(rewriteExpr(exp1), rewriteExpr(exp2), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.ApplyDef(sym, exps, itpe, tpe, eff, loc) =>
-      MonoAst.Expr.ApplyDef(sym, exps.map(rewriteExpr), rewriteEnumStructType(itpe), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.ApplyLocalDef(sym, exps, tpe, eff, loc) =>
-      MonoAst.Expr.ApplyLocalDef(sym, exps.map(rewriteExpr), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.ApplyOp(sym, exps, tpe, eff, loc) =>
-      MonoAst.Expr.ApplyOp(sym, exps.map(rewriteExpr), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.Let(sym, exp1, exp2, tpe, eff, occur, loc) =>
-      MonoAst.Expr.Let(sym, rewriteExpr(exp1), rewriteExpr(exp2), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), occur, loc)
-    case MonoAst.Expr.LocalDef(sym, fparams, exp1, exp2, tpe, eff, occur, loc) =>
-      MonoAst.Expr.LocalDef(sym, fparams.map(rewriteFormalParam), rewriteExpr(exp1), rewriteExpr(exp2), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), occur, loc)
-    case MonoAst.Expr.Region(sym, regSym, exp, tpe, eff, loc) =>
-      MonoAst.Expr.Region(sym, regSym, rewriteExpr(exp), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.IfThenElse(exp1, exp2, exp3, tpe, eff, loc) =>
-      MonoAst.Expr.IfThenElse(rewriteExpr(exp1), rewriteExpr(exp2), rewriteExpr(exp3), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.Stm(exps, exp, tpe, eff, loc) =>
-      MonoAst.Expr.Stm(exps.map(rewriteExpr), rewriteExpr(exp), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.Discard(exp, eff, loc) =>
-      MonoAst.Expr.Discard(rewriteExpr(exp), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.Match(exp, rules, tpe, eff, loc) =>
-      MonoAst.Expr.Match(rewriteExpr(exp), rules.map(rewriteMatchRule), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.ExtMatch(exp, rules, tpe, eff, loc) =>
-      MonoAst.Expr.ExtMatch(rewriteExpr(exp), rules.map(rewriteExtMatchRule), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.VectorLit(exps, tpe, eff, loc) =>
-      MonoAst.Expr.VectorLit(exps.map(rewriteExpr), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.VectorLoad(exp1, exp2, tpe, eff, loc) =>
-      MonoAst.Expr.VectorLoad(rewriteExpr(exp1), rewriteExpr(exp2), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.VectorLength(exp, loc) =>
-      MonoAst.Expr.VectorLength(rewriteExpr(exp), loc)
-    case MonoAst.Expr.Cast(exp, tpe, eff, loc) =>
-      MonoAst.Expr.Cast(rewriteExpr(exp), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.TryCatch(exp, rules, tpe, eff, loc) =>
-      MonoAst.Expr.TryCatch(rewriteExpr(exp), rules.map(rewriteCatchRule), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.RunWith(exp, effUse, rules, tpe, eff, loc) =>
-      MonoAst.Expr.RunWith(rewriteExpr(exp), effUse, rules.map(rewriteHandlerRule), rewriteEnumStructType(tpe), rewriteEnumStructType(eff), loc)
-    case MonoAst.Expr.NewObject(sym, clazz, tpe, eff, constructors, methods, loc) =>
-      MonoAst.Expr.NewObject(sym, clazz, rewriteEnumStructType(tpe), rewriteEnumStructType(eff), constructors.map(rewriteJvmConstructor), methods.map(rewriteJvmMethod), loc)
-  }
-
-  private def rewritePattern(pat0: MonoAst.Pattern)(implicit ctx: Context): MonoAst.Pattern = pat0 match {
-    case MonoAst.Pattern.Wild(tpe, loc) => MonoAst.Pattern.Wild(rewriteEnumStructType(tpe), loc)
-    case MonoAst.Pattern.Var(sym, tpe, occur, loc) => MonoAst.Pattern.Var(sym, rewriteEnumStructType(tpe), occur, loc)
-    case MonoAst.Pattern.Cst(cst, tpe, loc) => MonoAst.Pattern.Cst(cst, rewriteEnumStructType(tpe), loc)
-    case MonoAst.Pattern.Tag(symUse, pats, tpe, loc) =>
-      val newSym = tolerant(lookupCaseSym(symUse.sym, tpe), symUse.sym)
-      MonoAst.Pattern.Tag(symUse.copy(sym = newSym), pats.map(rewritePattern), rewriteEnumStructType(tpe), loc)
-    case MonoAst.Pattern.Tuple(pats, tpe, loc) =>
-      MonoAst.Pattern.Tuple(pats.map(rewritePattern), rewriteEnumStructType(tpe), loc)
-    case MonoAst.Pattern.Record(pats, pat, tpe, loc) =>
-      val ps = pats.map(p => p.copy(pat = rewritePattern(p.pat), tpe = rewriteEnumStructType(p.tpe)))
-      MonoAst.Pattern.Record(ps, rewritePattern(pat), rewriteEnumStructType(tpe), loc)
-  }
-
-  private def rewriteExtPattern(pat0: MonoAst.ExtPattern)(implicit ctx: Context): MonoAst.ExtPattern = pat0 match {
-    case MonoAst.ExtPattern.Default(loc) => MonoAst.ExtPattern.Default(loc)
-    case MonoAst.ExtPattern.Tag(label, pats, loc) => MonoAst.ExtPattern.Tag(label, pats.map(rewriteExtTagPattern), loc)
-  }
-
-  private def rewriteExtTagPattern(pat0: MonoAst.ExtTagPattern)(implicit ctx: Context): MonoAst.ExtTagPattern = pat0 match {
-    case MonoAst.ExtTagPattern.Wild(tpe, loc) => MonoAst.ExtTagPattern.Wild(rewriteEnumStructType(tpe), loc)
-    case MonoAst.ExtTagPattern.Var(sym, tpe, occur, loc) => MonoAst.ExtTagPattern.Var(sym, rewriteEnumStructType(tpe), occur, loc)
-    case MonoAst.ExtTagPattern.Unit(tpe, loc) => MonoAst.ExtTagPattern.Unit(rewriteEnumStructType(tpe), loc)
-  }
-
-  private def rewriteMatchRule(rule: MonoAst.MatchRule)(implicit ctx: Context): MonoAst.MatchRule =
-    MonoAst.MatchRule(rewritePattern(rule.pat), rule.guard.map(rewriteExpr), rewriteExpr(rule.exp))
-
-  private def rewriteExtMatchRule(rule: MonoAst.ExtMatchRule)(implicit ctx: Context): MonoAst.ExtMatchRule =
-    MonoAst.ExtMatchRule(rewriteExtPattern(rule.pat), rewriteExpr(rule.exp), rule.loc)
-
-  private def rewriteCatchRule(rule: MonoAst.CatchRule)(implicit ctx: Context): MonoAst.CatchRule =
-    rule.copy(exp = rewriteExpr(rule.exp))
-
-  private def rewriteHandlerRule(rule: MonoAst.HandlerRule)(implicit ctx: Context): MonoAst.HandlerRule =
-    MonoAst.HandlerRule(rule.op, rule.fparams.map(rewriteFormalParam), rewriteExpr(rule.exp))
-
-  private def rewriteJvmConstructor(c: MonoAst.JvmConstructor)(implicit ctx: Context): MonoAst.JvmConstructor =
-    MonoAst.JvmConstructor(rewriteExpr(c.exp), rewriteEnumStructType(c.retTpe), rewriteEnumStructType(c.eff), c.loc)
-
-  private def rewriteJvmMethod(m: MonoAst.JvmMethod)(implicit ctx: Context): MonoAst.JvmMethod =
-    m.copy(fparams = m.fparams.map(rewriteFormalParam), exp = rewriteExpr(m.exp))
-
-  /**
-    * Effect operations (`MonoAst.Op`, e.g. `Env.getArgs`'s own declared signature) also carry a
-    * `Spec` — same shape as a def's — and, like defs, their embedded types can reference a
-    * specialized enum/struct via a case/handler body elsewhere that HAS gone through
-    * `rewriteDef`. Missing this specifically caused `Sys/Env.flix`'s `Env.getArgs` handler to
-    * disagree with its own operation's declared type (one side rewritten via a def's body, the
-    * effect operation's own signature not) — confirmed via `Test.Exp.Struct.Get.flix`'s
-    * `TypeVerifier` failure citing exactly that mismatch.
+    * Effect operations (`MonoAst.Op`, e.g. `Env.getArgs`'s own declared signature) carry a `Spec`
+    * — same shape as a def's — whose embedded types can reference a specialized enum/struct just
+    * as a def's can. Unlike a def, an op's `Spec` is lowered independently of any def body, so it
+    * never passes through `SolutionLowering.visitType`'s inline rewrite; this explicit post-pass
+    * is what keeps an op's declared type consistent with the specialized case/handler bodies that
+    * implement it, per `TypeVerifier`'s enumSym-matches-embedded-type invariant.
     */
   private def rewriteEffect(eff: MonoAst.Effect)(implicit ctx: Context): MonoAst.Effect =
     eff.copy(ops = eff.ops.map(op => op.copy(spec = rewriteSpec(op.spec))))
@@ -1061,7 +375,7 @@ object SolutionSpecialization {
 
   def run(root: TypedAst.Root, solution: Solution)(implicit flix: Flix): MonoAst.Root = flix.phase("Monomorpher") {
     implicit val r: TypedAst.Root = root
-    implicit val is: Map[(Symbol.TraitSym, TypeConstructor), Instance] = MonomorphCanon.mkInstanceMap(root.instances)
+    val is: Map[(Symbol.TraitSym, TypeConstructor), Instance] = MonomorphCanon.mkInstanceMap(root.instances)
 
     // Instance defs live in root.instances, not root.defs — merge for unified lookup.
     // Also track which instance each def belongs to, so we can use inst.tparams when building subst.
@@ -1140,36 +454,31 @@ object SolutionSpecialization {
     // Build enum/struct entries: one per (sym, tuple) pair from the solution, for enums/structs
     // with a nonempty tparams list (non-generic ones need no specialization at all — see
     // lookupCaseSym/lookupStructSym's "argTypes.isEmpty" case, which keeps the original sym).
-    //
-    // Specialize wrt. primitive types only, per-position (design settled with Magnus/refined by
-    // Simon, see notes/design_questions.md's "✅ Resolved by Magnus directly"): each type argument
-    // is judged independently. Solved tuples are grouped by their "signature" — primitive
-    // arguments kept exact, non-primitive arguments collapsed to a single AnyType marker purely
-    // for grouping — so e.g. Result[Int32, String] and Result[Int32, Option[Int32]] share one
-    // declaration (position 0 pinned to Int32, position 1 stays generic), while Result[String,
-    // Int32] gets a different one (position 1 pinned instead). A tuple with *no* primitive
-    // argument at all (e.g. Result[String, String]) is dropped entirely — nothing would be
-    // pinned, so it's the same as the original declaration; `lookupCaseSym`/`lookupStructSym`'s
-    // "keep original" fallback (`!argTypes.exists(isPrimitive)`) covers exactly this case.
+    // Much simpler than defs' entries above: no instance-tparam-prefix / default-sig-tparam
+    // complexity, just the declaration's own tparams zipped with the solved tuple. Same
+    // speculative-tuple tolerance as defs (drop on InternalCompilerException rather than crash
+    // the whole computation) for consistency, even though it's less likely to matter here (enum
+    // case field types rarely carry trait constraints the way def signatures do).
     val enumEntries: List[(Symbol.EnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
       for {
         (sym, tuples) <- solution.enums.toList
         enm           <- root.enums.get(sym).toList
         if enm.tparams.nonEmpty
-        (signature, exactTuples) <- tuples.toList.groupBy(specializationSignature).toList
-        if signature.exists(MonomorphCanon.isPrimitive)
+        tuple         <- tuples.toList
+        substMap       = enm.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
         freshSym       = Symbol.freshEnumSym(enm.sym)
-        (substMap, survivingTparams) = partialSubst(enm.tparams, signature)
-        newEnum        = {
-                           val newCases = enm.cases.map { case (caseSym, TypedAst.Case(_, tpes, sc, cloc)) =>
-                             val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, caseSym.ordinal, caseSym.loc)
-                             val newTpes = tpes.map(t => MonomorphCanon.simplify(Substitution(substMap)(t), isGround = false))
-                             newCaseSym -> TypedAst.Case(newCaseSym, newTpes, sc, cloc)
-                           }
-                           TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, survivingTparams, enm.derives, newCases, enm.loc)
+        subst         <- try {
+                           List(StrictSubstitution.mk(Substitution(substMap)))
+                         } catch {
+                           case _: InternalCompilerException => Nil
                          }
-        exactTuple    <- exactTuples
-      } yield (sym, exactTuple, freshSym, newEnum)
+      } yield {
+        val newCases = enm.cases.map { case (caseSym, TypedAst.Case(_, tpes, sc, cloc)) =>
+          val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, caseSym.ordinal, caseSym.loc)
+          newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
+        }
+        (sym, tuple, freshSym, TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc))
+      }
 
     val enumTableMap: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym] =
       enumEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
@@ -1179,42 +488,55 @@ object SolutionSpecialization {
         (sym, tuples) <- solution.structs.toList
         struct        <- root.structs.get(sym).toList
         if struct.tparams.nonEmpty
-        (signature, exactTuples) <- tuples.toList.groupBy(specializationSignature).toList
-        if signature.exists(MonomorphCanon.isPrimitive)
+        tuple         <- tuples.toList
+        substMap       = struct.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
         freshSym       = Symbol.freshStructSym(struct.sym)
-        (substMap, survivingTparams) = partialSubst(struct.tparams, signature)
-        newStruct      = {
-                           val newFields = struct.fields.map { case (fieldSym, TypedAst.StructField(_, tpe, floc)) =>
-                             val newFieldSym = new Symbol.StructFieldSym(freshSym, fieldSym.name, fieldSym.loc)
-                             val newTpe = MonomorphCanon.simplify(Substitution(substMap)(tpe), isGround = false)
-                             newFieldSym -> TypedAst.StructField(newFieldSym, newTpe, floc)
-                           }
-                           TypedAst.Struct(struct.doc, struct.ann, struct.mod, freshSym, survivingTparams, struct.sc, newFields, struct.loc)
+        subst         <- try {
+                           List(StrictSubstitution.mk(Substitution(substMap)))
+                         } catch {
+                           case _: InternalCompilerException => Nil
                          }
-        exactTuple    <- exactTuples
-      } yield (sym, exactTuple, freshSym, newStruct)
+      } yield {
+        val newFields = struct.fields.map { case (fieldSym, TypedAst.StructField(_, tpe, floc)) =>
+          val newFieldSym = new Symbol.StructFieldSym(freshSym, fieldSym.name, fieldSym.loc)
+          newFieldSym -> TypedAst.StructField(newFieldSym, subst(tpe), floc)
+        }
+        (sym, tuple, freshSym, TypedAst.Struct(struct.doc, struct.ann, struct.mod, freshSym, Nil, struct.sc, newFields, struct.loc))
+      }
 
     val structTableMap: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym] =
       structEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
 
-    implicit val ctx: Context = new Context(defTableMap, allDefs, enumTableMap, structTableMap)
+    implicit val ctx: Context = new Context(defTableMap, allDefs, enumTableMap, structTableMap, is)
+
+    // Biggest-first scheduling (same convention as Typer.scala/Lexer.scala/Weeder2.scala/
+    // Parser2.scala's ParOps.*WithPriority uses): starting the largest defs' work first reduces
+    // the long-tail straggler effect where most threads finish their small defs early and idle
+    // while one thread grinds through whatever big def happened to be scheduled last.
+    def sortBySize(defn: TypedAst.Def): Int = defn.loc.startLine - defn.loc.endLine
 
     // Non-parametric defs: those with no spec.tparams AND no instance tparams AND not a
     // default-sig impl (which has trait tparams not in spec.tparams — always goes via entries).
-    ParOps.parMap(allDefs.filter { case (sym, d) =>
+    ParOps.parMapWithPriority(allDefs.filter { case (sym, d) =>
       d.spec.tparams.isEmpty &&
       defToInst.get(sym).map(_.tparams.isEmpty).getOrElse(true) &&
       !defaultSigDefs.contains(sym)
-    }) {
+    }, sortBy = (p: (Symbol.DefnSym, TypedAst.Def)) => sortBySize(p._2)) {
       case (sym, defn) => flix.profile(defn.sym, defn.loc) {
-        ctx.addSpecializedDef(sym, rewriteDef(SolutionLowering.lowerDef(specializeDef(sym, defn, StrictSubstitution.empty))))
+        ctx.incrementDefCategory(if (defToInst.contains(sym)) "instanceDefs" else "regularDefs")
+        ctx.addSpecializedDef(sym, SolutionLowering.visitDef(sym, defn, StrictSubstitution.empty))
       }
     }
 
     // Parametric specializations — one parallel pass, no worklist loop.
-    ParOps.parMap(entries) { case (freshSym, defn, subst, _) =>
+    ParOps.parMapWithPriority(entries, sortBy = (e: (Symbol.DefnSym, TypedAst.Def, StrictSubstitution, Type)) => sortBySize(e._2)) { case (freshSym, defn, subst, _) =>
       flix.profile(defn.sym, defn.loc) {
-        ctx.addSpecializedDef(freshSym, rewriteDef(SolutionLowering.lowerDef(specializeDef(freshSym, defn, subst))))
+        val category =
+          if (defToInst.contains(defn.sym)) "instanceDefs"
+          else if (defaultSigDefs.contains(defn.sym)) "defaultSigImpls"
+          else "regularDefs"
+        ctx.incrementDefCategory(category)
+        ctx.addSpecializedDef(freshSym, SolutionLowering.visitDef(freshSym, defn, subst))
       }
     }
 
@@ -1224,17 +546,15 @@ object SolutionSpecialization {
         rewriteEffect(SolutionLowering.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc)))
     }
 
-    // Kept as-is (one polymorphic declaration per original enum/struct), same as before this
-    // feature existed — NOT replaced by the specialized declarations below, added alongside
-    // instead. Two reasons this is additive, not exclusive: (1) some enum/struct constructions
-    // are synthesized directly as MonoAst by SolutionLowering (e.g. the Datalog Fixpoint3.Ast.*
-    // enums built by mkTag), never passing through specializeExp's Expr.Tag/StructNew rewriting
-    // at all — those references still need the original, polymorphic declaration to resolve
-    // against; (2) it costs nothing to keep an unused original declaration around alongside a
-    // specialized one, and doing so is strictly safer than trying to prove it is never needed.
+    // The original, polymorphic enum/struct declaration is always kept alongside the specialized
+    // declarations below, never replaced. Some enum/struct constructions are synthesized directly
+    // as MonoAst by SolutionLowering (e.g. the Datalog Fixpoint3.Ast.* enums built by mkTag),
+    // bypassing the ordinary Expr.Tag/StructNew rewrite path entirely — those references still
+    // need the original declaration to resolve against. Keeping an occasionally-unused original
+    // declaration around costs nothing and is strictly safer than trying to prove it is never
+    // needed.
     val enums = ParOps.parMapValues(root.enums) {
-      case TypedAst.Enum(doc, ann, mod, sym, tparams0, derives, cases, loc) =>
-        val tparams = tparams0.map { case TypedAst.TypeParam(name, sym, loc) => TypedAst.TypeParam(name, sym, loc) }
+      case TypedAst.Enum(doc, ann, mod, sym, tparams, derives, cases, loc) =>
         SolutionLowering.lowerEnum(TypedAst.Enum(doc, ann, mod, sym, tparams, derives, MapOps.mapValues(cases)(visitEnumCase), loc))
     }
 
@@ -1245,19 +565,22 @@ object SolutionSpecialization {
       ParOps.parMap(enumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SolutionLowering.lowerEnum(newEnum) }.toMap
 
     val restrictableEnums = ParOps.parMapValues(root.restrictableEnums) {
-      case TypedAst.RestrictableEnum(doc, ann, mod, sym, index, tparams0, derives, cases, loc) =>
-        val tparams = tparams0.map { case TypedAst.TypeParam(name, sym, loc) => TypedAst.TypeParam(name, sym, loc) }
+      case TypedAst.RestrictableEnum(doc, ann, mod, sym, index, tparams, derives, cases, loc) =>
         SolutionLowering.lowerRestrictableEnum(TypedAst.RestrictableEnum(doc, ann, mod, sym, index, tparams, derives, MapOps.mapValues(cases)(visitRestrictableEnumCase), loc))
     }
 
     val structs = ParOps.parMapValues(root.structs) {
-      case TypedAst.Struct(doc, ann, mod, sym, tparams0, sc, fields, loc) =>
-        val tparams = tparams0.map { case TypedAst.TypeParam(name, sym, loc) => TypedAst.TypeParam(name, sym, loc) }
+      case TypedAst.Struct(doc, ann, mod, sym, tparams, sc, fields, loc) =>
         SolutionLowering.lowerStruct(TypedAst.Struct(doc, ann, mod, sym, tparams, sc, MapOps.mapValues(fields)(visitStructField), loc))
     }
 
     val specializedStructs: Map[Symbol.StructSym, MonoAst.Struct] =
       ParOps.parMap(structEntries) { case (_, _, freshSym, newStruct) => freshSym -> SolutionLowering.lowerStruct(newStruct) }.toMap
+
+    // Diagnostic only (see Context.defCategoryCounts) — no equivalent exists for the
+    // demand-driven baseline (Specialization.scala), so MonomorphBench must treat this as
+    // this-pipeline-only data, not something to expect from every run.
+    flix.emitEvent(FlixEvent.AfterMonomorphCategories(ctx.getDefCategoryCounts))
 
     MonoAst.Root(
       ctx.getSpecializedDefs,

@@ -16,7 +16,7 @@
 package ca.uwaterloo.flix.api
 
 import ca.uwaterloo.flix.language.ast.shared.Source
-import ca.uwaterloo.flix.language.ast.{ReducedAst, Symbol, Token, TypedAst}
+import ca.uwaterloo.flix.language.ast.{MonoAst, ReducedAst, Symbol, Token, TypedAst}
 import ca.uwaterloo.flix.language.phase.typer.TypeConstraint
 import ca.uwaterloo.flix.language.phase.unification.set.Equation
 
@@ -36,6 +36,20 @@ object FlixEvent {
     * An event that is fired after the tailpos phase.
     */
   case class AfterTailPos(root: ReducedAst.Root) extends FlixEvent
+
+  /**
+    * An event that is fired right after monomorphization (either pipeline), before any
+    * subsequent phase (lambda-lifting, tree-shaking, etc.) can add or remove declarations.
+    */
+  case class AfterMonomorph(root: MonoAst.Root) extends FlixEvent
+
+  /**
+    * An event fired only by the constraint-based pipeline's `SolutionSpecialization.run`,
+    * breaking specialized-def counts down by origin ("regularDefs"/"instanceDefs"/
+    * "defaultSigImpls"). No equivalent exists for the demand-driven baseline
+    * (`Specialization.scala`) — diagnostic/benchmarking data, this-pipeline-only.
+    */
+  case class AfterMonomorphCategories(counts: Map[String, Int]) extends FlixEvent
 
   /**
     * An event that is fired after the Typer phase.

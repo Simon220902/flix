@@ -21,12 +21,24 @@ import ca.uwaterloo.flix.language.ast.{Kind, Name, SourceLocation, Symbol, Type,
 import ca.uwaterloo.flix.language.ast.TypedAst.{Expr, FormalParam, MatchRule, Predicate}
 import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.shared.Denotation
+import ca.uwaterloo.flix.language.dbg.AstPrinter
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Enums, Types}
-import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
+import ca.uwaterloo.flix.util.tc.Debug
+import ca.uwaterloo.flix.util.{FileOps, InternalCompilerException, ParOps}
+
+import scala.annotation.tailrec
 
 
-// TODO: Add general explanation comment.
+/**
+  * Constraint generation for constraint-based monomorphization.
+  *
+  * Walks the treeshaken `TypedAst` root and, for every definition, enum, trait instance, and
+  * default trait implementation, emits `Flow` constraints describing how concrete types and type
+  * shapes propagate into the type-parameter slots of the definitions and enums it references.
+  * `ConstraintSolver` later solves these constraints to find every concrete instantiation each
+  * definition/enum needs to be specialized at.
+  */
 object ConstraintCollection {
 
   /**
@@ -53,15 +65,15 @@ object ConstraintCollection {
 
   object MonoArg {
     /**
-      * A concrete / monomorphic type constant.
-      */
-    case class Const(tpe: Type) extends MonoArg
-
-    /**
       * The i'th type parameter slot belonging to a specific MVar.
       * Tracks exactly: "The index'th type parameter of function/enum v"
       */
     case class Param(v: MVar, index: Int) extends MonoArg
+
+    /**
+      * A concrete / monomorphic type constant.
+      */
+    case class Const(tpe: Type) extends MonoArg
 
     /**
       * A type constructor applied to symbolic mono-arguments.
@@ -107,17 +119,19 @@ object ConstraintCollection {
   /**
     * Generates specialization constraints for every top-level definition, enum, and trait instance.
     */
-  def generate(root: TypedAst.Root)(implicit flix: Flix): Set[Flow] = {
+  def generate(root: TypedAst.Root)(implicit flix: Flix): Set[Flow] = flix.phase("ConstraintCollection") {
     val fromDefs = ParOps.parMap(root.defs.values) { defn =>
-      val tparamEnv = defn.spec.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
-      implicit val ctx: Context = Context(MVar.Def(defn.sym), tparamEnv, root, flix)
-      visitDef(defn)
+      flix.profile(defn.sym, defn.loc) {
+        val tparamEnv = defn.spec.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
+        implicit val ctx: Context = Context(MVar.Def(defn.sym), tparamEnv, root, flix)
+        visitDef(defn, Nil)
+      }
     }.flatten.toSet
 
     val fromEnums = ParOps.parMap(root.enums.values) { enm =>
       val tparamEnv = enm.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
       implicit val ctx: Context = Context(MVar.Enum(enm.sym), tparamEnv, root, flix)
-      visitEnum(enm)
+      visitEnum(enm, Nil)
     }.flatten.toSet
 
     val fromInstances = ParOps.parMap(root.instances.values) { inst =>
@@ -129,21 +143,23 @@ object ConstraintCollection {
         val offset = inst.tparams.length
         val newSpecTparams = instDef.spec.tparams.filterNot(tp => instTparamEnv.contains(tp.sym))
         val specTparamEnv = newSpecTparams.zipWithIndex.map { case (tp, j) => tp.sym -> (offset + j) }.toMap
-        implicit val ctx: Context = Context(MVar.Def(instDef.sym), instTparamEnv ++ specTparamEnv, root, flix)
-        visitDef(instDef)
-      }.toSet
+        flix.profile(instDef.sym, instDef.loc) {
+          implicit val ctx: Context = Context(MVar.Def(instDef.sym), instTparamEnv ++ specTparamEnv, root, flix)
+          visitDef(instDef, Nil)
+        }
+      }
     }.flatten.toSet
 
     val fromRestrictableEnums = ParOps.parMap(root.restrictableEnums.values) { enm =>
       val tparamEnv = (enm.index :: enm.tparams).zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
       implicit val ctx: Context = Context(MVar.RestrictableEnum(enm.sym), tparamEnv, root, flix)
-      visitRestrictableEnum(enm)
+      visitRestrictableEnum(enm, Nil)
     }.flatten.toSet
 
     val fromStructs = ParOps.parMap(root.structs.values) { struct =>
       val tparamEnv = struct.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
       implicit val ctx: Context = Context(MVar.Struct(struct.sym), tparamEnv, root, flix)
-      visitStruct(struct)
+      visitStruct(struct, Nil)
     }.flatten.toSet
 
     // Visit default trait implementations (root.sigs with exp.isDefined).
@@ -159,13 +175,17 @@ object ConstraintCollection {
       val tparamEnv = allTparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
       val ns = sig.sym.trt.namespace :+ sig.sym.trt.name
       val defnSym = new Symbol.DefnSym(None, ns, sig.sym.name, sig.sym.loc)
-      implicit val ctx: Context = Context(MVar.Def(defnSym), tparamEnv, root, flix)
-      sig.exp.map(visitExp).getOrElse(Set.empty)
+      flix.profile(defnSym, sig.sym.loc) {
+        implicit val ctx: Context = Context(MVar.Def(defnSym), tparamEnv, root, flix)
+        sig.exp.map(e => visitExp(e, Nil)).getOrElse(Nil)
+      }
     }.flatten.toSet
 
     fromDefs ++ fromEnums ++ fromInstances ++ fromRestrictableEnums ++ fromStructs ++ fromSigs
-  }
+  }(DebugFlows)
 
+
+  // START OF --Xprint-phases HELPERS
   /**
     * Renders `flows` as a Graphviz DOT string.
     *
@@ -180,10 +200,7 @@ object ConstraintCollection {
     sb.append("  node [fontname=\"Courier\", fontsize=10];\n")
     sb.append("  edge [fontname=\"Courier\", fontsize=8];\n\n")
 
-    // Collect all MVars appearing anywhere in the flow set.
-    val allMVars: Set[MVar] = flows.flatMap { case Flow(FlowInput.FlowArgs(args), dst) =>
-      Set(dst) ++ args.flatMap(collectMVars)
-    }
+    val allMVars: Set[MVar] = allMVarsOf(flows)
 
     // Emit one node per MVar.
     allMVars.foreach { mvar =>
@@ -203,14 +220,13 @@ object ConstraintCollection {
     var seedCount = 0
     flows.foreach { case Flow(FlowInput.FlowArgs(args), dst) =>
       val srcMVars = args.flatMap(collectMVars)
+      val label = args.map(monoArgLabel).mkString(", ")
       if (srcMVars.isEmpty) {
-        val label = args.map(monoArgLabel).mkString(", ")
         val sid = s"seed$seedCount"
         seedCount += 1
         sb.append(s"""  $sid [label="${dotEscape(label)}", shape=plaintext];\n""")
         sb.append(s"""  $sid -> ${dotId(dst)};\n""")
       } else {
-        val label = args.map(monoArgLabel).mkString(", ")
         srcMVars.distinct.foreach { src =>
           sb.append(s"""  ${dotId(src)} -> ${dotId(dst)} [label="${dotEscape(label)}"];\n""")
         }
@@ -221,13 +237,52 @@ object ConstraintCollection {
     sb.toString
   }
 
+  /** Every `MVar` appearing anywhere in `flows`, as either a destination or a source argument. */
+  private def allMVarsOf(flows: Set[Flow]): Set[MVar] =
+    flows.flatMap { case Flow(FlowInput.FlowArgs(args), dst) => Set(dst) ++ args.flatMap(collectMVars) }
+
+  /** Summary stats for `flows`: total flow/MVar counts, plus a per-`MVar`-kind breakdown. */
+  private def stats(flows: Set[Flow]): List[String] = {
+    val allMVars = allMVarsOf(flows)
+    val byKind = allMVars.groupBy {
+      case _: MVar.Def              => "Def"
+      case _: MVar.Enum             => "Enum"
+      case _: MVar.Sig              => "Sig"
+      case _: MVar.RestrictableEnum => "RestrictableEnum"
+      case _: MVar.Struct           => "Struct"
+    }.view.mapValues(_.size).toList.sortBy(_._1)
+    s"flows: ${flows.size}" :: s"distinct MVars: ${allMVars.size}" :: byKind.map { case (k, n) => s"  $k: $n" }
+  }
+
+  /** Plain-text listing of `flows`, one line per flow: `<args> -> <destination>`. */
+  private def toText(flows: Set[Flow]): String =
+    flows.toList.map { case Flow(FlowInput.FlowArgs(args), dst) =>
+      s"${args.map(monoArgLabel).mkString(", ")} -> ${mvarLabel(dst)}"
+    }.sorted.mkString("\n")
+
+  /**
+    * Writes `flows` to `build/asts/monomorph2/ConstraintCollection.{dot,txt}` under
+    * `--Xprint-phases` — a Graphviz-openable dot graph and a plain-text listing, both prefixed
+    * with the same summary stats. Bypasses `AstPrinter`'s shared `writeToDisk` (which hardcodes
+    * the `.flixir` extension for every other phase) since a real `.dot`/`.txt` file needs its own
+    * extension to be directly usable (Graphviz, a text editor) rather than IR-dump tooling.
+    */
+  object DebugFlows extends Debug[Set[Flow]] {
+    override def emit(name: String, flows: Set[Flow])(implicit flix: Flix): Unit = {
+      val dir = AstPrinter.astFolderPath.resolve("monomorph2")
+      val statLines = stats(flows)
+      FileOps.writeString(dir.resolve("ConstraintCollection.dot"), statLines.map("// " + _).mkString("\n") + "\n\n" + toDot(flows))
+      FileOps.writeString(dir.resolve("ConstraintCollection.txt"), statLines.mkString("\n") + "\n\n" + toText(flows))
+    }
+  }
+
   // ---- DOT helpers -------------------------------------------------------
 
   private def collectMVars(arg: MonoArg): List[MVar] = arg match {
-    case MonoArg.Const(_)            => Nil
-    case MonoArg.Param(v, _)         => List(v)
-    case MonoArg.App(tc, args)       => collectMVars(tc) ++ args.flatMap(collectMVars)
-    case MonoArg.Assoc(_, arg, _, _) => collectMVars(arg)
+    case MonoArg.Param(v, _)          => List(v)
+    case MonoArg.Const(_)             => Nil
+    case MonoArg.App(tc, args)        => collectMVars(tc) ++ args.flatMap(collectMVars)
+    case MonoArg.Assoc(_, arg1, _, _) => collectMVars(arg1)
   }
 
   private def dotId(mvar: MVar): String = {
@@ -250,9 +305,9 @@ object ConstraintCollection {
   }
 
   private def monoArgLabel(arg: MonoArg): String = arg match {
-    case MonoArg.Const(tpe)        => tpe.toString
-    case MonoArg.Param(v, i)       => s"p(${mvarLabel(v)},$i)"
-    case MonoArg.App(tc, args)     => s"App(${monoArgLabel(tc)},${args.map(monoArgLabel).mkString(",")})"
+    case MonoArg.Param(v, i)         => s"p(${mvarLabel(v)},$i)"
+    case MonoArg.Const(tpe)          => tpe.toString
+    case MonoArg.App(tc, args)       => s"App(${monoArgLabel(tc)},${args.map(monoArgLabel).mkString(",")})"
     case MonoArg.Assoc(sym, a, _, _) => s"Assoc(${sym.name},${monoArgLabel(a)})"
   }
 
@@ -263,91 +318,100 @@ object ConstraintCollection {
   /** Escapes double-quotes and backslashes for DOT label strings. */
   private def dotEscape(s: String): String =
     s.replace("\\", "\\\\").replace("\"", "\\\"")
+  // END OF --Xprint-phases HELPERS
 
   // ---- Constraint generation ---------------------------------------------
+  //
+  // Every visit* function below threads an explicit, immutable `acc: List[Flow]` accumulator
+  // through the walk instead of returning `Set[Flow]` and unioning results with `++` on the way
+  // back up. Each node conses its own flow(s) onto the accumulator it receives and passes the
+  // result to its next sibling — a plain `foldLeft`/cons shape, no mutation, no per-node Set
+  // allocation or hashing. Flows may genuinely duplicate (e.g. the same call site's flow
+  // re-derived from two visits); that's fine, since dedup only needs to happen once, in
+  // `generate`'s final `.toSet` per category, rather than paying an O(n) merge cost at every node.
 
   /**
     * Emits flow constraints for enum type applications occurring in `tpe`.
     */
-  private def visitType(tpe: Type)(implicit ctx: Context): Set[Flow] = tpe match {
+  private def visitType(tpe0: Type, acc: List[Flow])(implicit ctx: Context): List[Flow] = dealias(tpe0) match {
     case at @ Type.AssocType(_, arg, _, _) =>
       // If the associated type is ground, resolve it and continue; otherwise recurse into arg.
-      if (tpe.typeVars.isEmpty) visitType(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix))
-      else visitType(arg)
+      if (tpe0.typeVars.isEmpty) visitType(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix), acc)
+      else visitType(arg, acc)
     case _: Type.BaseType
          | Type.Var(_, _)
-         | Type.Cst(_, _) => Set.empty
-    case Type.Apply(_, _, loc) =>
-      val tpArgs = getAppArgs(tpe)
-      val inner = tpArgs.flatMap(visitType(_)).toSet
-      getAppHead(tpe) match {
-        case Type.Cst(TypeConstructor.Enum(sym, _), _) =>
-          val margs = tpArgs.map(typeToMonoArg(_, loc))
-          inner + Flow(FlowInput.FlowArgs(margs), MVar.Enum(sym))
-        case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) =>
-          val margs = tpArgs.map(typeToMonoArg(_, loc))
-          inner + Flow(FlowInput.FlowArgs(margs), MVar.RestrictableEnum(sym))
-        case Type.Cst(TypeConstructor.Struct(sym, _), _) =>
-          val margs = tpArgs.map(typeToMonoArg(_, loc))
-          inner + Flow(FlowInput.FlowArgs(margs), MVar.Struct(sym))
-        case _ => inner
+         | Type.Cst(_, _) => acc
+    case app @ Type.Apply(_, _, loc) =>
+      val (appHead, tpArgs) = flattenApply(app)
+      val acc1 = tpArgs.foldLeft(acc)((a, t) => visitType(t, a))
+      val mvarOpt = appHead match {
+        case Type.Cst(TypeConstructor.Enum(sym, _), _)             => Some(MVar.Enum(sym))
+        case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => Some(MVar.RestrictableEnum(sym))
+        case Type.Cst(TypeConstructor.Struct(sym, _), _)           => Some(MVar.Struct(sym))
+        case _                                                     => None
+      }
+      mvarOpt match {
+        case Some(mvar) => Flow(FlowInput.FlowArgs(tpArgs.map(t => typeToMonoArg(t))), mvar) :: acc1
+        case None       => acc1
       }
   }
 
   /**
     * Emits flow constraints for all case field types in `enumDecl`.
     */
-  private def visitEnum(enumDecl: TypedAst.Enum)(implicit ctx: Context): Set[Flow] =
-    enumDecl.cases.values.flatMap(cas => cas.tpes.flatMap(visitType(_))).toSet
+  private def visitEnum(enumDecl: TypedAst.Enum, acc: List[Flow])(implicit ctx: Context): List[Flow] =
+    enumDecl.cases.values.foldLeft(acc) { (a, cas) => cas.tpes.foldLeft(a)((a2, t) => visitType(t, a2)) }
 
   /**
     * Emits flow constraints for all case field types in `enumDecl`.
     */
-  private def visitRestrictableEnum(enumDecl: TypedAst.RestrictableEnum)(implicit ctx: Context): Set[Flow] =
-    enumDecl.cases.values.flatMap(cas => cas.tpes.flatMap(visitType(_))).toSet
+  private def visitRestrictableEnum(enumDecl: TypedAst.RestrictableEnum, acc: List[Flow])(implicit ctx: Context): List[Flow] =
+    enumDecl.cases.values.foldLeft(acc) { (a, cas) => cas.tpes.foldLeft(a)((a2, t) => visitType(t, a2)) }
 
   /**
     * Emits flow constraints for all field types in `structDecl`.
     */
-  private def visitStruct(structDecl: TypedAst.Struct)(implicit ctx: Context): Set[Flow] =
-    structDecl.fields.values.flatMap(field => visitType(field.tpe)).toSet
+  private def visitStruct(structDecl: TypedAst.Struct, acc: List[Flow])(implicit ctx: Context): List[Flow] =
+    structDecl.fields.values.foldLeft(acc) { (a, field) => visitType(field.tpe, a) }
 
   /**
     * Emits flow constraints for the formal parameter types, return type, and body of `defn`.
     */
-  private def visitDef(defn: TypedAst.Def)(implicit ctx: Context): Set[Flow] = {
-    defn.spec.fparams.flatMap { case FormalParam(_, tpe, _, _, _) => visitType(tpe) }.toSet ++
-    visitType(defn.spec.retTpe) ++
-    visitExp(defn.exp) ++
-    entryPointHandlerFlows(defn)
+  private def visitDef(defn: TypedAst.Def, acc: List[Flow])(implicit ctx: Context): List[Flow] = {
+    val acc1 = defn.spec.fparams.foldLeft(acc) { case (a, FormalParam(_, tpe, _, _, _)) => visitType(tpe, a) }
+    val acc2 = visitType(defn.spec.retTpe, acc1)
+    val acc3 = visitExp(defn.exp, acc2)
+    entryPointHandlerFlows(defn, acc3)
   }
 
   /**
-    * Emits flow constraints for the default-handler calls that `Lowering.wrapDefWithDefaultHandlers`
-    * synthesizes around entry points (main, `@Test`, `@Export`).
+    * Emits flow constraints for the default-handler calls that
+    * `SolutionLowering.wrapDefWithDefaultHandlers` synthesizes around entry points (main, `@Test`,
+    * `@Export`).
     *
-    * Mirrors `Lowering.wrapInHandler`: each required default handler is applied in sequence,
-    * instantiated at `(Unit -> retTpe \ ef) -> retTpe \ ((ef - handledEff) + IO)`, where `ef`
-    * starts as `defn.spec.eff` and is threaded through the fold exactly as the lowering does.
+    * Mirrors `SolutionLowering.wrapInHandler`: each required default handler is applied in
+    * sequence, instantiated at `(Unit -> retTpe \ ef) -> retTpe \ ((ef - handledEff) + IO)`, where
+    * `ef` starts as `defn.spec.eff` and is threaded through the fold exactly as the lowering does.
     */
-  private def entryPointHandlerFlows(defn: TypedAst.Def)(implicit ctx: Context): Set[Flow] = {
-    if (!TypedAstOps.isEntryPoint(defn)(ctx.root)) Set.empty
+  private def entryPointHandlerFlows(defn: TypedAst.Def, acc: List[Flow])(implicit ctx: Context): List[Flow] = {
+    // LOWERING
+    if (!TypedAstOps.isEntryPoint(defn)(ctx.root)) acc
     else {
       val loc = defn.spec.eff.loc
       val defEffects = MonomorphCanon.evalEffect(defn.spec.eff)
       val requiredHandlers = ctx.root.defaultHandlers.filter(h => defEffects.contains(h.handledSym))
       var eff = defn.spec.eff
-      requiredHandlers.foldLeft(Set.empty[Flow]) { (acc, handler) =>
+      requiredHandlers.foldLeft(acc) { (a, handler) =>
         // Handler signature is `pub def h(f: Unit -> a \ ef): a \ ...` with tparams inferred
         // in order of first occurrence: [ef, a] (the effect var in the arrow, then the result type).
         val flow = Flow(
-          FlowInput.FlowArgs(List(typeToMonoArg(eff, loc), typeToMonoArg(defn.spec.retTpe, loc))),
+          FlowInput.FlowArgs(List(typeToMonoArg(eff), typeToMonoArg(defn.spec.retTpe))),
           MVar.Def(handler.handlerSym)
         )
-        // Canonicalized to match Lowering.wrapInHandler, which threads the canonical (not raw
-        // formula) effect into the next handler wrap — see canonicalGroundEffect there.
+        // Canonicalized to match SolutionLowering.wrapInHandler, which threads the canonical (not
+        // raw formula) effect into the next handler wrap via this same MonomorphCanon.canonicalEffect call.
         eff = MonomorphCanon.canonicalEffect(Type.mkUnion(Type.mkDifference(eff, handler.handledEff, loc), Type.IO, loc))
-        acc + flow
+        flow :: a
       }
     }
   }
@@ -355,229 +419,244 @@ object ConstraintCollection {
   /**
     * Emits flow constraints for all call sites and enum usages in `exp`.
     *
-    * Scope: all TypedAst expression forms are covered. Datalog fixpoint nodes
-    * are handled structurally (sub-expression recursion only) — they do not yet
-    * emit the Box/Unbox/liftN constraints required by Approach A; that is
-    * deferred until the full Datalog handling design is implemented.
-    * Channel nodes (NewChannel, GetChannel, etc.) are also structural only;
-    * correct constraints for the synthesized stdlib calls require pre-lowering.
+    * Scope: all TypedAst expression forms are covered. Datalog fixpoint nodes emit the
+    * Box/Unbox/liftN/lattice/Facts/ProjectInto/ProvenanceOf constraints for whatever
+    * `SolutionLowering.scala` will synthesize for them (see the `// LOWERING`-marked cases below).
+    * Channel nodes (NewChannel, GetChannel, etc.) likewise emit constraints for their synthesized
+    * stdlib calls directly, rather than relying on a pre-lowering pass.
     */
-  private def visitExp(exp: Expr)(implicit ctx: Context): Set[Flow] = exp match {
-    case Expr.Cst(_, _, _) => Set.empty
-    case Expr.Var(_, _, _) => Set.empty
-    case Expr.Hole(_, _, _, _, _) => Set.empty
+  private def visitExp(exp: Expr, acc: List[Flow])(implicit ctx: Context): List[Flow] = exp match {
+    case Expr.Cst(_, _, _) => acc
+    case Expr.Var(_, _, _) => acc
+    case Expr.Hole(_, _, _, _, _) => acc
 
     case Expr.ApplyDef(symUse, exps, targs, _, _, _, _, loc) =>
-      exps.flatMap(visitExp).toSet +
-        Flow(FlowInput.FlowArgs(targs.map(typeToMonoArg(_, loc))), MVar.Def(symUse.sym))
+      val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
+      Flow(FlowInput.FlowArgs(targs.map(typeToMonoArg(_))), MVar.Def(symUse.sym)) :: acc1
 
     case Expr.ApplySig(symUse, exps, targ, targs, _, _, _, _, loc) =>
-      exps.flatMap(visitExp).toSet +
-        Flow(FlowInput.FlowArgs((targ :: targs).map(typeToMonoArg(_, loc))), MVar.Sig(symUse.sym))
+      val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
+      Flow(FlowInput.FlowArgs((targ :: targs).map(typeToMonoArg(_))), MVar.Sig(symUse.sym)) :: acc1
 
     case Expr.ApplyOp(_, exps, _, _, _, _) =>
-      exps.flatMap(visitExp).toSet
+      exps.foldLeft(acc)((a, e) => visitExp(e, a))
 
     case Expr.ApplyClo(exp1, exp2, _, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, acc))
 
-    case Expr.Unary(_, exp, _, _, _) => visitExp(exp)
+    case Expr.Unary(_, exp, _, _, _) => visitExp(exp, acc)
 
     case Expr.Binary(_, exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, acc))
 
     case Expr.Let(_, exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, acc))
 
-    case Expr.Lambda(_, exp, _, _) => visitExp(exp)
+    case Expr.Lambda(_, exp, _, _) => visitExp(exp, acc)
 
     case Expr.IfThenElse(exp1, exp2, exp3, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2) ++ visitExp(exp3)
+      visitExp(exp3, visitExp(exp2, visitExp(exp1, acc)))
 
     case Expr.Stm(exps, exp, _, _, _) =>
-      exps.flatMap(visitExp).toSet ++ visitExp(exp)
+      val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
+      visitExp(exp, acc1)
 
-    case Expr.Discard(exp, _, _) => visitExp(exp)
+    case Expr.Discard(exp, _, _) => visitExp(exp, acc)
 
-    case Expr.Region(_, _, exp, _, _, _) => visitExp(exp)
+    case Expr.Region(_, _, exp, _, _, _) => visitExp(exp, acc)
 
-    case Expr.Use(_, _, exp, _) => visitExp(exp)
+    case Expr.Use(_, _, exp, _) => visitExp(exp, acc)
 
     // Unlike the paper we don't annotate the match with the scrutinee enum type, because Flix
     // match rules do not carry a type-parameter annotation (as they do in LangPoly).
     case Expr.Match(exp, rules, _, _, _) =>
-      visitExp(exp) ++ rules.flatMap {
-        case MatchRule(_, guardOpt, body, _) =>
-          guardOpt.map(visitExp).getOrElse(Set.empty) ++ visitExp(body)
-      }.toSet
+      val acc1 = visitExp(exp, acc)
+      rules.foldLeft(acc1) {
+        case (a, MatchRule(_, guardOpt, body, _)) =>
+          val a1 = guardOpt.foldLeft(a)((a2, g) => visitExp(g, a2))
+          visitExp(body, a1)
+      }
 
+    // PRE-LOWERING: pre-lowering will rewrite RestrictableTag to Tag over MVar.Enum; until then,
+    // both are handled identically here (getEnumMVarAndTypeArgs dispatches on `tpe` itself, not
+    // on which Expr node matched) — the solver just needs to handle both resulting mvars.
     case Expr.Tag(_, exps, tpe, _, loc) =>
       val (mvar, tpArgs) = getEnumMVarAndTypeArgs(tpe, loc)
-      exps.flatMap(visitExp).toSet +
-        Flow(FlowInput.FlowArgs(tpArgs.map(typeToMonoArg(_, loc))), mvar)
+      val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
+      Flow(FlowInput.FlowArgs(tpArgs.map(typeToMonoArg(_))), mvar) :: acc1
 
+    // LOWERING
     case Expr.RestrictableTag(_, exps, tpe, _, loc) =>
-      // PRE-LOWERING: pre-lowering will rewrite RestrictableTag to Tag over MVar.Enum.
-      // Until then we emit MVar.RestrictableEnum — the solver will need to handle both.
       val (mvar, tpArgs) = getEnumMVarAndTypeArgs(tpe, loc)
-      exps.flatMap(visitExp).toSet +
-        Flow(FlowInput.FlowArgs(tpArgs.map(typeToMonoArg(_, loc))), mvar)
+      val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
+      Flow(FlowInput.FlowArgs(tpArgs.map(typeToMonoArg(_))), mvar) :: acc1
 
+    // LOWERING
     case Expr.RestrictableChoose(_, exp, rules, _, _, _) =>
       // PRE-LOWERING: pre-lowering will rewrite RestrictableChoose to Match.
       // Until then we recurse structurally — correct since no new call sites are introduced.
-      visitExp(exp) ++ rules.flatMap(r => visitExp(r.exp)).toSet
+      val acc1 = visitExp(exp, acc)
+      rules.foldLeft(acc1)((a, r) => visitExp(r.exp, a))
 
     case Expr.ExtMatch(exp, rules, _, _, _) =>
-      visitExp(exp) ++ rules.flatMap(r => visitExp(r.exp)).toSet
+      val acc1 = visitExp(exp, acc)
+      rules.foldLeft(acc1)((a, r) => visitExp(r.exp, a))
 
     case Expr.ExtTag(_, exps, _, _, _) =>
-      exps.flatMap(visitExp).toSet
+      exps.foldLeft(acc)((a, e) => visitExp(e, a))
 
-    case Expr.OpenAs(_, exp, _, _) => visitExp(exp)
+    case Expr.OpenAs(_, exp, _, _) => visitExp(exp, acc)
 
     case Expr.Tuple(exps, _, _, _) =>
-      exps.flatMap(visitExp).toSet
+      exps.foldLeft(acc)((a, e) => visitExp(e, a))
 
     case Expr.LocalDef(_, bnd, _, exp1, exp2, _, _, _) =>
-      visitType(bnd.tpe) ++ visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, visitType(bnd.tpe, acc)))
 
     case Expr.ApplyLocalDef(_, exps, _, _, _, _, _) =>
-      exps.flatMap(visitExp).toSet
+      exps.foldLeft(acc)((a, e) => visitExp(e, a))
 
-    case Expr.HoleWithExp(exp, _, _, _, _) => visitExp(exp)
+    case Expr.HoleWithExp(exp, _, _, _, _) => visitExp(exp, acc)
 
-    case Expr.RecordSelect(exp, _, _, _, _) => visitExp(exp)
+    case Expr.RecordSelect(exp, _, _, _, _) => visitExp(exp, acc)
 
     case Expr.RecordExtend(_, exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, acc))
 
-    case Expr.RecordRestrict(_, exp, _, _, _) => visitExp(exp)
+    case Expr.RecordRestrict(_, exp, _, _, _) => visitExp(exp, acc)
 
     case Expr.ArrayLit(exps, exp, _, _, _) =>
-      exps.flatMap(visitExp).toSet ++ visitExp(exp)
+      val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
+      visitExp(exp, acc1)
 
     case Expr.ArrayNew(exp1, exp2, exp3, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2) ++ visitExp(exp3)
+      visitExp(exp3, visitExp(exp2, visitExp(exp1, acc)))
 
     case Expr.ArrayLoad(exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, acc))
 
-    case Expr.ArrayLength(exp, _, _) => visitExp(exp)
+    case Expr.ArrayLength(exp, _, _) => visitExp(exp, acc)
 
     case Expr.ArrayStore(exp1, exp2, exp3, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2) ++ visitExp(exp3)
+      visitExp(exp3, visitExp(exp2, visitExp(exp1, acc)))
 
     case Expr.VectorLit(exps, _, _, _) =>
-      exps.flatMap(visitExp).toSet
+      exps.foldLeft(acc)((a, e) => visitExp(e, a))
 
     case Expr.VectorLoad(exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, acc))
 
-    case Expr.VectorLength(exp, _) => visitExp(exp)
+    case Expr.VectorLength(exp, _) => visitExp(exp, acc)
 
     // StructNew: mirrors Expr.Tag — emits a Flow for the struct's own MVar so a construction
     // site's concrete type args seed the solver (visitType alone only captures the DECLARATION's
     // own field-type structure, not where/at-what-types the struct is actually instantiated).
     case Expr.StructNew(_, fields, region, tpe, _, loc) =>
       val (mvar, tpArgs) = getEnumMVarAndTypeArgs(tpe, loc)
-      fields.flatMap { case (_, e) => visitExp(e) }.toSet ++
-        region.map(visitExp).getOrElse(Set.empty) +
-        Flow(FlowInput.FlowArgs(tpArgs.map(typeToMonoArg(_, loc))), mvar)
+      val acc1 = fields.foldLeft(acc) { case (a, (_, e)) => visitExp(e, a) }
+      val acc2 = region.foldLeft(acc1)((a, r) => visitExp(r, a))
+      Flow(FlowInput.FlowArgs(tpArgs.map(typeToMonoArg(_))), mvar) :: acc2
 
-    case Expr.StructGet(exp, _, _, _, _) => visitExp(exp)
+    case Expr.StructGet(exp, _, _, _, _) => visitExp(exp, acc)
 
     case Expr.StructPut(exp1, _, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, acc))
 
-    case Expr.Lazy(exp, _, _) => visitExp(exp)
+    case Expr.Lazy(exp, _, _) => visitExp(exp, acc)
 
-    case Expr.Force(exp, _, _, _) => visitExp(exp)
+    case Expr.Force(exp, _, _, _) => visitExp(exp, acc)
 
-    case Expr.Ascribe(exp, _, _, _, _, _) => visitExp(exp)
+    case Expr.Ascribe(exp, _, _, _, _, _) => visitExp(exp, acc)
 
-    case Expr.InstanceOf(exp, _, _) => visitExp(exp)
+    case Expr.InstanceOf(exp, _, _) => visitExp(exp, acc)
 
-    case Expr.CheckedCast(_, exp, _, _, _) => visitExp(exp)
+    case Expr.CheckedCast(_, exp, _, _, _) => visitExp(exp, acc)
 
-    case Expr.UncheckedCast(exp, _, _, _, _, _) => visitExp(exp)
+    case Expr.UncheckedCast(exp, _, _, _, _, _) => visitExp(exp, acc)
 
-    case Expr.Unsafe(exp, _, _, _, _, _) => visitExp(exp)
+    case Expr.Unsafe(exp, _, _, _, _, _) => visitExp(exp, acc)
 
     case Expr.TryCatch(exp, rules, _, _, _) =>
-      visitExp(exp) ++ rules.flatMap(r => visitExp(r.exp)).toSet
+      val acc1 = visitExp(exp, acc)
+      rules.foldLeft(acc1)((a, r) => visitExp(r.exp, a))
 
-    case Expr.Throw(exp, _, _, _) => visitExp(exp)
+    case Expr.Throw(exp, _, _, _) => visitExp(exp, acc)
 
     case Expr.Handler(_, rules, _, _, _, _, _) =>
-      rules.flatMap(r => visitExp(r.exp)).toSet
+      rules.foldLeft(acc)((a, r) => visitExp(r.exp, a))
 
     case Expr.RunWith(exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, acc))
 
     case Expr.Spawn(exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, acc))
 
+    // LOWERING
     // ParYield: Lowering synthesizes Channel.get, Channel.put, Channel.newChannel calls
     // for each non-last fragment. Emit flows so the solver pre-populates these.
     case Expr.ParYield(frags, exp, _, _, loc) =>
-      val chanFlows = frags.init.flatMap { frag =>
+      val acc1 = frags.foldLeft(acc)((a, f) => visitExp(f.exp, a))
+      val acc2 = visitExp(exp, acc1)
+      frags.init.foldLeft(acc2) { (a, frag) =>
         val elmType = frag.exp.tpe
-        val elmArg = typeToMonoArg(lowerChannelType(elmType), loc)
-        List(
-          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelGet)),
-          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelPut)),
-          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelNew))
-        )
-      }.toSet
-      frags.flatMap(f => visitExp(f.exp)).toSet ++ visitExp(exp) ++ chanFlows
+        val elmArg = typeToMonoArg(lowerChannelType(elmType))
+        Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelNew)) ::
+          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelPut)) ::
+          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelGet)) :: a
+      }
 
     case Expr.InvokeConstructor(_, exps, _, _, _) =>
-      exps.flatMap(visitExp).toSet
+      exps.foldLeft(acc)((a, e) => visitExp(e, a))
 
     case Expr.InvokeSuperConstructor(_, exps, _, _, _) =>
-      exps.flatMap(visitExp).toSet
+      exps.foldLeft(acc)((a, e) => visitExp(e, a))
 
     case Expr.InvokeMethod(_, exp, exps, _, _, _) =>
-      visitExp(exp) ++ exps.flatMap(visitExp).toSet
+      val acc1 = visitExp(exp, acc)
+      exps.foldLeft(acc1)((a, e) => visitExp(e, a))
 
     case Expr.InvokeSuperMethod(_, exps, _, _, _) =>
-      exps.flatMap(visitExp).toSet
+      exps.foldLeft(acc)((a, e) => visitExp(e, a))
 
     case Expr.InvokeStaticMethod(_, exps, _, _, _) =>
-      exps.flatMap(visitExp).toSet
+      exps.foldLeft(acc)((a, e) => visitExp(e, a))
 
-    case Expr.GetField(_, exp, _, _, _) => visitExp(exp)
+    case Expr.GetField(_, exp, _, _, _) => visitExp(exp, acc)
 
     case Expr.PutField(_, exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, acc))
 
-    case Expr.GetStaticField(_, _, _, _) => Set.empty
+    case Expr.GetStaticField(_, _, _, _) => acc
 
-    case Expr.PutStaticField(_, exp, _, _, _) => visitExp(exp)
+    case Expr.PutStaticField(_, exp, _, _, _) => visitExp(exp, acc)
 
     case Expr.NewObject(_, _, _, _, constructors, methods, _) =>
-      constructors.flatMap(c => visitExp(c.exp)).toSet ++
-        methods.flatMap(m => visitExp(m.exp)).toSet
+      val acc1 = constructors.foldLeft(acc)((a, c) => visitExp(c.exp, a))
+      methods.foldLeft(acc1)((a, m) => visitExp(m.exp, a))
 
+    // LOWERING
     // Channel nodes: recurse into sub-expressions AND emit flows for the @LoweringTarget
     // defs that Lowering will synthesize at code-gen time.
     // GetChannel(<- c) → Channel.get(c): tparam a = element type = tpe
     case Expr.GetChannel(exp, tpe, _, loc) =>
-      visitExp(exp) + Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(tpe), loc))), MVar.Def(Defs.ChannelGet))
+      val acc1 = visitExp(exp, acc)
+      Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(tpe)))), MVar.Def(Defs.ChannelGet)) :: acc1
 
+    // LOWERING
     // PutChannel(channel, value) → Channel.put(value, channel): tparam a = exp2.tpe (value type)
     case Expr.PutChannel(exp1, exp2, _, _, loc) =>
-      visitExp(exp1) ++ visitExp(exp2) +
-        Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(exp2.tpe), loc))), MVar.Def(Defs.ChannelPut))
+      val acc1 = visitExp(exp2, visitExp(exp1, acc))
+      Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(exp2.tpe)))), MVar.Def(Defs.ChannelPut)) :: acc1
 
+    // LOWERING
     // NewChannel → Channel.newChannelTuple(size): tparam a = element type from Mpmc[a, rc]
     // tpe may be (Mpmc[T, rc], Mpmc[T, rc]) (tuple) or Mpmc[T, rc] (single channel).
     case Expr.NewChannel(exp, tpe, _, loc) =>
       val elmType = extractChannelElm(tpe)
-      visitExp(exp) +
-        Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(elmType), loc))), MVar.Def(Defs.ChannelNewTuple))
+      val acc1 = visitExp(exp, acc)
+      Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(elmType)))), MVar.Def(Defs.ChannelNewTuple)) :: acc1
 
+    // LOWERING
     // SelectChannel: Lowering synthesizes, per rule, a Channel.mpmcAdmin call (to build the
     // admin list passed to the non-parametric Channel.selectFrom) and a Channel.unsafeGetAndUnlock
     // call (to read the winning channel's value) — NOT Channel.get, which is only for the
@@ -587,63 +666,66 @@ object ConstraintCollection {
     // `List[ChannelMpmcAdmin]` instantiation is fixed (not per-rule/per-elmType) and must be
     // predicted here too.
     case Expr.SelectChannel(rules, default, _, _, loc) =>
-      rules.flatMap { r =>
+      val acc1 = rules.foldLeft(acc) { (a, r) =>
         val elmType = r.chan.tpe match {
           case Type.Apply(Type.Apply(_, e, _), _, _) => e  // Mpmc[T, rc] → T
           case Type.Apply(_, e, _)                    => e  // Sender[T] / Receiver[T] → T
           case t                                      => t
         }
-        val elmArg = typeToMonoArg(lowerChannelType(elmType), loc)
-        visitExp(r.chan) ++ visitExp(r.exp) ++ Set(
-          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelMpmcAdmin)),
-          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelUnsafeGetAndUnlock))
-        )
-      }.toSet ++ default.map(visitExp).getOrElse(Set.empty) +
-        Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.ChannelMpmcAdmin, loc))), MVar.Enum(Enums.FList))
+        val elmArg = typeToMonoArg(lowerChannelType(elmType))
+        val a1 = visitExp(r.exp, visitExp(r.chan, a))
+        Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelUnsafeGetAndUnlock)) ::
+          Flow(FlowInput.FlowArgs(List(elmArg)), MVar.Def(Defs.ChannelMpmcAdmin)) :: a1
+      }
+      val acc2 = default.foldLeft(acc1)((a, d) => visitExp(d, a))
+      Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.ChannelMpmcAdmin))), MVar.Enum(Enums.FList)) :: acc2
 
-    // Datalog fixpoint nodes ("Approach A", see plan_datalog_constraints.md): in addition to
+    // LOWERING
+    // Datalog fixpoint nodes: in addition to
     // recursing into sub-expressions to capture any defs called inside predicates, emit flows
     // for every Box/Unbox/liftN/lattice/Facts/ProjectInto/ProvenanceOf call that
     // SolutionLowering.scala will synthesize for these constructs — mirroring exactly the
     // TypedAst structure lowering itself inspects.
     case Expr.FixpointConstraintSet(cs, _, _) =>
-      cs.flatMap { c =>
+      cs.foldLeft(acc) { (a0, c) =>
         val cparams0 = c.cparams
-        val fromHead = c.head match {
+        val a1 = c.head match {
           case Predicate.Head.Atom(_, den, terms, _, loc) =>
-            terms.flatMap(visitExp).toSet ++
-              terms.flatMap(headTermFlows(cparams0, _)) ++
-              latticeFlows(den, terms.lastOption.map(_.tpe), loc)
+            val h1 = terms.foldLeft(a0)((x, t) => visitExp(t, x))
+            val h2 = terms.foldLeft(h1)((x, t) => headTermFlows(cparams0, t, x))
+            latticeFlows(den, terms.lastOption.map(_.tpe), loc, h2)
         }
-        val fromBody = c.body.flatMap {
-          case Predicate.Body.Guard(e, loc) =>
-            visitExp(e) ++ guardLiftFlow(cparams0, e, loc)
-          case Predicate.Body.Functional(outBnds, e, loc) =>
-            visitExp(e) + functionalLiftFlow(cparams0, outBnds.length, e, loc)
-          case Predicate.Body.Atom(_, den, _, _, terms, _, loc) =>
-            bodyAtomTermFlows(cparams0, terms) ++ latticeFlows(den, terms.lastOption.map(_.tpe), loc)
-        }.toSet
-        fromHead ++ fromBody
-      }.toSet
+        c.body.foldLeft(a1) {
+          case (x, Predicate.Body.Guard(e, _)) =>
+            guardLiftFlow(cparams0, e, visitExp(e, x))
+          case (x, Predicate.Body.Functional(outBnds, e, loc)) =>
+            functionalLiftFlow(cparams0, outBnds.length, e, loc) :: visitExp(e, x)
+          case (x, Predicate.Body.Atom(_, den, _, _, terms, _, loc)) =>
+            latticeFlows(den, terms.lastOption.map(_.tpe), loc, bodyAtomTermFlows(cparams0, terms, x))
+        }
+      }
 
+    // LOWERING
     // FixpointLambda: Lowering builds a `List[PredSym]` value directly via `mkTag`/`mkList`
     // (SolutionLowering.mkList, called from its FixpointLambda case) to pass to Solver.rename —
     // same bypass-the-ordinary-rewrite-path situation as latticeFlows' Denotation.Relational case
     // above, so the `List[PredSym]` instantiation must be predicted here too.
     case Expr.FixpointLambda(_, exp, _, _, loc) =>
-      visitExp(exp) + Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.PredSym, loc))), MVar.Enum(Enums.FList))
+      val acc1 = visitExp(exp, acc)
+      Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.PredSym))), MVar.Enum(Enums.FList)) :: acc1
 
     case Expr.FixpointMerge(exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      visitExp(exp2, visitExp(exp1, acc))
 
     case Expr.FixpointSolveWithProject(exps, _, _, _, _, _) =>
-      exps.flatMap(visitExp).toSet
+      exps.foldLeft(acc)((a, e) => visitExp(e, a))
 
+    // LOWERING
     // InjectInto: Lowering synthesizes a call to Fixpoint3.Solver.injectIntoN(p, ts), generic
     // over the container type constructor `f` and the tuple's own component types `t1..tn`.
     case Expr.FixpointInjectInto(exps, _, _, _, loc) =>
-      exps.flatMap { exp =>
-        val (tycon, argTypes) = dealias(exp.tpe) match {
+      exps.foldLeft(acc) { (a, e) =>
+        val (tycon, argTypes) = dealias(e.tpe) match {
           case Type.Apply(tc, innerType0, _) =>
             val innerType = dealias(innerType0)
             innerType.typeConstructor match {
@@ -653,10 +735,12 @@ object ConstraintCollection {
             }
           case t => throw InternalCompilerException(s"Unexpected non-foldable type: '$t'.", loc)
         }
-        val flowArgs = (tycon :: argTypes).map(typeToMonoArg(_, loc))
-        visitExp(exp) + Flow(FlowInput.FlowArgs(flowArgs), MVar.Def(Defs.ProjectInto(argTypes.length)))
-      }.toSet
+        val flowArgs = (tycon :: argTypes).map(typeToMonoArg(_))
+        val a1 = visitExp(e, a)
+        Flow(FlowInput.FlowArgs(flowArgs), MVar.Def(Defs.ProjectInto(argTypes.length))) :: a1
+      }
 
+    // LOWERING
     // Query-with-select: Lowering synthesizes a call to Fixpoint3.Solver.factsN(p, d), generic
     // over the N selected terms' own types. (The query's embedded constraint set, reached via
     // `queryExp`'s recursion into FixpointConstraintSet, already supplies the Box/liftN flows
@@ -671,47 +755,53 @@ object ConstraintCollection {
       val arity = selects.length
       val innerTpe = unwrapVectorType(tpe0, loc)
       val argTypes = if (arity <= 1) List(innerTpe) else innerTpe.typeArguments
-      exps.flatMap(visitExp).toSet ++
-        visitExp(queryExp) ++
-        selects.flatMap(visitExp).toSet ++
-        from.flatMap {
-          case Predicate.Body.Guard(e, _)        => visitExp(e)
-          case Predicate.Body.Functional(_, e, _) => visitExp(e)
-          case _: Predicate.Body.Atom             => Set.empty
-        }.toSet ++
-        where.flatMap(visitExp).toSet +
-        Flow(FlowInput.FlowArgs(argTypes.map(typeToMonoArg(_, loc))), MVar.Def(Defs.Facts(arity)))
+      val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
+      val acc2 = visitExp(queryExp, acc1)
+      val acc3 = selects.foldLeft(acc2)((a, e) => visitExp(e, a))
+      val acc4 = from.foldLeft(acc3) {
+        case (a, Predicate.Body.Guard(e, _))         => visitExp(e, a)
+        case (a, Predicate.Body.Functional(_, e, _)) => visitExp(e, a)
+        case (a, _: Predicate.Body.Atom)             => a
+      }
+      val acc5 = where.foldLeft(acc4)((a, e) => visitExp(e, a))
+      Flow(FlowInput.FlowArgs(argTypes.map(typeToMonoArg(_))), MVar.Def(Defs.Facts(arity))) :: acc5
 
+    // LOWERING
     // Query-with-provenance: Lowering boxes every goal term, unboxes every term type of every
     // predicate the extensible-variant result type can carry, and calls Solver.provenanceOf and
     // (internally) Vector.get at a fixed Boxed type. See mkExtVarLambda/mkUnboxedTerm.
     case Expr.FixpointQueryWithProvenance(exps, select, _, tpe0, _, loc) =>
-      val fromSelect = select match {
+      val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
+      val acc2 = select match {
         case Predicate.Head.Atom(_, _, terms, _, _) =>
-          terms.flatMap(visitExp).toSet ++ terms.map(t => boxFlow(t.tpe, t.loc)).toSet
+          val s1 = terms.foldLeft(acc1)((a, t) => visitExp(t, a))
+          terms.foldLeft(s1)((a, t) => boxFlow(t.tpe) :: a)
       }
       val extVarType = unwrapVectorType(tpe0, loc)
-      val unboxFlows = predicatesOfExtVar(extVarType, loc).flatMap(_._2).map { t =>
-        Flow(FlowInput.FlowArgs(List(typeToMonoArg(t, loc))), MVar.Def(Defs.Unbox))
-      }.toSet
-      exps.flatMap(visitExp).toSet ++ fromSelect ++ unboxFlows +
-        Flow(FlowInput.FlowArgs(List(typeToMonoArg(extVarType, loc))), MVar.Def(Defs.ProvenanceOf)) +
-        Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.Boxed, loc))), MVar.Def(Defs.VectorGet))
+      val acc3 = predicatesOfExtVar(extVarType, loc).flatMap(_._2).foldLeft(acc2) { (a, t) =>
+        Flow(FlowInput.FlowArgs(List(typeToMonoArg(t))), MVar.Def(Defs.Unbox)) :: a
+      }
+      Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.Boxed))), MVar.Def(Defs.VectorGet)) ::
+        Flow(FlowInput.FlowArgs(List(typeToMonoArg(extVarType))), MVar.Def(Defs.ProvenanceOf)) :: acc3
 
-    case Expr.Error(_, _, _) => Set.empty
+    case Expr.Error(_, _, _) => acc
   }
 
-  // ---- Datalog (Approach A) helpers --------------------------------------
+  // ---- Datalog helpers --------------------------------------
   //
   // Each of these mirrors, structurally, the corresponding synthesis logic in
-  // SolutionLowering.scala (named in each doc comment) — see plan_datalog_constraints.md.
+  // SolutionLowering.scala (named in each doc comment).
 
   /**
-    * Strips `Type.Alias` wrappers before structural matching. Needed only where this file
-    * pattern-matches a raw expression's `.tpe` directly (`typeToMonoArg` already dealiases on its
-    * own path) — unlike `SolutionLowering.scala`, which runs on an already-specialized MonoAst
-    * tree (aliases stripped earlier by `StrictSubstitution`), this file walks the raw, ground
-    * `TypedAst`, where a user type alias (e.g. `type alias X = List[Int32]`) is still intact.
+    * Strips `Type.Alias` wrappers before structural matching. Needed anywhere this file
+    * pattern-matches a raw `Type` directly (`typeToMonoArg` already dealiases on its own path) —
+    * unlike `SolutionLowering.scala`, which runs on an already-specialized MonoAst tree (aliases
+    * stripped earlier by `StrictSubstitution`), this file walks the raw, ground `TypedAst`, where
+    * a user type alias (e.g. `type alias X = List[Int32]`) is still intact. Also used by
+    * `visitType`/`getEnumMVarAndTypeArgs`: `Type.Alias` extends `Type.BaseType`, so without this,
+    * an enum/struct field declared via an alias name (e.g. `case Foo(BoxedDenotation)`) silently
+    * matches `visitType`'s `BaseType` catch-all instead of the `Type.Apply` case that emits its
+    * flow — no crash, just a silently missing flow for that instantiation.
     */
   private def dealias(tpe: Type): Type = tpe match {
     case Type.Alias(_, _, inner, _) => dealias(inner)
@@ -725,8 +815,8 @@ object ConstraintCollection {
     TypedAstOps.freeVars(exp0).toList.filter { case (sym, _) => isQuantifiedVar(sym, cparams0) }
 
   /** A flow for `Fixpoint3.Boxable.box` at type `tpe` — mirrors `SolutionLowering.box`. */
-  private def boxFlow(tpe: Type, loc: SourceLocation)(implicit ctx: Context): Flow =
-    Flow(FlowInput.FlowArgs(List(typeToMonoArg(tpe, loc))), MVar.Def(Defs.Box))
+  private def boxFlow(tpe: Type)(implicit ctx: Context): Flow =
+    Flow(FlowInput.FlowArgs(List(typeToMonoArg(tpe))), MVar.Def(Defs.Box))
 
   /**
     * Flows for a head term — mirrors `SolutionLowering.lowerHeadTerm`'s cases 1.2/2/3: a
@@ -734,37 +824,37 @@ object ConstraintCollection {
     * term WITH quantified free vars is lifted via `lift{arity}` instead (never both). A
     * quantified Var itself (case 1.1) needs neither flow — it carries no runtime value of its own.
     */
-  private def headTermFlows(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr)(implicit ctx: Context): Set[Flow] = exp0 match {
-    case Expr.Var(sym, tpe, loc) =>
-      if (isQuantifiedVar(sym, cparams0)) Set.empty else Set(boxFlow(tpe, loc))
+  private def headTermFlows(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, acc: List[Flow])(implicit ctx: Context): List[Flow] = exp0 match {
+    case Expr.Var(sym, tpe, _) =>
+      if (isQuantifiedVar(sym, cparams0)) acc else boxFlow(tpe) :: acc
     case _ =>
       val fvs = quantifiedVars(cparams0, exp0)
-      if (fvs.isEmpty) Set(boxFlow(exp0.tpe, exp0.loc))
-      else Set(Flow(FlowInput.FlowArgs((fvs.map(_._2) :+ exp0.tpe).map(typeToMonoArg(_, exp0.loc))), MVar.Def(Defs.Lift(fvs.length))))
+      if (fvs.isEmpty) boxFlow(exp0.tpe) :: acc
+      else Flow(FlowInput.FlowArgs((fvs.map(_._2) :+ exp0.tpe).map(typeToMonoArg(_))), MVar.Def(Defs.Lift(fvs.length))) :: acc
   }
 
   /**
     * Flows for a body atom's terms — mirrors `SolutionLowering.lowerBodyTerm`: `Wild` and a
     * quantified `Var` need nothing; a non-quantified `Var` or any `Cst` is boxed.
     */
-  private def bodyAtomTermFlows(cparams0: List[TypedAst.ConstraintParam], terms: List[TypedAst.Pattern])(implicit ctx: Context): Set[Flow] =
-    terms.flatMap {
-      case TypedAst.Pattern.Wild(_, _) => None
-      case TypedAst.Pattern.Var(bnd, tpe, loc) =>
-        if (isQuantifiedVar(bnd.sym, cparams0)) None else Some(boxFlow(tpe, loc))
-      case TypedAst.Pattern.Cst(_, tpe, loc) => Some(boxFlow(tpe, loc))
-      case _ => None
-    }.toSet
+  private def bodyAtomTermFlows(cparams0: List[TypedAst.ConstraintParam], terms: List[TypedAst.Pattern], acc: List[Flow])(implicit ctx: Context): List[Flow] =
+    terms.foldLeft(acc) {
+      case (a, TypedAst.Pattern.Wild(_, _)) => a
+      case (a, TypedAst.Pattern.Var(bnd, tpe, _)) =>
+        if (isQuantifiedVar(bnd.sym, cparams0)) a else boxFlow(tpe) :: a
+      case (a, TypedAst.Pattern.Cst(_, tpe, _)) => boxFlow(tpe) :: a
+      case (a, _) => a
+    }
 
   /**
     * A flow for `lift{arity}b`, mirroring `SolutionLowering.mkGuard`. An arity-0 guard is
     * lowered to a plain closure with no lift call at all (`Guard0` — there is no `lift0b`), so
     * nothing is emitted in that case.
     */
-  private def guardLiftFlow(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, loc: SourceLocation)(implicit ctx: Context): Set[Flow] = {
+  private def guardLiftFlow(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, acc: List[Flow])(implicit ctx: Context): List[Flow] = {
     val fvs = quantifiedVars(cparams0, exp0)
-    if (fvs.isEmpty) Set.empty
-    else Set(Flow(FlowInput.FlowArgs(fvs.map(kv => typeToMonoArg(kv._2, loc))), MVar.Def(Defs.LiftB(fvs.length))))
+    if (fvs.isEmpty) acc
+    else Flow(FlowInput.FlowArgs(fvs.map(kv => typeToMonoArg(kv._2))), MVar.Def(Defs.LiftB(fvs.length))) :: acc
   }
 
   /**
@@ -782,27 +872,24 @@ object ConstraintCollection {
       case t => throw InternalCompilerException(s"Expected Vector[_], but got $t", loc)
     }
     val outTypes = if (outArity <= 1) List(inner) else inner.typeArguments
-    Flow(FlowInput.FlowArgs((inVars.map(_._2) ++ outTypes).map(typeToMonoArg(_, loc))), MVar.Def(Defs.LiftXM(inVars.length, outArity)))
+    Flow(FlowInput.FlowArgs((inVars.map(_._2) ++ outTypes).map(typeToMonoArg(_))), MVar.Def(Defs.LiftXM(inVars.length, outArity)))
   }
 
   /**
     * Flows for `Fixpoint3.Ast.Shared.lattice`/`box`/`Denotation`, mirroring
     * `SolutionLowering.mkDenotation`. The `Relational` case constructs a `Denotation[Boxed]` value
-    * directly via `mkTag` (bypassing the ordinary TypedAst-level rewrite path entirely — see
-    * "Two coexisting representations" in `pipeline_design_overview.md`), so its enum-construction
-    * flow must be predicted here the same way channels/Box/Unbox/liftN already are, or
-    * `enumTable` never gets an entry for it and `SolutionSpecialization`'s post-lowering rewrite
-    * pass silently falls back to the original, unspecialized `Denotation` declaration.
+    * directly via `mkTag`, bypassing the ordinary TypedAst-level rewrite path entirely, so its
+    * enum-construction flow must be predicted here the same way channels/Box/Unbox/liftN already
+    * are, or `enumTable` never gets an entry for it and `SolutionSpecialization`'s post-lowering
+    * rewrite pass silently falls back to the original, unspecialized `Denotation` declaration.
     */
-  private def latticeFlows(den: Denotation, lastTermType: Option[Type], loc: SourceLocation)(implicit ctx: Context): Set[Flow] = den match {
+  private def latticeFlows(den: Denotation, lastTermType: Option[Type], loc: SourceLocation, acc: List[Flow])(implicit ctx: Context): List[Flow] = den match {
     case Denotation.Relational =>
-      Set(Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.Boxed, loc))), MVar.Enum(Enums.Denotation)))
+      Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.Boxed))), MVar.Enum(Enums.Denotation)) :: acc
     case Denotation.Latticenal =>
       val tpe = lastTermType.getOrElse(throw InternalCompilerException("Unexpected nullary lattice predicate.", loc))
-      Set(
-        Flow(FlowInput.FlowArgs(List(typeToMonoArg(tpe, loc))), MVar.Def(Defs.Lattice)),
-        Flow(FlowInput.FlowArgs(List(typeToMonoArg(tpe, loc))), MVar.Def(Defs.LatticeBox))
-      )
+      Flow(FlowInput.FlowArgs(List(typeToMonoArg(tpe))), MVar.Def(Defs.Lattice)) ::
+        Flow(FlowInput.FlowArgs(List(typeToMonoArg(tpe))), MVar.Def(Defs.LatticeBox)) :: acc
   }
 
   /** Returns `t` from `Vector[t]` — mirrors `SolutionLowering.unwrapVectorType`. */
@@ -821,8 +908,7 @@ object ConstraintCollection {
   private def predicatesOfSchemaRow(row: Type, loc: SourceLocation): List[(Name.Pred, List[Type])] = row match {
     case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SchemaRowExtend(pred), _), rel, loc2), tpe2, loc1) =>
       (pred, termTypesOfRelation(rel, loc2)) :: predicatesOfSchemaRow(tpe2, loc1)
-    case Type.Var(_, _) => Nil
-    case Type.SchemaRowEmpty => Nil
+    case Type.Var(_, _) | Type.SchemaRowEmpty => Nil
     case t => throw InternalCompilerException(s"Got unexpected $t", loc)
   }
 
@@ -831,9 +917,9 @@ object ConstraintCollection {
     * post-solve, where a stray `Kind.Star` var reaching this point has already been defaulted to
     * `AnyType` (its own `AnyType` case, kept below); this file runs pre-solve, on raw `TypedAst`,
     * where a relation belonging to an unused/under-constrained provenance predicate can still be
-    * a genuinely-unresolved bare `Type.Var` at this point. Per the "Correctness requirement" in
-    * plan_datalog_constraints.md, such a var must NOT be defaulted through to an Unbox flow (that
-    * defaulting is unsound specifically for Box/Unbox/liftN) — so it is simply skipped here
+    * a genuinely-unresolved bare `Type.Var` at this point. Correctness requirement: such a var
+    * must NOT be defaulted through to an Unbox flow (that defaulting is unsound specifically for
+    * Box/Unbox/liftN) — so it is simply skipped here
     * (no term types recoverable for this relation) rather than defaulted or thrown: a genuine miss
     * still surfaces as a clean Solver gap downstream, exactly as it would if no flow existed here.
     */
@@ -864,26 +950,22 @@ object ConstraintCollection {
     }
     tpe match {
       // Tuple: (ChanType1, ChanType2) — extract from first element
-      case Type.Apply(Type.Apply(_, firstChan, _), _, _) =>
-        elmFromChan(firstChan) match {
-          case Some(elm) => elm
-          case None      => tpe  // fallback
-        }
+      case Type.Apply(Type.Apply(_, firstChan, _), _, _) => elmFromChan(firstChan).getOrElse(tpe)
       case _ => tpe
     }
   }
 
   /**
     * Rewrites `Sender[t]`/`Receiver[t]` to `Concurrent.Channel.Mpmc[t, IO]`, recursively —
-    * mirrors `Lowering.lowerType`'s Sender/Receiver case.
+    * mirrors `SolutionLowering.lowerType`'s Sender/Receiver case.
     *
     * Used ONLY when building flows for the `@LoweringTarget` channel defs (`Defs.ChannelGet` /
-    * `ChannelPut` / `ChannelNewTuple`), because `Lowering.mkGetChannel` / `mkPutChannel` /
-    * `mkNewChannel` query `lookupFn` with a type that has already been run through
-    * `Lowering.lowerType`. It must NOT be applied inside `typeToMonoArg` generally: an ordinary
-    * def's own specialization key (e.g. `Channel.send`) is built from `subst(itpe)`, which never
-    * calls `lowerType` and so keeps `Sender`/`Receiver` unexpanded — rewriting those flows too
-    * would corrupt that def's own defTable key instead of fixing the channel-def one.
+    * `ChannelPut` / `ChannelNewTuple`), because `SolutionLowering.mkGetChannel` / `mkPutChannel` /
+    * `mkNewChannel` query `lookup` with a type that has already been run through
+    * `SolutionLowering.lowerType`. It must NOT be applied inside `typeToMonoArg` generally: an
+    * ordinary def's own specialization key (e.g. `Channel.send`) is built from `subst(itpe)`,
+    * which never calls `lowerType` and so keeps `Sender`/`Receiver` unexpanded — rewriting those
+    * flows too would corrupt that def's own defTable key instead of fixing the channel-def one.
     */
   private[monomorph2] def lowerChannelType(tpe: Type): Type = tpe match {
     case Type.Apply(Type.Cst(TypeConstructor.Sender, loc), elm, _) =>
@@ -897,27 +979,21 @@ object ConstraintCollection {
     case other => other
   }
 
-  /**
-    * Flattens a chain of Type.Apply to find the root type constructor head.
-    */
-  private def getAppHead(tpe: Type): Type = tpe match {
-    case Type.Apply(t1, _, _) => getAppHead(t1)
-    case head => head
-  }
-
-  /**
-    * Unrolls a chain of Type.Apply to collect all applied type arguments in order.
-    */
-  private def getAppArgs(tpe: Type): List[Type] = tpe match {
-    case Type.Apply(t1, t2, _) => getAppArgs(t1) :+ t2
-    case _ => Nil
+  /** Walks `tpe`'s `Type.Apply` chain once, returning its head and its args in left-to-right order. */
+  private def flattenApply(tpe: Type): (Type, List[Type]) = {
+    @tailrec
+    def loop(t: Type, argsAcc: List[Type]): (Type, List[Type]) = t match {
+      case Type.Apply(t1, t2, _) => loop(t1, t2 :: argsAcc)
+      case head => (head, argsAcc)
+    }
+    loop(tpe, Nil)
   }
 
   /**
     * Converts `tpe` to a `MonoArg` relative to the current declaration context.
     * Type variables bound by the current declaration become `Param`; everything else becomes `Const` or `App`.
     */
-  private def typeToMonoArg(tpe: Type, loc: SourceLocation)(implicit ctx: Context): MonoArg = tpe match {
+  private def typeToMonoArg(tpe: Type)(implicit ctx: Context): MonoArg = tpe match {
     case Type.Var(sym, _) =>
       ctx.tparamEnv.get(sym) match {
         case Some(idx) => MonoArg.Param(ctx.currentDecl, idx)
@@ -946,30 +1022,35 @@ object ConstraintCollection {
     case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
       // Ground: resolve eagerly. Non-ground: record symbolically for the solver.
       if (tpe.typeVars.isEmpty) MonoArg.Const(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix))
-      else MonoArg.Assoc(symUse.sym, typeToMonoArg(arg, loc), kind, assocLoc)
+      else MonoArg.Assoc(symUse.sym, typeToMonoArg(arg), kind, assocLoc)
     case Type.Alias(_, _, inner, _) =>
-      typeToMonoArg(inner, loc)
+      typeToMonoArg(inner)
     case Type.Cst(_, _) | _: Type.BaseType =>
       MonoArg.Const(tpe)
-    case Type.Apply(_, _, loc) =>
+    case Type.Apply(_, _, _) =>
       if (tpe.kind == Kind.Eff && tpe.typeVars.isEmpty)
         // Guard: effect formulas occasionally contain non-effect constructors (e.g. data types in
         // complement/union positions). canonicalEffect will throw on those; fall back to Const.
         try MonoArg.Const(MonomorphCanon.canonicalEffect(tpe))
         catch { case _: ca.uwaterloo.flix.util.InternalCompilerException => MonoArg.Const(tpe) }
-      else
-        MonoArg.App(typeToMonoArg(getAppHead(tpe), loc), getAppArgs(tpe).map(arg => typeToMonoArg(arg, loc)))
+      else {
+        val (head, args) = flattenApply(tpe)
+        MonoArg.App(typeToMonoArg(head), args.map(arg => typeToMonoArg(arg)))
+      }
     case other =>
       MonoArg.Const(other)
   }
 
   /** Returns the enum/struct `MVar` and type arguments for a fully-applied enum/struct type. */
-  private def getEnumMVarAndTypeArgs(tpe: Type, loc: SourceLocation): (MVar, List[Type]) =
-    getAppHead(tpe) match {
-      case Type.Cst(TypeConstructor.Enum(sym, _), _)             => (MVar.Enum(sym), getAppArgs(tpe))
-      case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => (MVar.RestrictableEnum(sym), getAppArgs(tpe))
-      case Type.Cst(TypeConstructor.Struct(sym, _), _)           => (MVar.Struct(sym), getAppArgs(tpe))
+  private def getEnumMVarAndTypeArgs(tpe0: Type, loc: SourceLocation): (MVar, List[Type]) = {
+    val tpe = dealias(tpe0)
+    val (head, args) = flattenApply(tpe)
+    head match {
+      case Type.Cst(TypeConstructor.Enum(sym, _), _)             => (MVar.Enum(sym), args)
+      case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => (MVar.RestrictableEnum(sym), args)
+      case Type.Cst(TypeConstructor.Struct(sym, _), _)           => (MVar.Struct(sym), args)
       case _ => throw InternalCompilerException(s"ConstraintGen: bad types? ${tpe}", loc)
     }
+  }
 
 }

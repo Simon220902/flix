@@ -23,7 +23,7 @@ import ca.uwaterloo.flix.language.fmt.FormatOptions
 import ca.uwaterloo.flix.language.phase.*
 import ca.uwaterloo.flix.language.phase.jvm.{CodeGen, JvmLoader, JvmWriter}
 import ca.uwaterloo.flix.language.phase.monomorph.Specialization
-import ca.uwaterloo.flix.language.phase.monomorph2.{ConstraintCollection, ConstraintSolver, SolutionSpecialization}
+import ca.uwaterloo.flix.language.phase.monomorph2.{ConstraintCollection, ConstraintSolver, MonomorphTreeShaker, NonMonomorphizableCheck, SolutionSpecialization}
 import ca.uwaterloo.flix.language.phase.optimizer.{LambdaDrop, Optimizer}
 import ca.uwaterloo.flix.language.{CompilationMessage, GenSym}
 import ca.uwaterloo.flix.runtime.CompilationResult
@@ -647,21 +647,31 @@ class Flix {
 
     // Initialize fork-join thread pool.
     initForkJoinPool()
-    var treeShaker1Ast = TreeShaker1.run(typedAst)
-    // Note: Do not null typedAst. It is used later.
 
     var monomorpherAst =
-      if (true) { // (System.getenv("FLIX_MONO_EXPERIMENT") != null) {
-        // println("Using the new monomorphizer!")
-        // NOTE: It is important that we here use the typedAst otherwise it fails (due to missing functions?)
-        // I don't really understand why we run the treeShaker1Ast really?
-        val constraints = ConstraintCollection.generate(typedAst)
-        val solution    = ConstraintSolver.solve(constraints, typedAst)
-        SolutionSpecialization.run(typedAst, solution)
+      if (options.xnewmono) {
+        var monomorphTreeShakerAst = MonomorphTreeShaker.run(typedAst)
+        val constraints = ConstraintCollection.generate(monomorphTreeShakerAst)
+        flix.phase("NonMonomorphizableCheck") {
+          NonMonomorphizableCheck.checkMonomorphizable(constraints)
+        }(AstPrinter.DebugNoOp())
+        val solution    = ConstraintSolver.solve(constraints, monomorphTreeShakerAst)
+        val monomorpherAst = SolutionSpecialization.run(monomorphTreeShakerAst, solution)
+        monomorphTreeShakerAst = null // Explicitly null-out such that the memory becomes eligible for GC.
+        monomorpherAst
       } else {
-        Specialization.run(typedAst)
+        // THE PREVIOUS CODE!
+        //var treeShaker1Ast = TreeShaker1.run(typedAst)
+        // Using the new version of the TreeShaker1.scala
+        var treeShaker1Ast = MonomorphTreeShaker.run(typedAst)
+        // Note: Do not null typedAst. It is used later.
+
+        val monomorpherAst =  Specialization.run(treeShaker1Ast)
+        treeShaker1Ast = null // Explicitly null-out such that the memory becomes eligible for GC.
+
+        monomorpherAst
       }
-    treeShaker1Ast = null // Explicitly null-out such that the memory becomes eligible for GC.
+    flix.emitEvent(FlixEvent.AfterMonomorph(monomorpherAst))
 
     var lambdaDropAst = LambdaDrop.run(monomorpherAst)
     monomorpherAst = null // Explicitly null-out such that the memory becomes eligible for GC.

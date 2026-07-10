@@ -43,9 +43,12 @@ object Options {
     xnodeprecated = false,
     xsummary = false,
     xsubeffecting = Set.empty,
+    xnewmono = false,
     XPerfN = None,
     XPerfFrontend = false,
     XPerfPar = false,
+    XMonoBenchCompare = false,
+    XMonoBenchWarmup = None,
     xchaosMonkey = false
   )
 
@@ -106,9 +109,12 @@ case class Options(lib: LibLevel,
                    xnodeprecated: Boolean,
                    xsummary: Boolean,
                    xsubeffecting: Set[Subeffecting],
+                   xnewmono: Boolean,
                    XPerfFrontend: Boolean,
                    XPerfPar: Boolean,
                    XPerfN: Option[Int],
+                   XMonoBenchCompare: Boolean,
+                   XMonoBenchWarmup: Option[Int],
                    xchaosMonkey: Boolean
                   )
 

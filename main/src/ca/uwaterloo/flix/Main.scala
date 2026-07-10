@@ -78,9 +78,12 @@ object Main {
       xnodeprecated = cmdOpts.xnodeprecated,
       xsummary = cmdOpts.xsummary,
       xsubeffecting = cmdOpts.xsubeffecting,
+      xnewmono = cmdOpts.xnewmono,
       XPerfFrontend = cmdOpts.XPerfFrontend,
       XPerfPar = cmdOpts.XPerfPar,
       XPerfN = cmdOpts.XPerfN,
+      XMonoBenchCompare = cmdOpts.XMonoBenchCompare,
+      XMonoBenchWarmup = cmdOpts.XMonoBenchWarmup,
       xchaosMonkey = Options.Default.xchaosMonkey
     )
 
@@ -451,6 +454,9 @@ object Main {
         case Command.CompilerMemory =>
           CompilerMemory.run(options)
 
+        case Command.MonomorphBench =>
+          MonomorphBench.run(options, cwd)
+
         case Command.Zhegalkin =>
           ZhegalkinPerf.run(options.XPerfN)
 
@@ -486,9 +492,12 @@ object Main {
     xprintphases: Boolean = false,
     xsummary: Boolean = false,
     xsubeffecting: Set[Subeffecting] = Set.empty,
+    xnewmono: Boolean = false,
     XPerfN: Option[Int] = None,
     XPerfFrontend: Boolean = false,
     XPerfPar: Boolean = false,
+    XMonoBenchCompare: Boolean = false,
+    XMonoBenchWarmup: Option[Int] = None,
     files: Seq[File] = Seq()
   )
 
@@ -540,6 +549,8 @@ object Main {
     case object CompilerPerf extends Command
 
     case object CompilerMemory extends Command
+
+    case object MonomorphBench extends Command
 
     case object Zhegalkin extends Command
 
@@ -639,6 +650,18 @@ object Main {
 
       cmd("Xmemory").action((_, c) => c.copy(command = Command.CompilerMemory)).hidden()
 
+      cmd("Xmonobench").action((_, c) => c.copy(command = Command.MonomorphBench)).children(
+        opt[Unit]("compare")
+          .action((_, c) => c.copy(XMonoBenchCompare = true))
+          .text("print a comparison table from previously-written results instead of compiling"),
+        opt[Int]("n")
+          .action((v, c) => c.copy(XPerfN = Some(v)))
+          .text("number of compilations to average over (default 5)"),
+        opt[Int]("warmup")
+          .action((v, c) => c.copy(XMonoBenchWarmup = Some(v)))
+          .text("number of discarded warmup compilations before the measured runs (default 2)")
+      ).hidden()
+
       cmd("Xzhegalkin").action((_, c) => c.copy(command = Command.Zhegalkin)).children(
         opt[Int]("n")
           .action((v, c) => c.copy(XPerfN = Some(v)))
@@ -719,6 +742,10 @@ object Main {
       // Xsubeffecting
       opt[Seq[Subeffecting]]("Xsubeffecting").action((subeffectings, c) => c.copy(xsubeffecting = subeffectings.toSet)).
         text("[experimental] enables sub-effecting in select places")
+
+      // Xnewmono
+      opt[Unit]("Xnewmono").action((_, c) => c.copy(xnewmono = true)).
+        text("[experimental] uses the constraint-based monomorphization pipeline instead of the demand-driven one.")
 
       note("")
 
