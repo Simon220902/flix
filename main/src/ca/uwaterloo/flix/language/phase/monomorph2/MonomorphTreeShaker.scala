@@ -52,14 +52,11 @@ object MonomorphTreeShaker {
 
     val defaultHandlers = root.defaultHandlers.map(handler => ReachableSym.DefnSym(handler.handlerSym)).toSet
 
-    // Tree shaking runs before `Lowering`, which is what actually synthesizes call sites to
-    // `@LoweringTarget` defs. Ordinary reachability can't see those calls yet, so such defs must
-    // be seeded as roots unconditionally instead of being discovered through the call graph.
-    val loweringTargets: Set[ReachableSym] =
-      root.defs.values.filter(_.spec.ann.isLoweringTarget).map(defn => ReachableSym.DefnSym(defn.sym)).toSet
-
-    // Compute the symbols that are transitively reachable.
-    val allReachable = ParOps.parReach(initReach ++ loweringTargets ++ defaultHandlers, visitSym(_, root))
+    // Compute the symbols that are transitively reachable. `@LoweringTargetDatalog`/
+    // `@LoweringTargetChannel` defs are pulled in lazily via the `ChannelUsed`/`DatalogUsed`
+    // sentinels emitted by `visitExp` (see below), not seeded unconditionally, so a program using
+    // neither feature keeps neither def group.
+    val allReachable = ParOps.parReach(initReach ++ defaultHandlers, visitSym(_, root))
 
     // Filter the reachable definitions.
     val reachableDefs = root.defs.filter {
@@ -96,6 +93,17 @@ object MonomorphTreeShaker {
       root.instances(traitSym).foldLeft(Set.empty[ReachableSym]) {
         case (acc, s) => visitExps(s.defs.map(_.exp)) ++ acc
       }
+
+    // `Lowering` is what actually synthesizes call sites to `@LoweringTargetDatalog`/
+    // `@LoweringTargetChannel` defs; ordinary reachability can't see those calls yet, so pull in
+    // the whole triggered category here.
+    case ReachableSym.ChannelUsed =>
+      root.defs.values.filter(_.spec.ann.isLoweringTargetChannel)
+        .map(d => ReachableSym.DefnSym(d.sym)).toSet
+
+    case ReachableSym.DatalogUsed =>
+      root.defs.values.filter(_.spec.ann.isLoweringTargetDatalog)
+        .map(d => ReachableSym.DefnSym(d.sym)).toSet
   }
 
   /** Returns the symbols reachable from `e0`. */
@@ -281,22 +289,23 @@ object MonomorphTreeShaker {
       visitExp(exp1) ++ visitExp(exp2)
 
     case Expr.NewChannel(exp, _, _, _) =>
-      visitExp(exp)
+      Set(ReachableSym.ChannelUsed) ++ visitExp(exp)
 
     case Expr.GetChannel(exp, _, _, _) =>
-      visitExp(exp)
+      Set(ReachableSym.ChannelUsed) ++ visitExp(exp)
 
     case Expr.PutChannel(exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      Set(ReachableSym.ChannelUsed) ++ visitExp(exp1) ++ visitExp(exp2)
 
     case Expr.Spawn(exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      Set(ReachableSym.ChannelUsed) ++ visitExp(exp1) ++ visitExp(exp2)
 
     case Expr.SelectChannel(selects, optExp, _, _, _) =>
-      visitExps(selects.map(_.exp)) ++ visitExps(selects.map(_.chan)) ++ optExp.map(visitExp).getOrElse(Set.empty)
+      Set(ReachableSym.ChannelUsed) ++
+        visitExps(selects.map(_.exp)) ++ visitExps(selects.map(_.chan)) ++ optExp.map(visitExp).getOrElse(Set.empty)
 
     case Expr.ParYield(frags, exp, _, _, _) =>
-      visitExps(frags.map(_.exp)) ++ visitExp(exp)
+      Set(ReachableSym.ChannelUsed) ++ visitExps(frags.map(_.exp)) ++ visitExp(exp)
 
     case Expr.Lazy(exp, _, _) =>
       visitExp(exp)
@@ -305,29 +314,30 @@ object MonomorphTreeShaker {
       visitExp(exp)
 
     case Expr.FixpointConstraintSet(cs, _, _) =>
-      cs.map(visitConstraint).fold(Set.empty)(_ ++ _)
+      Set(ReachableSym.DatalogUsed) ++ cs.map(visitConstraint).fold(Set.empty)(_ ++ _)
 
     case Expr.FixpointLambda(_, exp, _, _, _) =>
-      visitExp(exp)
+      Set(ReachableSym.DatalogUsed) ++ visitExp(exp)
 
     case Expr.FixpointMerge(exp1, exp2, _, _, _) =>
-      visitExp(exp1) ++ visitExp(exp2)
+      Set(ReachableSym.DatalogUsed) ++ visitExp(exp1) ++ visitExp(exp2)
 
     case Expr.FixpointQueryWithProvenance(exps, select, _, _, _, _) =>
-      visitExps(exps) ++ visitHead(select)
+      Set(ReachableSym.DatalogUsed) ++ visitExps(exps) ++ visitHead(select)
 
     case Expr.FixpointQueryWithSelect(exps, queryExp, selects, from0, where0, _, _, _, _) =>
-      visitExps(exps) ++
+      Set(ReachableSym.DatalogUsed) ++
+        visitExps(exps) ++
         visitExp(queryExp) ++
         visitExps(selects) ++
         visitBodies(from0) ++
         visitExps(where0)
 
     case Expr.FixpointSolveWithProject(exps0, _, _, _, _, _) =>
-      visitExps(exps0)
+      Set(ReachableSym.DatalogUsed) ++ visitExps(exps0)
 
     case Expr.FixpointInjectInto(exps, _, _, _, _) =>
-      visitExps(exps)
+      Set(ReachableSym.DatalogUsed) ++ visitExps(exps)
 
     case Expr.Error(m, _, _) =>
       throw InternalCompilerException(s"Unexpected error expression near", m.loc)
@@ -367,6 +377,12 @@ object MonomorphTreeShaker {
     case class TraitSym(sym: Symbol.TraitSym) extends ReachableSym
 
     case class SigSym(sym: Symbol.SigSym) extends ReachableSym
+
+    /** Sentinel marking that a Channel-family expression was encountered. */
+    case object ChannelUsed extends ReachableSym
+
+    /** Sentinel marking that a Datalog-family expression was encountered. */
+    case object DatalogUsed extends ReachableSym
 
   }
 

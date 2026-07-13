@@ -30,7 +30,7 @@ import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
   *   - Is an entry point (main / test / export).
   *   - Appears in a function which itself is reachable.
   *   - Is an instance of a trait whose signature(s) appear in a reachable function.
-  *   - Is annotated with `@LoweringTarget`.
+  *   - Is annotated with `@LoweringTargetDatalog` or `@LoweringTargetChannel`.
   */
 object TreeShaker1 {
 
@@ -41,7 +41,7 @@ object TreeShaker1 {
     val defaultHandlers = root.defaultHandlers.map(handler => ReachableSym.DefnSym(handler.handlerSym)).toSet
 
     val loweringTargets: Set[ReachableSym] = root.defs.foldLeft(Set[ReachableSym]()) {
-      case (acc, (_, defn)) if defn.spec.ann.isLoweringTarget => acc + ReachableSym.DefnSym(defn.sym)
+      case (acc, (_, defn)) if defn.spec.ann.isLoweringTargetDatalog || defn.spec.ann.isLoweringTargetChannel => acc + ReachableSym.DefnSym(defn.sym)
       case (acc, _) => acc
     }
 
