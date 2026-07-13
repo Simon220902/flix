@@ -516,16 +516,17 @@ object SolutionLowering {
     case TypedAst.Expr.VectorLit(exps, tpe, eff, loc) =>
       val es = exps.map(visitExp(_, env0, subst))
       val t = visitType(tpe, subst)
-      MonoAst.Expr.VectorLit(es, t, subst(eff), loc)
+      MonoAst.Expr.ApplyAtomic(AtomicOp.VectorLit, es, t, subst(eff), loc)
 
     case TypedAst.Expr.VectorLoad(exp1, exp2, tpe, eff, loc) =>
       val e1 = visitExp(exp1, env0, subst)
       val e2 = visitExp(exp2, env0, subst)
       val t = visitType(tpe, subst)
-      MonoAst.Expr.VectorLoad(e1, e2, t, subst(eff), loc)
+      MonoAst.Expr.ApplyAtomic(AtomicOp.VectorLoad, List(e1, e2), t, subst(eff), loc)
 
     case TypedAst.Expr.VectorLength(exp, loc) =>
-      MonoAst.Expr.VectorLength(visitExp(exp, env0, subst), loc)
+      val e = visitExp(exp, env0, subst)
+      MonoAst.Expr.ApplyAtomic(AtomicOp.VectorLength, List(e), Type.Int32, e.eff, loc)
 
     case TypedAst.Expr.Ascribe(exp, _, _, _, _, _) =>
       visitExp(exp, env0, subst)
@@ -2343,7 +2344,7 @@ object SolutionLowering {
     * Returns a vector expression constructed from the given `exps` with type list of `elmType`.
     */
   private def mkVector(exps: List[MonoAst.Expr], elmType: Type, loc: SourceLocation): MonoAst.Expr = {
-    MonoAst.Expr.VectorLit(exps, Type.mkVector(elmType, loc), Type.Pure, loc)
+    MonoAst.Expr.ApplyAtomic(AtomicOp.VectorLit, exps, Type.mkVector(elmType, loc), Type.Pure, loc)
   }
 
   /**
@@ -2459,19 +2460,6 @@ object SolutionLowering {
           MonoAst.ExtMatchRule(p, e1, loc1)
       }
       MonoAst.Expr.ExtMatch(e, rs, tpe, eff, loc)
-
-    case MonoAst.Expr.VectorLit(exps, tpe, eff, loc) =>
-      val es = exps.map(substExp(_, subst))
-      MonoAst.Expr.VectorLit(es, tpe, eff, loc)
-
-    case MonoAst.Expr.VectorLoad(exp1, exp2, tpe, eff, loc) =>
-      val e1 = substExp(exp1, subst)
-      val e2 = substExp(exp2, subst)
-      MonoAst.Expr.VectorLoad(e1, e2, tpe, eff, loc)
-
-    case MonoAst.Expr.VectorLength(exp, loc) =>
-      val e = substExp(exp, subst)
-      MonoAst.Expr.VectorLength(e, loc)
 
     case MonoAst.Expr.Cast(exp, tpe, eff, loc) =>
       val e = substExp(exp, subst)
