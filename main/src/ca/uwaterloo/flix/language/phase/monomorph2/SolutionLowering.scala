@@ -26,7 +26,7 @@ import ca.uwaterloo.flix.language.ast.shared.{BoundBy, Constant, Decreasing, Den
 import ca.uwaterloo.flix.language.ast.{AtomicOp, MonoAst, Name, SemanticOp, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.phase.monomorph2.SolutionSpecialization.{Context, StrictSubstitution, lookupCaseSym, lookupStructSym, lookupSym, resolveSigSym, specializeFormalParam, specializeFormalParams}
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Enums, Types}
-import ca.uwaterloo.flix.util.{InternalCompilerException, Result}
+import ca.uwaterloo.flix.util.{InternalCompilerException, JvmUtils, Result}
 import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
 
 /**
@@ -675,6 +675,11 @@ object SolutionLowering {
       // LOWERING: this-ref LocalContext for anonymous-class methods.
       // NB: the thisRef must use the FRESHENED fparam sym (the method body's vars are renamed),
       // so the fparams are specialized here, before the body is visited under the new lctx.
+      // Mint a fresh anonymous class symbol for each specialization. Otherwise distinct
+      // specializations of an enclosing generic def (e.g. `mk[String]` and `mk[Int32]`)
+      // would reuse the same anonymous class name and collide, so one specialization would
+      // run with the other's generated class.
+      val freshSym = Symbol.mkFreshAnonClassSym(sym.loc)
       val cs = constructors.map {
         case TypedAst.JvmConstructor(cExp, cRetTpe, cEff, cLoc) =>
           MonoAst.JvmConstructor(visitExp(cExp, env0, subst), visitType(cRetTpe, subst), subst(cEff), cLoc)
@@ -685,12 +690,21 @@ object SolutionLowering {
           val fs = mFparams.map(lowerFormalParam).map(SolutionSpecialization.rewriteFormalParam)
           val thisParam = fs.head
           val thisRef = MonoAst.Expr.Var(thisParam.sym, thisParam.tpe, loc)
-          implicit val lctx: LocalContext = LocalContext(Some(sym), Some(thisRef))
-          val e = visitExp(mExp, env0 ++ env1, subst)
-          MonoAst.JvmMethod(mAnn, mIdent, fs, e, visitType(mRetTpe, subst), subst(mEff), mLoc)
+          implicit val lctx: LocalContext = LocalContext(Some(freshSym), Some(thisRef))
+          val e0 = visitExp(mExp, env0 ++ env1, subst)
+          // If this method overrides a Java method whose erased return type is a reference
+          // (e.g. `Object` for a generic interface method) but the Flix result is a primitive,
+          // box it so the value matches the erased JVM signature. This mirrors the boxing applied
+          // to generic Java method *calls* above (see `boxIfNecessary`), and the call site
+          // unboxes the result symmetrically.
+          val e = overriddenJavaReturnType(clazz, mIdent.name, fs.tail.length) match {
+            case Some(javaReturnType) => boxIfNecessary(e0, javaReturnType)
+            case None => e0
+          }
+          MonoAst.JvmMethod(mAnn, mIdent, fs, e, e.tpe, subst(mEff), mLoc)
       }
       val t = visitType(tpe, subst)
-      MonoAst.Expr.NewObject(sym, clazz, t, subst(eff), cs, ms, loc)
+      MonoAst.Expr.NewObject(freshSym, clazz, t, subst(eff), cs, ms, loc)
 
     case TypedAst.Expr.NewChannel(exp, tpe, eff, loc) =>
       // LOWERING: channel primitive → Concurrent.Channel call
@@ -1255,6 +1269,12 @@ object SolutionLowering {
     } else arg
   }
 
+  /** Returns the erased return type of the Java method on `clazz` matching `name` and `arity` (excluding the receiver). */
+  private def overriddenJavaReturnType(clazz: Class[?], name: String, arity: Int): Option[Class[?]] =
+    JvmUtils.getOverridableInstanceMethods(clazz).collectFirst {
+      case m if m.getName == name && m.getParameterCount == arity => m.getReturnType
+    }
+
   /**
     * Unboxes `expr` if the expected return type (Flix primitive) mismatches the actual return type (Object).
     * E.g., in `let v: Int32 = m.get("k")` on a `HashMap[String, Int32]`, the expected type is
@@ -1343,15 +1363,28 @@ object SolutionLowering {
     * Channel put expressions are rewritten as follows:
     * {{{ c <- 42 }}}
     * becomes a call to the standard library function:
-    * {{{ Concurrent/Channel.put(42, c) }}}
+    * {{{ let chan = c; let value = 42; Concurrent/Channel.put(value, chan) }}}
+    *
+    * Here `exp1` is the channel and `exp2` is the value (i.e. `exp1 <- exp2`). In source order
+    * the channel is evaluated before the value, but `Channel.put` takes the value before the
+    * channel. We let-bind both expressions in source order so that reordering them into the
+    * argument list does not change their evaluation order. See:
+    * https://github.com/flix/flix/issues/10378
     */
-  private def mkPutChannel(exp1: MonoAst.Expr, exp2: MonoAst.Expr, chanTpe: Type, valTpe: Type, eff: Type, loc: SourceLocation)(implicit ctx: Context): MonoAst.Expr = {
+  private def mkPutChannel(exp1: MonoAst.Expr, exp2: MonoAst.Expr, chanTpe: Type, valTpe: Type, eff: Type, loc: SourceLocation)(implicit ctx: Context, flix: Flix): MonoAst.Expr = {
     // itpe is the def-lookup key: built from the caller's RAW (un-rewritten) substituted
     // chanTpe/valTpe — see mkGetChannel's doc comment for why `exp1.tpe`/`exp2.tpe` can't be used
     // directly (already enum/struct-rewritten by the time the visited exprs reach here).
     val itpe = lowerType(Type.mkIoUncurriedArrow(List(valTpe, chanTpe), Type.Unit, loc))
     val defnSym = lookup(Defs.ChannelPut, itpe)
-    MonoAst.Expr.ApplyDef(defnSym, List(exp2, exp1), SolutionSpecialization.rewriteEnumStructType(itpe), Type.Unit, eff, loc)
+    val chanSym = mkLetSym("chan", loc)
+    val valueSym = mkLetSym("value", loc)
+    val chanVar = MonoAst.Expr.Var(chanSym, exp1.tpe, loc)
+    val valueVar = MonoAst.Expr.Var(valueSym, exp2.tpe, loc)
+    val putExp = MonoAst.Expr.ApplyDef(defnSym, List(valueVar, chanVar), SolutionSpecialization.rewriteEnumStructType(itpe), Type.Unit, eff, loc)
+    // The channel binding is the outermost let, so the channel is evaluated before the value.
+    val valueLet = MonoAst.Expr.Let(valueSym, exp2, putExp, Type.Unit, eff, Occur.Unknown, loc)
+    MonoAst.Expr.Let(chanSym, exp1, valueLet, Type.Unit, eff, Occur.Unknown, loc)
   }
 
   /**
@@ -1522,7 +1555,7 @@ object SolutionLowering {
     *                         def-lookup keys — see mkGetChannel's doc comment for why `e.tpe`
     *                         alone, already enum/struct-rewritten, isn't safe to reuse here).
     */
-  private def mkParChannels(exp: MonoAst.Expr, chanSymsWithExps: List[(Symbol.VarSym, MonoAst.Expr, Type)])(implicit ctx: Context): MonoAst.Expr = {
+  private def mkParChannels(exp: MonoAst.Expr, chanSymsWithExps: List[(Symbol.VarSym, MonoAst.Expr, Type)])(implicit ctx: Context, flix: Flix): MonoAst.Expr = {
     // Make spawn expressions `spawn ch <- exp`.
     val spawns = chanSymsWithExps.foldRight(exp: MonoAst.Expr) {
       case ((sym, e, rawTpe), acc) =>
