@@ -635,7 +635,7 @@ object ConstraintCollection {
       methods.foldLeft(acc1)((a, m) => visitExp(m.exp, a))
 
     // LOWERING
-    // Channel nodes: recurse into sub-expressions AND emit flows for the @LoweringTarget
+    // Channel nodes: recurse into sub-expressions AND emit flows for the @LoweringTargetChannel
     // defs that Lowering will synthesize at code-gen time.
     // GetChannel(<- c) → Channel.get(c): tparam a = element type = tpe
     case Expr.GetChannel(exp, tpe, _, loc) =>
@@ -959,7 +959,7 @@ object ConstraintCollection {
     * Rewrites `Sender[t]`/`Receiver[t]` to `Concurrent.Channel.Mpmc[t, IO]`, recursively —
     * mirrors `SolutionLowering.lowerType`'s Sender/Receiver case.
     *
-    * Used ONLY when building flows for the `@LoweringTarget` channel defs (`Defs.ChannelGet` /
+    * Used ONLY when building flows for the `@LoweringTargetChannel` defs (`Defs.ChannelGet` /
     * `ChannelPut` / `ChannelNewTuple`), because `SolutionLowering.mkGetChannel` / `mkPutChannel` /
     * `mkNewChannel` query `lookup` with a type that has already been run through
     * `SolutionLowering.lowerType`. It must NOT be applied inside `typeToMonoArg` generally: an

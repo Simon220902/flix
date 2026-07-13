@@ -61,7 +61,7 @@ object ConstraintSolver {
     val prepared    = flows.iterator.map(f => prepareFlow(f, root)).toList
     val dependents  = buildDependents(prepared)
 
-    // The @LoweringTarget channel defs are queried by Lowering.mkGetChannel/mkPutChannel/
+    // The @LoweringTargetChannel defs are queried by Lowering.mkGetChannel/mkPutChannel/
     // mkNewChannel with a type that has already been run through Lowering.lowerType (which
     // rewrites Sender[t]/Receiver[t] to Mpmc[t, IO]). Every other def's key comes from
     // subst(itpe), which never calls lowerType. So the rewrite must be applied here, at the
