@@ -660,13 +660,10 @@ class Flix {
         monomorphTreeShakerAst = null // Explicitly null-out such that the memory becomes eligible for GC.
         monomorpherAst
       } else {
-        // THE PREVIOUS CODE!
-        //var treeShaker1Ast = TreeShaker1.run(typedAst)
-        // Using the new version of the TreeShaker1.scala
         var treeShaker1Ast = MonomorphTreeShaker.run(typedAst)
         // Note: Do not null typedAst. It is used later.
 
-        val monomorpherAst =  Specialization.run(treeShaker1Ast)
+        val monomorpherAst = Specialization.run(treeShaker1Ast)
         treeShaker1Ast = null // Explicitly null-out such that the memory becomes eligible for GC.
 
         monomorpherAst

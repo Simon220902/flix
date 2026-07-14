@@ -398,13 +398,13 @@ object SolutionLowering {
     case TypedAst.Expr.RestrictableChoose(_, exp, rules, tpe, eff, loc) =>
       // LOWERING: restrictable choose → ordinary match
       val e = visitExp(exp, env0, subst)
-      val rs = rules.map(lowerRestrictableChooseRule(_, env0, subst))
+      val rs = rules.map(visitRestrictableChooseRule(_, env0, subst))
       val t = visitType(tpe, subst)
       MonoAst.Expr.Match(e, rs, t, subst(eff), loc)
 
     case TypedAst.Expr.ExtMatch(exp, rules, tpe, eff, loc) =>
       val e = visitExp(exp, env0, subst)
-      val rs = rules.map(lowerExtMatch(_, env0, subst))
+      val rs = rules.map(visitExtMatchRule(_, env0, subst))
       val t = visitType(tpe, subst)
       MonoAst.Expr.ExtMatch(e, rs, t, subst(eff), loc)
 
@@ -571,7 +571,7 @@ object SolutionLowering {
     case TypedAst.Expr.TryCatch(exp, rules, tpe, eff, loc) =>
       val e = visitExp(exp, env0, subst)
       val t = visitType(tpe, subst)
-      val rs = rules.map(lowerCatchRule(_, env0, subst))
+      val rs = rules.map(visitCatchRule(_, env0, subst))
       MonoAst.Expr.TryCatch(e, rs, t, subst(eff), loc)
 
     case TypedAst.Expr.Handler(symUse, rules, bodyTpe, bodyEff0, handledEff, tpe, loc) =>
@@ -579,7 +579,7 @@ object SolutionLowering {
       // is lowered to
       // handlerBody -> try handlerBody() with sym { rules }
       val bodySym = Symbol.freshVarSym("handlerBody", BoundBy.FormalParam, loc.asSynthetic)(RegionScope.Top, flix)
-      val rs = rules.map(lowerHandlerRule(_, env0, subst))
+      val rs = rules.map(visitHandlerRule(_, env0, subst))
       val bt = visitType(bodyTpe, subst)
       val t = visitType(tpe, subst)
       val bodyEff = subst(bodyEff0)
@@ -782,7 +782,7 @@ object SolutionLowering {
     case TypedAst.Expr.FixpointLambda(pparams, exp, _, eff, loc) =>
       // LOWERING: predicate rename via the Fixpoint solver's rename function
       val resultType = Types.Datalog
-      val defn = lookup(Defs.Rename, resultType)
+      val defn = lookupSym(Defs.Rename, resultType)
       val predExps = mkList(pparams.map(pparam => mkPredSym(pparam.pred)), Types.PredSym, loc)
       val argExps = predExps :: visitExp(exp, env0, subst) :: Nil
       MonoAst.Expr.ApplyDef(defn, argExps, Types.RenameType, resultType, subst(eff), loc)
@@ -790,7 +790,7 @@ object SolutionLowering {
     case TypedAst.Expr.FixpointMerge(exp1, exp2, _, eff, loc) =>
       // LOWERING: Datalog merge → Fixpoint solver merge call
       val resultType = Types.Datalog
-      val defn = lookup(Defs.Merge, resultType)
+      val defn = lookupSym(Defs.Merge, resultType)
       val argExps = visitExp(exp1, env0, subst) :: visitExp(exp2, env0, subst) :: Nil
       MonoAst.Expr.ApplyDef(defn, argExps, Types.MergeType, resultType, subst(eff), loc)
 
@@ -826,7 +826,7 @@ object SolutionLowering {
   /**
     * Specializes and lowers the given catch rule `rule0` (fresh binder, like every other binder).
     */
-  private def lowerCatchRule(rule: TypedAst.CatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.CatchRule = rule match {
+  private def visitCatchRule(rule: TypedAst.CatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.CatchRule = rule match {
     case TypedAst.CatchRule(bnd, clazz, exp, _) =>
       val freshSym = Symbol.freshVarSym(bnd.sym)
       val env1 = env0 + (bnd.sym -> freshSym)
@@ -837,7 +837,7 @@ object SolutionLowering {
   /**
     * Specializes and lowers the given handler rule `rule0` (fresh formal params).
     */
-  private def lowerHandlerRule(rule0: TypedAst.HandlerRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.HandlerRule = rule0 match {
+  private def visitHandlerRule(rule0: TypedAst.HandlerRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.HandlerRule = rule0 match {
     case TypedAst.HandlerRule(opSymUse, fparams0, body0, _) =>
       val (fparams1, env1) = specializeFormalParams(fparams0, subst)
       val fparams = fparams1.map(lowerFormalParam).map(SolutionSpecialization.rewriteFormalParam)
@@ -912,7 +912,7 @@ object SolutionLowering {
   /**
     * Specializes and lowers the given restrictable choice rule `rule0` to a match rule.
     */
-  private def lowerRestrictableChooseRule(rule0: TypedAst.RestrictableChooseRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.MatchRule = rule0 match {
+  private def visitRestrictableChooseRule(rule0: TypedAst.RestrictableChooseRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.MatchRule = rule0 match {
     case TypedAst.RestrictableChooseRule(pat, exp) =>
       pat match {
         case TypedAst.RestrictableChoosePattern.Tag(symUse, pat0, tpe, loc) =>
@@ -968,7 +968,7 @@ object SolutionLowering {
       throw InternalCompilerException("unexpected error ext pattern", loc)
   }
 
-  private def lowerExtMatch(rule0: TypedAst.ExtMatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.ExtMatchRule = rule0 match {
+  private def visitExtMatchRule(rule0: TypedAst.ExtMatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.ExtMatchRule = rule0 match {
     case TypedAst.ExtMatchRule(pat, exp, loc) =>
       val (p, env1) = visitExtPat(pat, subst)
       val e = visitExp(exp, env0 ++ env1, subst)
@@ -1104,14 +1104,6 @@ object SolutionLowering {
     */
   private def lowerRestrictableEnumSym(sym: Symbol.RestrictableEnumSym): Symbol.EnumSym =
     new Symbol.EnumSym(None, sym.namespace, sym.name, sym.loc)
-
-  /**
-    * Returns the definition associated with the given symbol `sym`.
-    *
-    * @param tpe must be specialized. Can be visited, if the underlying function can handle that
-    */
-  private def lookup(sym: Symbol.DefnSym, tpe: Type)(implicit ctx: Context): Symbol.DefnSym =
-    lookupSym(sym, tpe)
 
   /**
     * Returns the cast of `e` to `tpe` and `eff`.
@@ -1335,7 +1327,7 @@ object SolutionLowering {
     // itpe is the def-lookup key: computed and used raw (un-rewritten), matching every other
     // lookup-key position in the fused walk — only the node's own field positions get rewritten.
     val itpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
-    val defnSym = lookup(Defs.ChannelNewTuple, itpe)
+    val defnSym = lookupSym(Defs.ChannelNewTuple, itpe)
     MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, SolutionSpecialization.rewriteEnumStructType(itpe), visitTypeSubstituted(tpe), eff, loc)
   }
 
@@ -1353,7 +1345,7 @@ object SolutionLowering {
     // already-visited channel expression) reaches here. Only the node's own field positions below
     // get the rewrite.
     val itpe = lowerType(Type.mkIoArrow(chanTpe, tpe, loc))
-    val defnSym = lookup(Defs.ChannelGet, itpe)
+    val defnSym = lookupSym(Defs.ChannelGet, itpe)
     MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, SolutionSpecialization.rewriteEnumStructType(itpe), visitTypeSubstituted(tpe), eff, loc)
   }
 
@@ -1376,7 +1368,7 @@ object SolutionLowering {
     // chanTpe/valTpe — see mkGetChannel's doc comment for why `exp1.tpe`/`exp2.tpe` can't be used
     // directly (already enum/struct-rewritten by the time the visited exprs reach here).
     val itpe = lowerType(Type.mkIoUncurriedArrow(List(valTpe, chanTpe), Type.Unit, loc))
-    val defnSym = lookup(Defs.ChannelPut, itpe)
+    val defnSym = lookupSym(Defs.ChannelPut, itpe)
     val chanSym = mkLetSym("chan", loc)
     val valueSym = mkLetSym("value", loc)
     val chanVar = MonoAst.Expr.Var(chanSym, exp1.tpe, loc)
@@ -1442,7 +1434,7 @@ object SolutionLowering {
       case ((_, _, _, rawChanTpe), (chanSym, _)) =>
         // itpe/lookup key built from the RAW channel type — see SelectChannel case's doc comment.
         val itpe = lowerType(Type.mkPureArrow(rawChanTpe, Types.ChannelMpmcAdmin, loc))
-        val defnSym = lookup(Defs.ChannelMpmcAdmin, itpe)
+        val defnSym = lookupSym(Defs.ChannelMpmcAdmin, itpe)
         MonoAst.Expr.ApplyDef(defnSym, List(MonoAst.Expr.Var(chanSym, visitTypeSubstituted(rawChanTpe), loc)), SolutionSpecialization.rewriteEnumStructType(itpe), Types.ChannelMpmcAdmin, Type.Pure, loc)
     }
     mkList(admins, Types.ChannelMpmcAdmin, loc)
@@ -1467,7 +1459,7 @@ object SolutionLowering {
       case Some(_) => MonoAst.Expr.Cst(Constant.Bool(false), Type.Bool, loc)
       case None => MonoAst.Expr.Cst(Constant.Bool(true), Type.Bool, loc)
     }
-    val defnSym = lookup(Defs.ChannelSelectFrom, itpe)
+    val defnSym = lookupSym(Defs.ChannelSelectFrom, itpe)
     MonoAst.Expr.ApplyDef(defnSym, List(admins, blocking), SolutionSpecialization.rewriteEnumStructType(lowerType(itpe)), SolutionSpecialization.rewriteEnumStructType(selectRetTpe), Type.IO, loc)
   }
 
@@ -1496,7 +1488,7 @@ object SolutionLowering {
         val getTpe = extractChannelTpe(rawChanTpe)
         val itpe = lowerType(Type.mkIoUncurriedArrow(List(rawChanTpe, locksTypeRaw), getTpe, loc))
         val args = List(MonoAst.Expr.Var(chSym, visitTypeSubstituted(rawChanTpe), loc), MonoAst.Expr.Var(locksSym, locksType, loc))
-        val defnSym = lookup(Defs.ChannelUnsafeGetAndUnlock, itpe)
+        val defnSym = lookupSym(Defs.ChannelUnsafeGetAndUnlock, itpe)
         val getExp = MonoAst.Expr.ApplyDef(defnSym, args, SolutionSpecialization.rewriteEnumStructType(itpe), visitTypeSubstituted(getTpe), eff, loc)
         val e = MonoAst.Expr.Let(sym, getExp, exp, exp.tpe, eff, Occur.Unknown, loc)
         MonoAst.MatchRule(pat, None, e)
@@ -1581,7 +1573,7 @@ object SolutionLowering {
     */
   private def mkNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit ctx: Context): MonoAst.Expr = {
     val itpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
-    val defnSym = lookup(Defs.ChannelNew, itpe)
+    val defnSym = lookupSym(Defs.ChannelNew, itpe)
     MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, SolutionSpecialization.rewriteEnumStructType(itpe), SolutionSpecialization.rewriteEnumStructType(tpe), eff, loc)
   }
 
@@ -1776,7 +1768,7 @@ object SolutionLowering {
     val lambdaExp = mkExtVarLambda(preds, extVarType, loc)
     val argExps = goalPredSym :: goalTerms :: withPredSyms :: lambdaExp :: mergedExp :: Nil
     val itpe = Types.mkProvenanceOf(extVarType, loc)
-    val defn = lookup(Defs.ProvenanceOf, itpe)
+    val defn = lookupSym(Defs.ProvenanceOf, itpe)
     MonoAst.Expr.ApplyDef(defn, argExps, SolutionSpecialization.rewriteEnumStructType(itpe), SolutionSpecialization.rewriteEnumStructType(tpe), eff, loc)
   }
 
@@ -1789,11 +1781,11 @@ object SolutionLowering {
 
     // Define the name and type of the appropriate factsX function in Solver.flix
     val defTpe = Type.mkPureUncurriedArrow(List(Types.PredSym, Types.Datalog), tpe, loc)
-    val sym = lookup(Defs.Facts(predArity), defTpe)
+    val sym = lookupSym(Defs.Facts(predArity), defTpe)
 
     // Merge and solve exps
     val mergedExp = mergeExps(loweredQueryExp :: loweredExps, loc)
-    val solveDefn = lookup(Defs.Solve, Types.SolveType)
+    val solveDefn = lookupSym(Defs.Solve, Types.SolveType)
     val solvedExp = MonoAst.Expr.ApplyDef(solveDefn, mergedExp :: Nil, Types.SolveType, Types.Datalog, eff, loc)
 
     // Put everything together
@@ -1816,8 +1808,8 @@ object SolutionLowering {
   // NB (fused walk): `eff` must arrive already substituted from the caller.
   private def lowerSolveWithProject(exps0: List[TypedAst.Expr], optPreds: Option[List[Name.Pred]], mode: SolveMode, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val defn = mode match {
-      case SolveMode.Default => lookup(Defs.Solve, Types.Datalog)
-      case SolveMode.WithProvenance => lookup(Defs.SolveWithProvenance, Types.Datalog)
+      case SolveMode.Default => lookupSym(Defs.Solve, Types.Datalog)
+      case SolveMode.WithProvenance => lookupSym(Defs.SolveWithProvenance, Types.Datalog)
     }
     val exps = exps0.map(visitExp(_, env0, subst))
     val mergedExp = mergeExps(exps, loc)
@@ -1855,7 +1847,7 @@ object SolutionLowering {
         val defTpe = Type.mkPureUncurriedArrow(List(Types.PredSym, lowerType(expTpe)), Types.Datalog, loc)
 
         // Compute the symbol of the function.
-        val sym = lookup(Defs.ProjectInto(targsLength), defTpe)
+        val sym = lookupSym(Defs.ProjectInto(targsLength), defTpe)
 
         // Put everything together.
         val argExps = mkPredSym(pred) :: visitExp(exp, env0, subst) :: Nil
@@ -2005,7 +1997,7 @@ object SolutionLowering {
     exps.reduceRight {
       (exp, acc) =>
         val resultType = Types.Datalog
-        val defn = lookup(Defs.Merge, resultType)
+        val defn = lookupSym(Defs.Merge, resultType)
         val argExps = exp :: acc :: Nil
         val itpe = Types.MergeType
         MonoAst.Expr.ApplyDef(defn, argExps, itpe, resultType, exp.eff, loc)
@@ -2017,7 +2009,7 @@ object SolutionLowering {
     */
   private def projectSym(predSymExp: MonoAst.Expr, datalogExp: MonoAst.Expr, loc: SourceLocation)(implicit ctx: Context): MonoAst.Expr = {
     val resultType = Types.Datalog
-    val defn = lookup(Defs.Filter, resultType)
+    val defn = lookupSym(Defs.Filter, resultType)
     val argExps = predSymExp :: datalogExp :: Nil
     val itpe = Types.FilterType
     MonoAst.Expr.ApplyDef(defn, argExps, itpe, resultType, datalogExp.eff, loc)
@@ -2045,7 +2037,7 @@ object SolutionLowering {
     val liftType = Type.mkPureArrow(argType, returnType, exp0.loc)
 
     // Compute the liftXb symbol.
-    val sym = lookup(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${argTypes.length}"), liftType)
+    val sym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${argTypes.length}"), liftType)
 
     // Construct a call to the liftX function.
     MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialization.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
@@ -2071,7 +2063,7 @@ object SolutionLowering {
     val liftType = Type.mkPureArrow(argType, returnType, exp0.loc)
 
     // Compute the liftXb symbol.
-    val sym = lookup(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${argTypes.length}b"), liftType)
+    val sym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${argTypes.length}b"), liftType)
 
     // Construct a call to the liftXb function.
     MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialization.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
@@ -2103,7 +2095,7 @@ object SolutionLowering {
 
     // Compute the liftXY symbol.
     // For example, lift3X2 is a function from three arguments to a Vector of pairs.
-    val sym = lookup(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${numberOfInVars}X$numberOfOutVars"), liftType)
+    val sym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${numberOfInVars}X$numberOfOutVars"), liftType)
 
     // Construct a call to the liftXY function.
     MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialization.rewriteEnumStructType(liftType), returnType, Type.Pure, loc)
@@ -2174,10 +2166,10 @@ object SolutionLowering {
           val boxedDenotationType = Types.Denotation
 
           val latticeType: Type = Type.mkPureArrow(Type.Unit, unboxedDenotationType, loc)
-          val latticeSym: Symbol.DefnSym = lookup(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Ast.Shared.lattice"), latticeType)
+          val latticeSym: Symbol.DefnSym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Ast.Shared.lattice"), latticeType)
 
           val boxType: Type = Type.mkPureArrow(unboxedDenotationType, boxedDenotationType, loc)
-          val boxSym: Symbol.DefnSym = lookup(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Ast.Shared.box"), boxType)
+          val boxSym: Symbol.DefnSym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Ast.Shared.box"), boxType)
 
           val innerApply = MonoAst.Expr.ApplyDef(latticeSym, List(MonoAst.Expr.Cst(Constant.Unit, Type.Unit, loc)), SolutionSpecialization.rewriteEnumStructType(latticeType), SolutionSpecialization.rewriteEnumStructType(unboxedDenotationType), Type.Pure, loc)
           MonoAst.Expr.ApplyDef(boxSym, List(innerApply), SolutionSpecialization.rewriteEnumStructType(boxType), SolutionSpecialization.rewriteEnumStructType(boxedDenotationType), Type.Pure, loc)
@@ -2370,7 +2362,7 @@ object SolutionLowering {
   private def box(exp: MonoAst.Expr, rawTpe: Type)(implicit ctx: Context): MonoAst.Expr = {
     val loc = exp.loc
     val tpe = Type.mkPureArrow(rawTpe, Types.Boxed, loc)
-    MonoAst.Expr.ApplyDef(lookup(Defs.Box, tpe), List(exp), SolutionSpecialization.rewriteEnumStructType(tpe), Types.Boxed, Type.Pure, loc)
+    MonoAst.Expr.ApplyDef(lookupSym(Defs.Box, tpe), List(exp), SolutionSpecialization.rewriteEnumStructType(tpe), Types.Boxed, Type.Pure, loc)
   }
 
   /**
@@ -2765,10 +2757,10 @@ object SolutionLowering {
     val outerItpe = Type.mkPureUncurriedArrow(List(Types.Boxed), tpe, loc)
     val innerItpe = Type.mkPureUncurriedArrow(List(Type.Int32, Types.VectorOfBoxed), Types.Boxed, loc)
     MonoAst.Expr.ApplyDef(
-      sym = lookup(Defs.Unbox, outerItpe),
+      sym = lookupSym(Defs.Unbox, outerItpe),
       exps = List(
         MonoAst.Expr.ApplyDef(
-          sym = lookup(Symbol.mkDefnSym(s"Vector.get"), innerItpe),
+          sym = lookupSym(Symbol.mkDefnSym(s"Vector.get"), innerItpe),
           exps = List(
             MonoAst.Expr.Cst(Constant.Int32(i), Type.Int32, loc),
             MonoAst.Expr.Var(termsVar, Types.VectorOfBoxed, loc)

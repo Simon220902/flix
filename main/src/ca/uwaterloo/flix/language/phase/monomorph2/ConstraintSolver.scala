@@ -19,12 +19,10 @@ package ca.uwaterloo.flix.language.phase.monomorph2
 import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.{Kind, RigidityEnv, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.ast.shared.{RegionScope, SymUse}
-import ca.uwaterloo.flix.language.dbg.AstPrinter
 import ca.uwaterloo.flix.language.phase.monomorph2.ConstraintCollection._
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols.Defs
 import ca.uwaterloo.flix.language.phase.typer.ConstraintSolver2
-import ca.uwaterloo.flix.util.tc.Debug
-import ca.uwaterloo.flix.util.{FileOps, InternalCompilerException, ParOps}
+import ca.uwaterloo.flix.util.InternalCompilerException
 
 import scala.collection.mutable
 
@@ -120,42 +118,7 @@ object ConstraintSolver {
       enums = solution.collect { case (MVar.Enum(sym), tuples) => sym -> tuples.toSet }.toMap,
       structs = solution.collect { case (MVar.Struct(sym), tuples) => sym -> tuples.toSet }.toMap
     )
-  }(DebugSolution)
-
-  /** Plain-text listing of `solution`: summary stats, then every symbol's solved ground tuples,
-    * grouped by category. Reuses `ConstraintCollection.mvarLabel`/its own type formatting so the
-    * symbols read the same way they do in the flow dumps. */
-  private def toText(solution: Solution): String = {
-    def section[K](title: String, mk: K => MVar, m: Map[K, Set[List[Type]]]): String = {
-      val lines = m.toList.map { case (k, tuples) =>
-        s"${mvarLabel(mk(k))} -> ${tuples.toList.map(t => s"[${t.mkString(", ")}]").sorted.mkString(", ")}"
-      }.sorted
-      s"$title (${m.size} symbols, ${m.values.map(_.size).sum} tuples):\n" + lines.mkString("\n")
-    }
-
-    val header = List(
-      s"total symbols: ${solution.defs.size + solution.enums.size + solution.structs.size}",
-      s"total tuples: ${(solution.defs.values ++ solution.enums.values ++ solution.structs.values).map(_.size).sum}"
-    ).mkString("\n")
-
-    header + "\n\n" +
-      section("Defs", MVar.Def(_), solution.defs) + "\n\n" +
-      section("Enums", MVar.Enum(_), solution.enums) + "\n\n" +
-      section("Structs", MVar.Struct(_), solution.structs) + "\n"
-  }
-
-  /**
-    * Writes `solution` to `build/asts/monomorph2/ConstraintSolver.txt` under `--Xprint-phases`.
-    * Bypasses `AstPrinter`'s shared `writeToDisk` (which hardcodes the `.flixir` extension for
-    * every other phase) for the same reason `ConstraintCollection`'s own dumps do — a plain `.txt`
-    * is more honest than `.flixir` for something that isn't one of the pipeline's ASTs.
-    */
-  private object DebugSolution extends Debug[Solution] {
-    override def emit(name: String, solution: Solution)(implicit flix: Flix): Unit = {
-      val dir = AstPrinter.astFolderPath.resolve("monomorph2")
-      FileOps.writeString(dir.resolve("ConstraintSolver.txt"), toText(solution))
-    }
-  }
+  }(MonomorphDebug.DebugSolution)
 
   // ---- Dependency index --------------------------------------------------------
 

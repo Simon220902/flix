@@ -21,11 +21,9 @@ import ca.uwaterloo.flix.language.ast.{Kind, Name, SourceLocation, Symbol, Type,
 import ca.uwaterloo.flix.language.ast.TypedAst.{Expr, FormalParam, MatchRule, Predicate}
 import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.shared.Denotation
-import ca.uwaterloo.flix.language.dbg.AstPrinter
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Enums, Types}
-import ca.uwaterloo.flix.util.tc.Debug
-import ca.uwaterloo.flix.util.{FileOps, InternalCompilerException, ParOps}
+import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
 import scala.annotation.tailrec
 
@@ -182,143 +180,7 @@ object ConstraintCollection {
     }.flatten.toSet
 
     fromDefs ++ fromEnums ++ fromInstances ++ fromRestrictableEnums ++ fromStructs ++ fromSigs
-  }(DebugFlows)
-
-
-  // START OF --Xprint-phases HELPERS
-  /**
-    * Renders `flows` as a Graphviz DOT string.
-    *
-    * Nodes are MVars (boxes=defs, ellipses=enums, diamonds=sigs).
-    * Seed edges run from a plaintext constant node to the destination MVar.
-    * Propagation edges run from the source MVar to the destination MVar.
-    */
-  def toDot(flows: Set[Flow]): String = {
-    val sb = new StringBuilder
-    sb.append("digraph constraints {\n")
-    sb.append("  rankdir=LR;\n")
-    sb.append("  node [fontname=\"Courier\", fontsize=10];\n")
-    sb.append("  edge [fontname=\"Courier\", fontsize=8];\n\n")
-
-    val allMVars: Set[MVar] = allMVarsOf(flows)
-
-    // Emit one node per MVar.
-    allMVars.foreach { mvar =>
-      val (shape, color) = mvar match {
-        case _: MVar.Def              => ("box",     "lightblue")
-        case _: MVar.Enum             => ("ellipse", "lightyellow")
-        case _: MVar.Sig              => ("diamond", "lightgreen")
-        case _: MVar.RestrictableEnum => ("ellipse", "lightsalmon")
-        case _: MVar.Struct           => ("box",     "lightcyan")
-      }
-      sb.append(s"""  ${dotId(mvar)} [label="${dotEscape(mvarLabel(mvar))}", shape=$shape, style=filled, fillcolor=$color];\n""")
-    }
-
-    sb.append("\n")
-
-    // Emit edges. Flows with only Const/App args get a plaintext "seed" node.
-    var seedCount = 0
-    flows.foreach { case Flow(FlowInput.FlowArgs(args), dst) =>
-      val srcMVars = args.flatMap(collectMVars)
-      val label = args.map(monoArgLabel).mkString(", ")
-      if (srcMVars.isEmpty) {
-        val sid = s"seed$seedCount"
-        seedCount += 1
-        sb.append(s"""  $sid [label="${dotEscape(label)}", shape=plaintext];\n""")
-        sb.append(s"""  $sid -> ${dotId(dst)};\n""")
-      } else {
-        srcMVars.distinct.foreach { src =>
-          sb.append(s"""  ${dotId(src)} -> ${dotId(dst)} [label="${dotEscape(label)}"];\n""")
-        }
-      }
-    }
-
-    sb.append("}\n")
-    sb.toString
-  }
-
-  /** Every `MVar` appearing anywhere in `flows`, as either a destination or a source argument. */
-  private def allMVarsOf(flows: Set[Flow]): Set[MVar] =
-    flows.flatMap { case Flow(FlowInput.FlowArgs(args), dst) => Set(dst) ++ args.flatMap(collectMVars) }
-
-  /** Summary stats for `flows`: total flow/MVar counts, plus a per-`MVar`-kind breakdown. */
-  private def stats(flows: Set[Flow]): List[String] = {
-    val allMVars = allMVarsOf(flows)
-    val byKind = allMVars.groupBy {
-      case _: MVar.Def              => "Def"
-      case _: MVar.Enum             => "Enum"
-      case _: MVar.Sig              => "Sig"
-      case _: MVar.RestrictableEnum => "RestrictableEnum"
-      case _: MVar.Struct           => "Struct"
-    }.view.mapValues(_.size).toList.sortBy(_._1)
-    s"flows: ${flows.size}" :: s"distinct MVars: ${allMVars.size}" :: byKind.map { case (k, n) => s"  $k: $n" }
-  }
-
-  /** Plain-text listing of `flows`, one line per flow: `<args> -> <destination>`. */
-  private def toText(flows: Set[Flow]): String =
-    flows.toList.map { case Flow(FlowInput.FlowArgs(args), dst) =>
-      s"${args.map(monoArgLabel).mkString(", ")} -> ${mvarLabel(dst)}"
-    }.sorted.mkString("\n")
-
-  /**
-    * Writes `flows` to `build/asts/monomorph2/ConstraintCollection.{dot,txt}` under
-    * `--Xprint-phases` — a Graphviz-openable dot graph and a plain-text listing, both prefixed
-    * with the same summary stats. Bypasses `AstPrinter`'s shared `writeToDisk` (which hardcodes
-    * the `.flixir` extension for every other phase) since a real `.dot`/`.txt` file needs its own
-    * extension to be directly usable (Graphviz, a text editor) rather than IR-dump tooling.
-    */
-  object DebugFlows extends Debug[Set[Flow]] {
-    override def emit(name: String, flows: Set[Flow])(implicit flix: Flix): Unit = {
-      val dir = AstPrinter.astFolderPath.resolve("monomorph2")
-      val statLines = stats(flows)
-      FileOps.writeString(dir.resolve("ConstraintCollection.dot"), statLines.map("// " + _).mkString("\n") + "\n\n" + toDot(flows))
-      FileOps.writeString(dir.resolve("ConstraintCollection.txt"), statLines.mkString("\n") + "\n\n" + toText(flows))
-    }
-  }
-
-  // ---- DOT helpers -------------------------------------------------------
-
-  private def collectMVars(arg: MonoArg): List[MVar] = arg match {
-    case MonoArg.Param(v, _)          => List(v)
-    case MonoArg.Const(_)             => Nil
-    case MonoArg.App(tc, args)        => collectMVars(tc) ++ args.flatMap(collectMVars)
-    case MonoArg.Assoc(_, arg1, _, _) => collectMVars(arg1)
-  }
-
-  private def dotId(mvar: MVar): String = {
-    val raw = mvar match {
-      case MVar.Def(sym)              => s"def_${sanitize(sym.toString)}"
-      case MVar.Enum(sym)             => s"enum_${sanitize(sym.toString)}"
-      case MVar.Sig(sym)              => s"sig_${sanitize(sym.toString)}"
-      case MVar.RestrictableEnum(sym) => s"renum_${sanitize(sym.toString)}"
-      case MVar.Struct(sym)           => s"struct_${sanitize(sym.toString)}"
-    }
-    s""""$raw""""
-  }
-
-  private[monomorph2] def mvarLabel(mvar: MVar): String = mvar match {
-    case MVar.Def(sym)              => s"Def(${sym.name})"
-    case MVar.Enum(sym)             => s"Enum(${sym.name})"
-    case MVar.Sig(sym)              => s"Sig(${sym.name})"
-    case MVar.RestrictableEnum(sym) => s"REnum(${sym.name})"
-    case MVar.Struct(sym)           => s"Struct(${sym.text})"
-  }
-
-  private def monoArgLabel(arg: MonoArg): String = arg match {
-    case MonoArg.Param(v, i)         => s"p(${mvarLabel(v)},$i)"
-    case MonoArg.Const(tpe)          => tpe.toString
-    case MonoArg.App(tc, args)       => s"App(${monoArgLabel(tc)},${args.map(monoArgLabel).mkString(",")})"
-    case MonoArg.Assoc(sym, a, _, _) => s"Assoc(${sym.name},${monoArgLabel(a)})"
-  }
-
-  /** Replaces DOT-unsafe characters with underscores in node IDs. */
-  private def sanitize(s: String): String =
-    s.replaceAll("[^A-Za-z0-9_]", "_")
-
-  /** Escapes double-quotes and backslashes for DOT label strings. */
-  private def dotEscape(s: String): String =
-    s.replace("\\", "\\\\").replace("\"", "\\\"")
-  // END OF --Xprint-phases HELPERS
+  }(MonomorphDebug.DebugFlows)
 
   // ---- Constraint generation ---------------------------------------------
   //
