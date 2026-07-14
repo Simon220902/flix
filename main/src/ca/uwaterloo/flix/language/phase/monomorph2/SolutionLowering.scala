@@ -30,43 +30,47 @@ import ca.uwaterloo.flix.util.{InternalCompilerException, JvmUtils, Result}
 import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
 
 /**
-  * This phase translates AST expressions related to the Datalog subset of the
-  * language into `Fixpoint.Ast.Datalog` values (which are ordinary Flix values).
-  * This allows the Datalog engine to be implemented as an ordinary Flix program.
+  * Fuses specialization and lowering into a single AST walk: for each solver-solution
+  * `(def, subst)` pair, [[visitDef]] both instantiates the def's types/symbols to their concrete
+  * (ground) form and lowers Datalog, channel, and other high-level constructs to their runtime
+  * primitives in one pass, avoiding materializing an intermediate specialized-but-not-yet-lowered
+  * `TypedAst`.
   *
-  * In addition to translating expressions, types must also be translated from
-  * Schema types to enum types.
+  * Concretely, lowering here:
+  *   - translates the Datalog subset into `Fixpoint.Ast.Datalog` values (ordinary Flix values),
+  *     so the Datalog engine can be implemented as an ordinary Flix program,
+  *   - translates Schema types to enum types and boxes values via `Boxable`,
+  *   - translates channel expressions and `Sender`/`Receiver` types to the channel enum encoding.
   *
-  * Finally, values must be boxed using the Boxable.
+  * Forked from [[ca.uwaterloo.flix.language.phase.monomorph.Lowering]] with specialization fused
+  * in; the pure helpers shared with that phase (`mkCast`, Java box/unbox, the `subst*` suite, etc.)
+  * are intentionally kept textually in sync with it.
   *
-  * It also translates channels to the lowered types.
+  * `ConstraintCollection` predicts the def-lookup keys and specialized symbols that this phase's
+  * synthesized calls (channels, `par`/`select`, Datalog) resolve against; changes to what is
+  * synthesized here must stay in sync with what is collected there.
   */
 object SolutionLowering {
 
-  /**
-    * Lowers the given type `tpe0`.
-    *
-    * Replaces schema types with the Datalog enum type and channel-related types with the channel enum type.
-    */
+  /** Lowers `tpe0`, replacing Schema types with the Datalog enum type and channel types with the channel enum type. */
   private def lowerType(tpe0: Type): Type = tpe0.typeConstructor match {
     case Some(TypeConstructor.Schema) =>
-      // LOWERING: Schema type → erased Datalog enum type.
-      // We replace any Schema type, no matter the number of polymorphic type applications, with the erased Datalog type.
+      // Erase every Schema type, regardless of its polymorphic type applications, to the Datalog type.
       Types.Datalog
     case _ => lowerTypeNonSchema(tpe0)
   }
 
   private def lowerTypeNonSchema(tpe0: Type): Type = tpe0 match {
-    case Type.Cst(_, _) => tpe0 // Performance: Reuse tpe0.
+    case Type.Cst(_, _) => tpe0 // Reuse tpe0.
 
     case Type.Var(_, _) => tpe0
 
-    // LOWERING: Sender[t] → Concurrent.Channel.Mpmc[t, IO]
+    // Sender[t] -> Concurrent.Channel.Mpmc[t, IO]
     case Type.Apply(Type.Cst(TypeConstructor.Sender, loc), tpe, _) =>
       val t = lowerType(tpe)
       mkChannelTpe(t, loc)
 
-    // LOWERING: Receiver[t] → Concurrent.Channel.Mpmc[t, IO]
+    // Receiver[t] -> Concurrent.Channel.Mpmc[t, IO]
     case Type.Apply(Type.Cst(TypeConstructor.Receiver, loc), tpe, _) =>
       val t = lowerType(tpe)
       mkChannelTpe(t, loc)
@@ -74,7 +78,6 @@ object SolutionLowering {
     case Type.Apply(tpe1, tpe2, loc) =>
       val t1 = lowerType(tpe1)
       val t2 = lowerType(tpe2)
-      // Performance: Reuse tpe0, if possible.
       if ((t1 eq tpe1) && (t2 eq tpe2)) {
         tpe0
       } else {
@@ -94,40 +97,22 @@ object SolutionLowering {
 
   }
 
-  /**
-    * Composes substitution, lowering, and the enum/struct-type rewrite (`SolutionSpecialization.rewriteEnumStructType`)
-    * into the single call every type in the fused walk goes through.
-    */
+  /** Composes `subst`, lowering, and [[SolutionSpecialization.rewriteEnumStructType]] — the single call every type in the fused walk goes through. */
   private def visitType(t: Type, subst: StrictSubstitution)(implicit ctx: Context, root: TypedAst.Root, flix: Flix): Type =
     SolutionSpecialization.rewriteEnumStructType(lowerType(subst(t)))
 
-  /**
-    * Same as `visitType`, for the handful of call sites where the caller already applied `subst`
-    * (the value arrives pre-substituted, e.g. `visitExp`'s `FixpointQueryWithProvenance` case
-    * passes `subst(tpe0)` into `lowerQueryWithProvenance`) — only lowering + the rewrite remain.
-    */
+  /** Same as [[visitType]], for call sites where `t` has already been substituted (only lowering + the rewrite remain). */
   private def visitTypeSubstituted(t: Type)(implicit ctx: Context): Type =
     SolutionSpecialization.rewriteEnumStructType(lowerType(t))
 
-  /**
-    * Specializes and lowers the given def `defn0` under `subst` in one fused walk, producing the
-    * final `MonoAst.Def` for the specialized symbol `freshSym`. Fusing specialization and lowering
-    * into a single walk avoids materializing an intermediate TypedAst that would otherwise be
-    * discarded immediately.
-    */
+  /** Specializes and lowers `defn0` under `subst` into the `MonoAst.Def` for the specialized symbol `freshSym`. */
   protected[monomorph2] def visitDef(freshSym: Symbol.DefnSym, defn0: TypedAst.Def, subst: StrictSubstitution)(implicit ctx: Context, root: TypedAst.Root, flix: Flix): MonoAst.Def = {
     implicit val lctx: LocalContext = LocalContext.empty
-    /*
-     LOWERING: entry-point default-handler wrapping.
-     If the definition is an entry point it is wrapped with the required default handlers before the rest of lowering.
-       For example:
-          {{{ def myEntryPoint(): Unit \ Assert = e }}}
-       Will be transformed into:
-          {{{ def myEntryPoint(): Unit \ IO = Assert.runWithIO(_ -> e) }}}
-     Entry points are non-parametric, so `subst` is empty here — but applying it to the spec's
-     types first still matters: it canonicalizes them, and wrapInHandler builds defTable lookup
-     keys from these fields (defTable keys are canonical — see wrapInHandler's own comment).
-     */
+    // If `defn0` is an entry point, wrap it with its required default handlers before the rest of
+    // lowering, e.g. `def f(): Unit \ Assert = e` becomes `def f(): Unit \ IO = Assert.runWithIO(_ -> e)`.
+    // Entry points are non-parametric, so `subst` is empty here — but applying it to the spec's
+    // types first still matters: it canonicalizes them, and wrapInHandler builds defTable lookup
+    // keys from these fields (defTable keys are canonical — see wrapInHandler's own comment).
     val defn = if (TypedAstOps.isEntryPoint(defn0)) {
       val spec0 = defn0.spec
       val spec = spec0.copy(
@@ -241,9 +226,6 @@ object SolutionLowering {
     *   - def/sig/case/struct symbols are resolved against the solver solution (strict: a miss is
     *     a "Solver gap" crash),
     *   - types are lowered and channel/fixpoint expressions are lowered to the primitives.
-    *
-    * Cases marked `// LOWERING:` perform a genuine lowering transformation (output structurally
-    * different from the input); everything else is specialization plus structural mapping.
     */
   private def visitExp(exp0: TypedAst.Expr, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = exp0 match {
     case TypedAst.Expr.Cst(cst, tpe, loc) => MonoAst.Expr.Cst(cst, visitType(tpe, subst), loc)
@@ -377,15 +359,15 @@ object SolutionLowering {
       MonoAst.Expr.IfThenElse(e1, e2, e3, t, subst(eff), loc)
 
     case TypedAst.Expr.Stm(exps, exp, tpe, eff, loc) =>
-      // LOWERING: strip auto-unboxing: `m.put("k", 42);` discards the result, so we must not
-      // unbox the null that `HashMap.put` returns on first insert (would NPE).
+      // Strip auto-unboxing: `m.put("k", 42);` discards the result, so we must not unbox the
+      // null that `HashMap.put` returns on first insert (would NPE).
       val es = exps.map(e => stripAutoUnbox(visitExp(e, env0, subst)))
       val e = visitExp(exp, env0, subst)
       val t = visitType(tpe, subst)
       MonoAst.Expr.Stm(es, e, t, subst(eff), loc)
 
     case TypedAst.Expr.Discard(exp, eff, loc) =>
-      // LOWERING: strip auto-unboxing: same reason as Stm — discarded results must not be unboxed.
+      // Strip auto-unboxing: same reason as Stm above — discarded results must not be unboxed.
       val e = stripAutoUnbox(visitExp(exp, env0, subst))
       MonoAst.Expr.Discard(e, subst(eff), loc)
 
@@ -396,7 +378,6 @@ object SolutionLowering {
       MonoAst.Expr.Match(e, rs, t, subst(eff), loc)
 
     case TypedAst.Expr.RestrictableChoose(_, exp, rules, tpe, eff, loc) =>
-      // LOWERING: restrictable choose → ordinary match
       val e = visitExp(exp, env0, subst)
       val rs = rules.map(visitRestrictableChooseRule(_, env0, subst))
       val t = visitType(tpe, subst)
@@ -417,7 +398,7 @@ object SolutionLowering {
       MonoAst.Expr.ApplyAtomic(AtomicOp.Tag(newSym), es, visitTypeSubstituted(t), subst(eff), loc)
 
     case TypedAst.Expr.RestrictableTag(symUse, exps, tpe, eff, loc) =>
-      // LOWERING: restrictable tag → ordinary tag (restrictable enums are not specialized).
+      // Restrictable enums are not specialized, so this becomes an ordinary tag.
       val caseSym = lowerRestrictableCaseSym(symUse.sym)
       val es = exps.map(visitExp(_, env0, subst))
       val t = visitType(tpe, subst)
@@ -532,32 +513,27 @@ object SolutionLowering {
       visitExp(exp, env0, subst)
 
     case TypedAst.Expr.InstanceOf(exp, clazz, loc) =>
-      // LOWERING: instanceof on a primitive type → evaluate and return false
+      // Primitives never satisfy an instanceof check: evaluate for side effects and return false.
       val e = visitExp(exp, env0, subst)
       if (isPrimType(e.tpe)) {
-        // If it's a primitive type, evaluate the expression but return false
         MonoAst.Expr.Stm(List(e), MonoAst.Expr.Cst(Constant.Bool(false), Type.Bool, loc), Type.Bool, e.eff, loc)
       } else {
-        // If it's a reference type, then do the instanceof check
         MonoAst.Expr.ApplyAtomic(AtomicOp.InstanceOf(clazz), List(e), Type.Bool, e.eff, loc)
       }
 
     case TypedAst.Expr.CheckedCast(_, exp, tpe, eff, loc) =>
-      // LOWERING: cast erasure (mkCast decides cast vs. bytecode-verifier crash)
-      // Note: We do *NOT* erase checked (i.e. safe) casts.
-      // In Java, `String` is a subtype of `Object`, but the Flix IR makes this upcast _explicit_.
+      // We do *NOT* erase checked (i.e. safe) casts: in Java, `String` is a subtype of `Object`,
+      // but the Flix IR makes this upcast explicit, and mkCast decides cast vs. bytecode-verifier crash.
       val e = visitExp(exp, env0, subst)
       val t = visitType(tpe, subst)
       mkCast(e, t, subst(eff), loc)
 
     case TypedAst.Expr.UncheckedCast(exp, _, _, tpe, eff, loc) =>
-      // LOWERING: cast erasure (mkCast decides cast vs. bytecode-verifier crash)
       val e = visitExp(exp, env0, subst)
       val t = visitType(tpe, subst)
       mkCast(e, t, subst(eff), loc)
 
     case TypedAst.Expr.Unsafe(exp, _, _, tpe, eff, loc) =>
-      // LOWERING: cast erasure (mkCast decides cast vs. bytecode-verifier crash)
       val e = visitExp(exp, env0, subst)
       val t = visitType(tpe, subst)
       mkCast(e, t, subst(eff), loc)
@@ -575,9 +551,7 @@ object SolutionLowering {
       MonoAst.Expr.TryCatch(e, rs, t, subst(eff), loc)
 
     case TypedAst.Expr.Handler(symUse, rules, bodyTpe, bodyEff0, handledEff, tpe, loc) =>
-      // LOWERING: handler sym { rules }
-      // is lowered to
-      // handlerBody -> try handlerBody() with sym { rules }
+      // `handler sym { rules }` lowers to `handlerBody -> try handlerBody() with sym { rules }`.
       val bodySym = Symbol.freshVarSym("handlerBody", BoundBy.FormalParam, loc.asSynthetic)(RegionScope.Top, flix)
       val rs = rules.map(visitHandlerRule(_, env0, subst))
       val bt = visitType(bodyTpe, subst)
@@ -591,9 +565,7 @@ object SolutionLowering {
       MonoAst.Expr.Lambda(param, RunWith, t, loc)
 
     case TypedAst.Expr.RunWith(exp1, exp2, tpe, eff, loc) =>
-      // LOWERING: run exp1 with exp2
-      // is lowered to
-      // exp2(_runWith -> exp1)
+      // `run exp1 with exp2` lowers to `exp2(_runWith -> exp1)`.
       val e1 = visitExp(exp1, env0, subst)
       val unitParam = MonoAst.FormalParam(Symbol.freshVarSym("_runWith", BoundBy.FormalParam, loc.asSynthetic)(RegionScope.Top, flix), Type.Unit, Occur.Unknown, loc.asSynthetic)
       val thunkType = Type.mkArrowWithEffect(Type.Unit, e1.eff, e1.tpe, loc.asSynthetic)
@@ -604,7 +576,7 @@ object SolutionLowering {
     case TypedAst.Expr.InvokeConstructor(constructor, exps, tpe, eff, loc) =>
       val es = exps.map(visitExp(_, env0, subst))
       val t = visitType(tpe, subst)
-      // LOWERING: box primitive args where Java expects Object (e.g., `new SimpleEntry(42, true)`).
+      // Box primitive args where Java expects Object (e.g., `new SimpleEntry(42, true)`).
       val javaParamTypes = constructor.getParameterTypes
       val boxedArgs = es.zip(javaParamTypes).map { case (arg, paramType) => boxIfNecessary(arg, paramType) }
       MonoAst.Expr.ApplyAtomic(AtomicOp.InvokeConstructor(constructor), boxedArgs, t, subst(eff), loc)
@@ -618,8 +590,8 @@ object SolutionLowering {
       val e = visitExp(exp, env0, subst)
       val es = exps.map(visitExp(_, env0, subst))
       val t = visitType(tpe, subst)
-      // LOWERING: box primitive args and unbox Object returns for Java generic methods.
-      // E.g., `m.put("k", 42)` boxes 42 via Integer.valueOf; `m.get("k")` unboxes via intValue.
+      // Box primitive args and unbox Object returns for Java generic methods: e.g. `m.put("k", 42)`
+      // boxes 42 via Integer.valueOf; `m.get("k")` unboxes via intValue.
       val javaParamTypes = method.getParameterTypes
       val boxedArgs = es.zip(javaParamTypes).map { case (arg, paramType) => boxIfNecessary(arg, paramType) }
       val javaReturnType = method.getReturnType
@@ -629,7 +601,7 @@ object SolutionLowering {
       unboxIfNecessary(invoke, t, javaReturnType)
 
     case TypedAst.Expr.InvokeSuperMethod(method, exps, tpe, eff, loc) =>
-      // LOWERING: super call routed through the NewObject this-ref (LocalContext)
+      // The super call is routed through the enclosing NewObject's this-ref (LocalContext).
       val es = exps.map(visitExp(_, env0, subst))
       val t = visitType(tpe, subst)
       (lctx.sym, lctx.thisRef) match {
@@ -642,7 +614,7 @@ object SolutionLowering {
     case TypedAst.Expr.InvokeStaticMethod(method, exps, tpe, eff, loc) =>
       val es = exps.map(visitExp(_, env0, subst))
       val t = visitType(tpe, subst)
-      // LOWERING: box primitive args and unbox Object returns (same as InvokeMethod).
+      // Box primitive args and unbox Object returns (same as InvokeMethod).
       val javaParamTypes = method.getParameterTypes
       val boxedArgs = es.zip(javaParamTypes).map { case (arg, paramType) => boxIfNecessary(arg, paramType) }
       val javaReturnType = method.getReturnType
@@ -672,7 +644,6 @@ object SolutionLowering {
       MonoAst.Expr.ApplyAtomic(AtomicOp.PutStaticField(field), List(e), t, subst(eff), loc)
 
     case TypedAst.Expr.NewObject(sym, clazz, tpe, eff, constructors, methods, loc) =>
-      // LOWERING: this-ref LocalContext for anonymous-class methods.
       // NB: the thisRef must use the FRESHENED fparam sym (the method body's vars are renamed),
       // so the fparams are specialized here, before the body is visited under the new lctx.
       // Mint a fresh anonymous class symbol for each specialization. Otherwise distinct
@@ -707,12 +678,12 @@ object SolutionLowering {
       MonoAst.Expr.NewObject(freshSym, clazz, t, subst(eff), cs, ms, loc)
 
     case TypedAst.Expr.NewChannel(exp, tpe, eff, loc) =>
-      // LOWERING: channel primitive → Concurrent.Channel call
+      // Synthesizes a call to Concurrent.Channel's channel constructor.
       val e = visitExp(exp, env0, subst)
       lowerNewChannel(e, subst(tpe), subst(eff), loc)
 
     case TypedAst.Expr.GetChannel(innerExp, tpe, eff, loc) =>
-      // LOWERING: channel primitive → Concurrent.Channel call
+      // Synthesizes a call to Concurrent.Channel.get.
       // NB: the channel's own RAW substituted type (innerExp.tpe) is threaded in separately from
       // the visited `e` — `e.tpe` is already enum/struct-rewritten (Step 2), which would corrupt
       // mkGetChannel's own def-lookup key if a specialized generic enum flowed through the channel.
@@ -720,14 +691,14 @@ object SolutionLowering {
       mkGetChannel(e, subst(innerExp.tpe), subst(tpe), subst(eff), loc)
 
     case TypedAst.Expr.PutChannel(innerExp1, innerExp2, _, eff, loc) =>
-      // LOWERING: channel primitive → Concurrent.Channel call
+      // Synthesizes a call to Concurrent.Channel.put.
       // NB: same raw-type-threading reasoning as GetChannel above.
       val exp1 = visitExp(innerExp1, env0, subst)
       val exp2 = visitExp(innerExp2, env0, subst)
       SolutionLowering.mkPutChannel(exp1, exp2, subst(innerExp1.tpe), subst(innerExp2.tpe), subst(eff), loc)
 
     case TypedAst.Expr.SelectChannel(rules0, default0, tpe, eff, loc) =>
-      // LOWERING: select → Concurrent.Channel admin/select calls (mkSelectChannel)
+      // Synthesizes Concurrent.Channel admin/select calls (mkSelectChannel).
       // NB: each rule's RAW substituted channel type is threaded alongside — same reasoning as
       // GetChannel/PutChannel/ParYield above (the visited `chan` expr's own `.tpe` is already
       // enum/struct-rewritten, which would corrupt the synthesized admin/get calls' lookup keys).
@@ -750,7 +721,7 @@ object SolutionLowering {
       MonoAst.Expr.ApplyAtomic(AtomicOp.Spawn, List(e1, e2), t, subst(eff), loc)
 
     case TypedAst.Expr.ParYield(frags, exp, tpe, eff, loc) =>
-      // LOWERING: par-yield → channels (mkParYield)
+      // Synthesizes the channel plumbing for par-yield (mkParYield).
       // NB: each fragment's RAW substituted type is threaded alongside the visited expr — the
       // synthesized channel plumbing needs it for its own def-lookup keys (same reasoning as
       // GetChannel/PutChannel above), since the visited expr's own `.tpe` is already rewritten.
@@ -776,11 +747,11 @@ object SolutionLowering {
       MonoAst.Expr.ApplyAtomic(AtomicOp.Force, List(e), t, subst(eff), loc)
 
     case TypedAst.Expr.FixpointConstraintSet(cs, _, loc) =>
-      // LOWERING: Datalog constraint set → Fixpoint.Ast.Datalog value
+      // Synthesizes a Fixpoint.Ast.Datalog value from the constraint set.
       lowerConstraintSet(cs, loc, env0, subst)
 
     case TypedAst.Expr.FixpointLambda(pparams, exp, _, eff, loc) =>
-      // LOWERING: predicate rename via the Fixpoint solver's rename function
+      // Synthesizes a predicate rename via the Fixpoint solver's rename function.
       val resultType = Types.Datalog
       val defn = lookupSym(Defs.Rename, resultType)
       val predExps = mkList(pparams.map(pparam => mkPredSym(pparam.pred)), Types.PredSym, loc)
@@ -788,26 +759,26 @@ object SolutionLowering {
       MonoAst.Expr.ApplyDef(defn, argExps, Types.RenameType, resultType, subst(eff), loc)
 
     case TypedAst.Expr.FixpointMerge(exp1, exp2, _, eff, loc) =>
-      // LOWERING: Datalog merge → Fixpoint solver merge call
+      // Synthesizes a call to the Fixpoint solver's merge function.
       val resultType = Types.Datalog
       val defn = lookupSym(Defs.Merge, resultType)
       val argExps = visitExp(exp1, env0, subst) :: visitExp(exp2, env0, subst) :: Nil
       MonoAst.Expr.ApplyDef(defn, argExps, Types.MergeType, resultType, subst(eff), loc)
 
     case TypedAst.Expr.FixpointQueryWithProvenance(exps, select, withh, tpe0, eff, loc) =>
-      // LOWERING: Datalog query → Fixpoint solver provenanceOf call
+      // Synthesizes a call to the Fixpoint solver's provenanceOf function.
       lowerQueryWithProvenance(exps, select, withh, subst(tpe0), subst(eff), loc, env0, subst)
 
     case TypedAst.Expr.FixpointQueryWithSelect(exps, queryExp, selects, _, _, pred, tpe, eff, loc) =>
-      // LOWERING: Datalog query → Fixpoint solver solve+facts calls
+      // Synthesizes Fixpoint solver solve+facts calls.
       lowerQueryWithSelect(exps, queryExp, selects, pred, subst(tpe), subst(eff), loc, env0, subst)
 
     case TypedAst.Expr.FixpointSolveWithProject(exps, optPreds, mode, _, eff, loc) =>
-      // LOWERING: Datalog solve → Fixpoint solver solve+project calls
+      // Synthesizes Fixpoint solver solve+project calls.
       lowerSolveWithProject(exps, optPreds, mode, subst(eff), loc, env0, subst)
 
     case TypedAst.Expr.FixpointInjectInto(exps, predsAndArities, _, _, loc) =>
-      // LOWERING: Datalog inject → Fixpoint solver projectInto calls
+      // Synthesizes Fixpoint solver projectInto calls.
       lowerInjectInto(exps, predsAndArities, loc, env0, subst)
 
     case TypedAst.Expr.ApplySig(symUse, exps, _, _, itpe, tpe, eff, _, loc) =>
@@ -985,82 +956,32 @@ object SolutionLowering {
   }
 
   /**
-    * Wraps an entry point function with calls to the default handlers of each of the effects appearing in
-    * its signature. The order in which the handlers are applied is not defined and should not be relied upon.
+    * Wraps `currentDef` with calls to the default handlers of each effect appearing in its
+    * signature. The order in which the handlers are applied is not defined.
     *
-    * For example, if we had default handlers for some effects A, B and C:
-    *
-    * Transforms a function:
-    * {{{
-    *     def f(arg1: tpe1, ...): tpe \ A + B = exp
-    * }}}
-    * Into:
-    * {{{
-    *     def f(arg1: tpe1, ...): tpe \ (((ef - A) + IO) - B) + IO =
-    *         handlerB(_ -> handlerA(_ ->exp))
-    * }}}
-    *
-    * Each of the wrappers:
-    *   - Removes the handled effect from the function's effect set and adds IO
-    *   - Creates a lambda (_ -> originalBody) and passes it to each handler
-    *   - Updates the function's type signature accordingly
-    *
-    * @param currentDef The entry point function definition to wrap
-    * @param root       The typed AST root
-    * @return The wrapped function definition with all necessary default effect handlers
+    * E.g. with default handlers for effects A and B, `def f(...): tpe \ A + B = exp` becomes
+    * `def f(...): tpe \ (((ef - A) + IO) - B) + IO = handlerB(_ -> handlerA(_ -> exp))`.
     */
-  // ---- LOWERING: entry-point default-handler wrapping --------------------------------------
   private def wrapDefWithDefaultHandlers(currentDef: TypedAst.Def)(implicit root: TypedAst.Root, flix: Flix): TypedAst.Def = {
-    // Obtain the concrete effect set of the definition that is going to be wrapped.
-    // We are expecting entry points, and all entry points should have a concrete effect set.
+    // Entry points are expected to have a concrete (ground) effect set; anything else is a bug.
     val defEffects: CofiniteSet[Symbol.EffSym] = Type.eval(currentDef.spec.eff) match {
       case Result.Ok(s) => s
-      // This means eff is either not well-formed or it has type variables.
-      // Either way, in this case we will wrap with all default handlers
-      // to make sure that the effects present in the signature that have default handlers are handled
       case Result.Err(_) => throw InternalCompilerException("Unexpected illegal effect set on entry point", currentDef.spec.eff.loc)
     }
-    // Gather only the default handlers for the effects appearing in the signature of the definition.
+    // Order of application follows the order of root.defaultHandlers and is otherwise unspecified.
     val requiredHandlers = root.defaultHandlers.filter(h => defEffects.contains(h.handledSym))
-    // Wrap the expression in each of the required default handlers.
-    // Right now, the order depends on the order of defaultHandlers.
     requiredHandlers.foldLeft(currentDef)((defn, handler) => wrapInHandler(defn, handler))
   }
 
   /**
-    * Wraps an entry point function with a default effect handler.
-    *
-    * Transforms a function:
-    * {{{
-    *     def f(arg1: tpe1, ...): tpe \ ef = exp
-    * }}}
-    *
-    * Into:
-    * {{{
-    *     def f(arg1: tpe1, ...): tpe \ (ef - handledEffect) + IO =
-    *         handler(_ -> exp)
-    * }}}
-    *
-    * The wrapper:
-    *   - Removes the handled effect from the function's effect set and adds IO
-    *   - Creates a lambda (_ -> originalBody) and passes it to each handler
-    *   - Updates the function's type signature accordingly
-    *
-    * @param defn           The entry point function definition to wrap
-    * @param defaultHandler Information about the default handler to apply
-    * @return The wrapped function definition with updated effect signature
+    * Wraps `defn` with `defaultHandler`: `def f(...): tpe \ ef = exp` becomes
+    * `def f(...): tpe \ (ef - handledEffect) + IO = handler(_ -> exp)`.
     */
   private def wrapInHandler(defn: TypedAst.Def, defaultHandler: DefaultHandler)(implicit flix: Flix): TypedAst.Def = {
-    // Create synthetic locations
     val effLoc = defn.spec.eff.loc.asSynthetic
     val baseTypeLoc = defn.spec.declaredScheme.base.loc.asSynthetic
     val expLoc = defn.exp.loc.asSynthetic
-    // The new type is the same as the wrapped def with an effect set of
-    // `(ef - handledEffect) + IO` where `ef` is the effect set of the previous definition.
     val effDif = Type.mkDifference(defn.spec.eff, defaultHandler.handledEff, effLoc)
-    // Technically we could perform this outside at the wrapInHandlers level
-    // by just checking the length of the handlers and if it is greater than 0
-    // just adding IO. However, that would only work while default handlers can only generate IO.
     // Canonicalized (not left as a raw `(ef - handledEff) + IO` formula): the solution-driven
     // specializer's defTable keys are built via StrictSubstitution, which canonicalizes ground
     // effect formulas on the way in (see MonomorphCanon). The synthesized ApplyDef's `itpe`
@@ -1073,7 +994,6 @@ object SolutionLowering {
       declaredScheme = defn.spec.declaredScheme.copy(base = tpe),
       eff = eff,
     )
-    // Create _ -> exp
     val innerLambda =
       TypedAst.Expr.Lambda(
         TypedAst.FormalParam(
@@ -1087,9 +1007,7 @@ object SolutionLowering {
         Type.mkArrowWithEffect(Type.Unit, defn.spec.eff, defn.spec.retTpe, expLoc),
         expLoc
       )
-    // Create the instantiated type of the handler
     val handlerArrowType = Type.mkArrowWithEffect(innerLambda.tpe, eff, defn.spec.retTpe, expLoc)
-    // Create HandledEff.handle(_ -> exp)
     // The handler sym is embedded unresolved: this synthesized TypedAst node is subsequently
     // visited by visitExp, whose ApplyDef case resolves it against the solver solution like any
     // other call site. Resolving it here instead would make visitExp re-look-up an already-fresh
@@ -1198,7 +1116,6 @@ object SolutionLowering {
     * Returns the `valueOf` boxing method for a Flix primitive type.
     * This is the same mechanism javac uses to implement autoboxing.
     */
-  // ---- LOWERING: Java boxing/unboxing helpers -----------------------------------------------
   private def javaBoxMethod(tpe: Type): java.lang.reflect.Method = tpe match {
     case Type.Bool => classOf[java.lang.Boolean].getMethod("valueOf", java.lang.Boolean.TYPE)
     case Type.Char => classOf[java.lang.Character].getMethod("valueOf", java.lang.Character.TYPE)
@@ -1313,16 +1230,9 @@ object SolutionLowering {
   }
 
   /**
-    * Make a new channel tuple (sender, receiver) expression
-    *
-    * New channel expressions are rewritten as follows:
-    * {{{ %%CHANNEL_NEW%%(m) }}}
-    * becomes a call to the standard library function:
-    * {{{ Concurrent/Channel.newChannel(10) }}}
-    *
-    * @param tpe The specialized type of the result
+    * Returns a new channel tuple (sender, receiver) expression: `%%CHANNEL_NEW%%(m)` becomes
+    * a call to `Concurrent/Channel.newChannel(10)`. `tpe` is the specialized type of the result.
     */
-  // ---- LOWERING: channel synthesis helpers --------------------------------------------------
   private def lowerNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit ctx: Context): MonoAst.Expr = {
     // itpe is the def-lookup key: computed and used raw (un-rewritten), matching every other
     // lookup-key position in the fused walk — only the node's own field positions get rewritten.
@@ -1331,14 +1241,7 @@ object SolutionLowering {
     MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, SolutionSpecialization.rewriteEnumStructType(itpe), visitTypeSubstituted(tpe), eff, loc)
   }
 
-  /**
-    * Make a channel get expression
-    *
-    * Channel get expressions are rewritten as follows:
-    * {{{ <- c }}}
-    * becomes a call to the standard library function:
-    * {{{ Concurrent/Channel.get(c) }}}
-    */
+  /** Returns a channel get expression: `<- c` becomes a call to `Concurrent/Channel.get(c)`. */
   private def mkGetChannel(exp: MonoAst.Expr, chanTpe: Type, tpe: Type, eff: Type, loc: SourceLocation)(implicit ctx: Context): MonoAst.Expr = {
     // itpe is the def-lookup key: built from `chanTpe`, the caller's RAW (un-rewritten) substituted
     // channel type — NOT `exp.tpe`, which is already enum/struct-rewritten by the time `exp` (the
@@ -1350,18 +1253,13 @@ object SolutionLowering {
   }
 
   /**
-    * Make a channel put expression
+    * Returns a channel put expression: `c <- 42` becomes
+    * `let chan = c; let value = 42; Concurrent/Channel.put(value, chan)`.
     *
-    * Channel put expressions are rewritten as follows:
-    * {{{ c <- 42 }}}
-    * becomes a call to the standard library function:
-    * {{{ let chan = c; let value = 42; Concurrent/Channel.put(value, chan) }}}
-    *
-    * Here `exp1` is the channel and `exp2` is the value (i.e. `exp1 <- exp2`). In source order
-    * the channel is evaluated before the value, but `Channel.put` takes the value before the
-    * channel. We let-bind both expressions in source order so that reordering them into the
-    * argument list does not change their evaluation order. See:
-    * https://github.com/flix/flix/issues/10378
+    * `exp1` is the channel and `exp2` is the value (i.e. `exp1 <- exp2`). `Channel.put` takes the
+    * value before the channel, but source order evaluates the channel first — both are let-bound
+    * in source order so reordering them into the argument list doesn't change evaluation order.
+    * See https://github.com/flix/flix/issues/10378.
     */
   private def mkPutChannel(exp1: MonoAst.Expr, exp2: MonoAst.Expr, chanTpe: Type, valTpe: Type, eff: Type, loc: SourceLocation)(implicit ctx: Context, flix: Flix): MonoAst.Expr = {
     // itpe is the def-lookup key: built from the caller's RAW (un-rewritten) substituted
@@ -1380,9 +1278,7 @@ object SolutionLowering {
   }
 
   /**
-    * Make a channel select expression
-    *
-    * Channel select expressions are rewritten as follows:
+    * Returns a channel select expression:
     * {{{
     *  select {
     *    case x <- ?ch1 => ?handlech1
@@ -1422,11 +1318,9 @@ object SolutionLowering {
   }
 
   /**
-    * Make the list of MpmcAdmin objects which will be passed to `selectFrom`.
-    *
-    * For each case like
+    * Returns the list of MpmcAdmin objects passed to `selectFrom`. Each case
     * {{{ x <- ?ch1 => ?handlech1 }}}
-    * we generate
+    * generates
     * {{{ mpmcAdmin(x) }}}
     */
   private def mkChannelAdminList(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], loc: SourceLocation)(implicit ctx: Context, root: TypedAst.Root): MonoAst.Expr = {
@@ -1441,14 +1335,11 @@ object SolutionLowering {
   }
 
   /**
-    * Construct a call to `selectFrom` given a list of MpmcAdmin objects and optional default.
-    *
-    * Transforms
+    * Returns a call to `selectFrom` given a list of MpmcAdmin objects and an optional default:
     * {{{ mpmcAdmin(ch1), mpmcAdmin(ch1), ... }}}
-    * Into
+    * becomes
     * {{{ selectFrom(mpmcAdmin(ch1) :: mpmcAdmin(ch2) :: ... :: Nil, false) }}}
-    *
-    * When `default` is `Some` the second parameter will be `true`.
+    * `false` is `true` instead when `default` is `Some`.
     */
   private def mkChannelSelect(admins: MonoAst.Expr, default: Option[MonoAst.Expr], loc: SourceLocation)(implicit ctx: Context): MonoAst.Expr = {
     val locksType = Types.mkList(Types.ConcurrentReentrantLock, loc)
@@ -1464,11 +1355,9 @@ object SolutionLowering {
   }
 
   /**
-    * Construct a sequence of MatchRules corresponding to the given SelectChannelRules
-    *
-    * Transforms the `i`'th
+    * Returns the MatchRules for `rs`. The `i`'th
     * {{{ case x <- ?ch1 => ?handlech1 }}}
-    * into
+    * becomes
     * {{{
     * case (i, locks) =>
     *   let x = unsafeGetAndUnlock(ch1, locks);
@@ -1496,11 +1385,9 @@ object SolutionLowering {
   }
 
   /**
-    * Construct additional MatchRule to handle the (optional) default case
-    * NB: Does not need to unlock because that is handled inside Concurrent/Channel.selectFrom.
-    *
-    * If `default` is `None` returns an empty list. Otherwise produces
+    * Returns the MatchRule for the optional default case, or an empty list if `default` is `None`:
     * {{{ case (-1, _) => ?default }}}
+    * No unlock is needed here — that's handled inside `Concurrent/Channel.selectFrom`.
     */
   private def mkSelectDefaultCase(default: Option[MonoAst.Expr], loc: SourceLocation)(implicit ctx: Context): List[MonoAst.MatchRule] = {
     default match {
@@ -1518,59 +1405,50 @@ object SolutionLowering {
     * Returns a desugared [[TypedAst.Expr.ParYield]] expression as a nested match-expression.
     */
   private def mkParYield(frags: List[(MonoAst.Pattern, MonoAst.Expr, Type, SourceLocation)], exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit ctx: Context, flix: Flix): MonoAst.Expr = {
-    // Only generate channels for n-1 fragments. We use the current thread for the last fragment.
+    // Only generate channels for n-1 fragments; the last fragment runs on the current thread.
     val fs = frags.init
     val last = frags.last
 
-    // Generate symbols for each channel.
     val chanSymsWithPatAndExp = fs.map { case (p, e, rawTpe, l) => (p, mkLetSym("channel", l.asSynthetic), e, rawTpe) }
 
-    // Make `GetChannel` exps for the spawnable exps.
     val waitExps = mkBoundParWaits(chanSymsWithPatAndExp, exp)
 
-    // Evaluate the last expression in the current thread (so just make let-binding)
     val desugaredYieldExp = mkLetMatch(last._1, last._2, waitExps)
 
-    // Generate channels and spawn exps.
     val chanSymsWithExp = chanSymsWithPatAndExp.map { case (_, s, e, rawTpe) => (s, e, rawTpe) }
     val blockExp = mkParChannels(desugaredYieldExp, chanSymsWithExp)
 
-    // Wrap everything in a purity cast,
     MonoAst.Expr.Cast(blockExp, lowerType(tpe), eff, loc.asSynthetic)
   }
 
   /**
-    * Returns a full `par yield` expression.
-    *
-    * @param chanSymsWithExps each fragment's channel sym, visited value expr, and the fragment's
-    *                         RAW substituted type (needed for mkPutChannel/mkNewChannel's own
-    *                         def-lookup keys — see mkGetChannel's doc comment for why `e.tpe`
-    *                         alone, already enum/struct-rewritten, isn't safe to reuse here).
+    * Returns a full `par yield` expression. `chanSymsWithExps` holds, per fragment, its channel
+    * sym, visited value expr, and RAW substituted type — the RAW type is needed for
+    * mkPutChannel/mkNewChannel's own def-lookup keys (see mkGetChannel's doc comment for why
+    * `e.tpe` alone, already enum/struct-rewritten, isn't safe to reuse here).
     */
   private def mkParChannels(exp: MonoAst.Expr, chanSymsWithExps: List[(Symbol.VarSym, MonoAst.Expr, Type)])(implicit ctx: Context, flix: Flix): MonoAst.Expr = {
-    // Make spawn expressions `spawn ch <- exp`.
+    // Builds `spawn ch <- exp` for each fragment.
     val spawns = chanSymsWithExps.foldRight(exp: MonoAst.Expr) {
       case ((sym, e, rawTpe), acc) =>
         val loc = e.loc.asSynthetic
-        val e1 = mkChannelExp(sym, rawTpe, loc) // The channel `ch`
-        val e2 = mkPutChannel(e1, e, mkChannelTpe(rawTpe, loc), rawTpe, Type.IO, loc) // The put exp: `ch <- exp0`.
+        val e1 = mkChannelExp(sym, rawTpe, loc)
+        val e2 = mkPutChannel(e1, e, mkChannelTpe(rawTpe, loc), rawTpe, Type.IO, loc)
         val e3 = MonoAst.Expr.Cst(Constant.Static, Type.mkRegionToStar(Type.IO, loc), loc)
-        val e4 = MonoAst.Expr.ApplyAtomic(AtomicOp.Spawn, List(e2, e3), Type.Unit, Type.IO, loc) // Spawn the put expression from above i.e. `spawn ch <- exp0`.
-        MonoAst.Expr.Stm(List(e4), acc, acc.tpe, Type.mkUnion(e4.eff, acc.eff, loc), loc) // Return a statement expression containing the other spawn expressions along with this one.
+        val e4 = MonoAst.Expr.ApplyAtomic(AtomicOp.Spawn, List(e2, e3), Type.Unit, Type.IO, loc)
+        MonoAst.Expr.Stm(List(e4), acc, acc.tpe, Type.mkUnion(e4.eff, acc.eff, loc), loc)
     }
 
-    // Make let bindings `let ch = chan 1;`.
+    // Wraps `spawns` in `let ch = chan 1;` bindings for each fragment's channel.
     chanSymsWithExps.foldRight(spawns: MonoAst.Expr) {
       case ((sym, e, rawTpe), acc) =>
         val loc = e.loc.asSynthetic
-        val chan = mkNewChannel(MonoAst.Expr.Cst(Constant.Int32(1), Type.Int32, loc), mkChannelTpe(rawTpe, loc), Type.IO, loc) // The channel exp `chan 1`
-        MonoAst.Expr.Let(sym, chan, acc, acc.tpe, Type.mkUnion(e.eff, acc.eff, loc), Occur.Unknown, loc) // The let-binding `let ch = chan 1`
+        val chan = mkNewChannel(MonoAst.Expr.Cst(Constant.Int32(1), Type.Int32, loc), mkChannelTpe(rawTpe, loc), Type.IO, loc)
+        MonoAst.Expr.Let(sym, chan, acc, acc.tpe, Type.mkUnion(e.eff, acc.eff, loc), Occur.Unknown, loc)
     }
   }
 
-  /**
-    * Make a new channel expression
-    */
+  /** Returns a new channel expression. */
   private def mkNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit ctx: Context): MonoAst.Expr = {
     val itpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
     val defnSym = lookupSym(Defs.ChannelNew, itpe)
@@ -1632,11 +1510,7 @@ object SolutionLowering {
     MonoAst.Expr.Var(sym, SolutionSpecialization.rewriteEnumStructType(mkChannelTpe(tpe, loc)), loc)
   }
 
-  /**
-    * Returns a list expression constructed from the given `exps` with type list of `elmType`.
-    *
-    * @param elmType is assumed to be specialized and lowered.
-    */
+  /** Returns a list expression constructed from `exps` with type list of `elmType` (assumed specialized and lowered). */
   private def mkList(exps: List[MonoAst.Expr], elmType: Type, loc: SourceLocation)(implicit ctx: Context, root: TypedAst.Root): MonoAst.Expr = {
     val nil = mkNil(elmType, loc)
     exps.foldRight(nil) {
@@ -1644,11 +1518,7 @@ object SolutionLowering {
     }
   }
 
-  /**
-    * Returns a `Nil` expression with type list of `elmType`.
-    *
-    * @param elmType is assumed to be specialized and lowered.
-    */
+  /** Returns a `Nil` expression with type list of `elmType` (assumed specialized and lowered). */
   private def mkNil(elmType: Type, loc: SourceLocation)(implicit ctx: Context, root: TypedAst.Root): MonoAst.Expr = {
     mkTag(Enums.FList, "Nil", Nil, Types.mkList(elmType, loc), loc)
   }
@@ -1667,17 +1537,15 @@ object SolutionLowering {
   }
 
   /**
-    * Returns a pure tag expression for the given `sym` and given `tag` with the given inner expression `exp`.
+    * Returns a pure tag expression for `sym`/`tag` wrapping `exps`. `tpe` is the specialized,
+    * lowered but NOT YET enum/struct-rewritten type, used both as `lookupCaseSym`'s key and
+    * (rewritten) as the returned node's own type.
     *
-    * @param tpe is assumed to be specialized and lowered, but NOT yet enum/struct-rewritten — this
-    *            is the pre-rewrite ground type, used both as `lookupCaseSym`'s key and (rewritten)
-    *            as the returned node's own type. `sym` is almost always non-generic (Datalog/PredSym/
-    *            etc. runtime AST nodes), for which the tolerant lookup is a no-op fallback. The two
-    *            exceptions that are actually generic are `Enums.FList` (`mkNil`/`mkCons`) and
-    *            `Enums.Denotation` (`mkDenotation`'s `Relational` case): since `mkTag` synthesizes
-    *            its own `AtomicOp.Tag` node directly rather than going through `visitExp`'s ordinary
-    *            Tag case, it has to perform the case-sym lookup and the enum/struct-type rewrite
-    *            itself.
+    * `sym` is almost always non-generic (Datalog/PredSym/etc. runtime AST nodes), for which the
+    * tolerant lookup is a no-op fallback; the two actually-generic exceptions are `Enums.FList`
+    * (`mkNil`/`mkCons`) and `Enums.Denotation` (`mkDenotation`'s `Relational` case). Because `mkTag`
+    * synthesizes its own `AtomicOp.Tag` node directly instead of going through `visitExp`'s Tag
+    * case, it must perform the case-sym lookup and the enum/struct-type rewrite itself.
     */
   private def mkTag(sym: Symbol.EnumSym, tag: String, exps: List[MonoAst.Expr], tpe: Type, loc: SourceLocation)(implicit ctx: Context, root: TypedAst.Root): MonoAst.Expr = {
     val caseSym0 = findCaseSym(sym, tag)
@@ -1692,21 +1560,13 @@ object SolutionLowering {
   private def findCaseSym(sym: Symbol.EnumSym, name: String)(implicit root: TypedAst.Root): Symbol.CaseSym =
     root.enums(sym).cases.values.find(_.sym.name == name).get.sym
 
-  /**
-    * Returns `(t1, t2)` where `tpe = Concurrent.Channel.Mpmc[t1, t2]`.
-    *
-    * @param tpe is assumed to be specialized, but not lowered.
-    */
+  /** Returns `(t1, t2)` where `tpe = Concurrent.Channel.Mpmc[t1, t2]`. `tpe` is assumed specialized, but not lowered. */
   private def extractChannelTpe(tpe: Type): Type = tpe match {
     case Type.Apply(Type.Apply(Types.ChannelMpmc, elmType, _), _, _) => elmType
     case _ => throw InternalCompilerException(s"Cannot interpret '$tpe' as a channel type", tpe.loc)
   }
 
-  /**
-    * Returns a TypedAst.Pattern representing a tuple of patterns.
-    *
-    * @param patterns are assumed to contain specialized and lowered types.
-    */
+  /** Returns a tuple pattern of `patterns` (assumed to contain specialized and lowered types). */
   private def mkTuplePattern(patterns: Nel[MonoAst.Pattern], loc: SourceLocation): MonoAst.Pattern = {
     MonoAst.Pattern.Tuple(patterns, Type.mkTuple(patterns.map(_.tpe), loc), loc)
   }
@@ -1732,10 +1592,7 @@ object SolutionLowering {
     * Datalog lowering
     */
 
-  /**
-    * Constructs a `Fixpoint/Ast/Datalog.Datalog` value from the given list of Datalog constraints `cs`.
-    */
-  // ---- LOWERING: Datalog/fixpoint synthesis helpers ------------------------------------------
+  /** Constructs a `Fixpoint/Ast/Datalog.Datalog` value from the Datalog constraints `cs`. */
   private def lowerConstraintSet(cs: List[TypedAst.Constraint], loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val factExps = cs.filter(c => c.body.isEmpty).map(lowerConstraint(_, env0, subst))
     val ruleExps = cs.filter(c => c.body.nonEmpty).map(lowerConstraint(_, env0, subst))
@@ -1748,9 +1605,8 @@ object SolutionLowering {
   }
 
   /**
-    *
-    * Create appropriate call to Fixpoint.Solver.provenanceOf. This requires creating a mapping, mkExtVar, from
-    * PredSym and terms to an extensible variant.
+    * Returns a call to `Fixpoint.Solver.provenanceOf`, building the `mkExtVar` mapping from
+    * `PredSym` and terms to an extensible variant that it requires.
     */
   // NB (fused walk): `tpe0`/`eff` must arrive already substituted from the caller; `env0`/`subst`
   // are only for the TypedAst sub-expressions visited here.
@@ -1772,7 +1628,7 @@ object SolutionLowering {
     MonoAst.Expr.ApplyDef(defn, argExps, SolutionSpecialization.rewriteEnumStructType(itpe), SolutionSpecialization.rewriteEnumStructType(tpe), eff, loc)
   }
 
-  // NB (fused walk): `tpe`/`eff` must arrive already substituted from the caller.
+  /** Lowers a Datalog query-with-select to Fixpoint solver solve+facts calls. `tpe`/`eff` must arrive already substituted from the caller (fused walk). */
   private def lowerQueryWithSelect(exps: List[TypedAst.Expr], queryExp: TypedAst.Expr, selects: List[TypedAst.Expr], pred: Name.Pred, tpe: Type, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val loweredExps = exps.map(visitExp(_, env0, subst))
     val loweredQueryExp = visitExp(queryExp, env0, subst)
@@ -1804,8 +1660,8 @@ object SolutionLowering {
     *     let tmp% = solve e₁ <+> e₂ <+> e₃;
     *     merge (project P₁ tmp%, project P₂ tmp%, project P₃ tmp%)
     * }}}
+    * `eff` must arrive already substituted from the caller (fused walk).
     */
-  // NB (fused walk): `eff` must arrive already substituted from the caller.
   private def lowerSolveWithProject(exps0: List[TypedAst.Expr], optPreds: Option[List[Name.Pred]], mode: SolveMode, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val defn = mode match {
       case SolveMode.Default => lookupSym(Defs.Solve, Types.Datalog)
@@ -1828,12 +1684,13 @@ object SolutionLowering {
 
   }
 
+  /** Lowers a Datalog inject-into to Fixpoint solver `projectInto` calls, one per predicate in `predsAndArities`. */
   private def lowerInjectInto(exps: List[TypedAst.Expr], predsAndArities: List[PredicateAndArity], loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val loweredExps = exps.zip(predsAndArities).map {
       case (exp, PredicateAndArity(pred, _)) =>
         // The exp's own type/eff are TypedAst-level reads: substitute before use (fused walk).
         val expTpe = subst(exp.tpe)
-        // Compute the types arguments of the functor F[(a, b, c)] or F[a].
+        // The type arguments of the functor F[(a, b, c)] or F[a].
         val (_, targsLength) = expTpe match {
           case Type.Apply(tycon, innerType, _) => innerType.typeConstructor match {
             case Some(TypeConstructor.Tuple(_)) => (tycon, innerType.typeArguments.length)
@@ -1843,13 +1700,10 @@ object SolutionLowering {
           case _ => throw InternalCompilerException(s"Unexpected non-foldable type: '$expTpe'.", loc)
         }
 
-        // The type of the function.
         val defTpe = Type.mkPureUncurriedArrow(List(Types.PredSym, lowerType(expTpe)), Types.Datalog, loc)
 
-        // Compute the symbol of the function.
         val sym = lookupSym(Defs.ProjectInto(targsLength), defTpe)
 
-        // Put everything together.
         val argExps = mkPredSym(pred) :: visitExp(exp, env0, subst) :: Nil
         MonoAst.Expr.ApplyDef(sym, argExps, SolutionSpecialization.rewriteEnumStructType(defTpe), Types.Datalog, subst(exp.eff), loc)
     }
@@ -1919,37 +1773,27 @@ object SolutionLowering {
   }
 
   /**
-    * Lowers the given head term `exp0`.
+    * Lowers the given head term `exp0`. Four cases: a quantified variable becomes a `Var`; a
+    * lexically bound variable becomes a `Lit` capturing its value; an expression with no quantified
+    * variables is reduced to a (boxed) value `Lit`; one with quantified variables becomes an
+    * application term.
     */
   private def lowerHeadTerm(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, env: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
-    //
-    // We need to consider four cases:
-    //
-    // Case 1.1: The expression is quantified variable. We translate it to a Var.
-    // Case 1.2: The expression is a lexically bound variable. We translate it to a Lit that captures its value.
-    // Case 2: The expression does not contain a quantified variable. We evaluate it to a (boxed) value.
-    // Case 3: The expression contains quantified variables. We translate it to an application term.
-    //
     exp0 match {
       case TypedAst.Expr.Var(sym, _, _) =>
-        // Case 1: Variable term.
         if (isQuantifiedVar(sym, cparams0)) {
-          // Case 1.1: Quantified variable.
           mkHeadTermVar(env(sym))
         } else {
-          // Case 1.2: Lexically bound variable.
           mkHeadTermLit(box(visitExp(exp0, env, subst), subst(exp0.tpe)))
         }
 
       case _ =>
-        // Compute the universally quantified variables (i.e. the variables not bound by the local scope).
+        // The universally quantified variables (i.e. the variables not bound by the local scope).
         val quantifiedFreeVars = quantifiedVars(cparams0, exp0)
 
         if (quantifiedFreeVars.isEmpty) {
-          // Case 2: No quantified variables. The expression can be reduced to a value.
           mkHeadTermLit(box(visitExp(exp0, env, subst), subst(exp0.tpe)))
         } else {
-          // Case 3: Quantified variables. The expression is translated to an application term.
           // NB: env/subst-mapped so the syms match the visited exp inside mkAppTerm's substExp.
           val fvs = quantifiedFreeVars.map { case (sym, tpe) => (env(sym), subst(tpe)) }
           mkAppTerm(fvs, visitExp(exp0, env, subst), subst(exp0.tpe), exp0.loc)
@@ -2016,88 +1860,54 @@ object SolutionLowering {
   }
 
   /**
-    * Lifts the given lambda expression `exp0` with the given argument types `argTypes`.
-    *
-    * Note: liftX and liftXb are similar and should probably be maintained together.
+    * Lifts `exp0: a -> b -> c -> resultType` (curried) to a call `liftN(exp0): Boxed -> ... -> Boxed`
+    * (also curried). `liftX` and `liftXb` are similar and should probably be maintained together.
     */
   private def liftX(exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type)(implicit ctx: Context): MonoAst.Expr = {
-    //
-    // The liftX family of functions are of the form: a -> b -> c -> `resultType` and
-    // returns a function of the form Boxed -> Boxed -> Boxed -> Boxed -> Boxed`.
-    // That is, the function accepts a *curried* function and returns a *curried* function.
-    //
 
-    // The type of the function argument, i.e. a -> b -> c -> `resultType`.
     val argType = Type.mkPureCurriedArrow(argTypes, resultType, exp0.loc)
 
-    // The type of the returned function, i.e. Boxed -> Boxed -> Boxed -> Boxed.
     val returnType = Type.mkPureCurriedArrow(argTypes.map(_ => Types.Boxed), Types.Boxed, exp0.loc)
 
-    // The type of the overall liftX function, i.e. (a -> b -> c -> `resultType`) -> (Boxed -> Boxed -> Boxed -> Boxed).
     val liftType = Type.mkPureArrow(argType, returnType, exp0.loc)
 
-    // Compute the liftXb symbol.
     val sym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${argTypes.length}"), liftType)
 
-    // Construct a call to the liftX function.
     MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialization.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
   }
 
-  /**
-    * Lifts the given Boolean-valued lambda expression `exp0` with the given argument types `argTypes`.
-    */
+  /** Lifts `exp0: a -> b -> c -> Bool` (curried) to a call `liftNb(exp0): Boxed -> ... -> Bool` (curried). */
   private def liftXb(exp0: MonoAst.Expr, argTypes: List[Type])(implicit ctx: Context): MonoAst.Expr = {
-    //
-    // The liftX family of functions are of the form: a -> b -> c -> Bool and
-    // returns a function of the form Boxed -> Boxed -> Boxed -> Boxed -> Bool.
-    // That is, the function accepts a *curried* function and returns a *curried* function.
-    //
 
-    // The type of the function argument, i.e. a -> b -> c -> Bool.
     val argType = Type.mkPureCurriedArrow(argTypes, Type.Bool, exp0.loc)
 
-    // The type of the returned function, i.e. Boxed -> Boxed -> Boxed -> Bool.
     val returnType = Type.mkPureCurriedArrow(argTypes.map(_ => Types.Boxed), Type.Bool, exp0.loc)
 
-    // The type of the overall liftXb function, i.e. (a -> b -> c -> Bool) -> (Boxed -> Boxed -> Boxed -> Bool).
     val liftType = Type.mkPureArrow(argType, returnType, exp0.loc)
 
-    // Compute the liftXb symbol.
     val sym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${argTypes.length}b"), liftType)
 
-    // Construct a call to the liftXb function.
     MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialization.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
   }
 
   /**
-    * Lifts the given lambda expression `exp0` with the given argument types `argTypes` and `resultType`.
+    * Lifts `exp0: i1 -> i2 -> i3 -> Vector[(o1, o2, o3, ...)]` (curried) to a call
+    * `liftInVarsXOutVars(exp0): Vector[Boxed] -> Vector[Vector[Boxed]]`, e.g. `lift3X2` for three
+    * inputs producing a Vector of pairs.
     */
   private def liftXY(outVars: List[Symbol.VarSym], exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type, loc: SourceLocation)(implicit ctx: Context): MonoAst.Expr = {
-    //
-    // The liftXY family of functions are of the form: i1 -> i2 -> i3 -> Vector[(o1, o2, o3, ...)] and
-    // returns a function of the form Vector[Boxed] -> Vector[Vector[Boxed]].
-    // That is, the function accepts a *curried* function and an uncurried function that takes
-    // its input as a boxed Vector and return its output as a vector of vectors.
-    //
 
-    // The type of the function argument, i.e. i1 -> i2 -> i3 -> Vector[(o1, o2, o3, ...)].
     val argType = Type.mkPureCurriedArrow(argTypes, resultType, loc)
 
-    // The type of the returned function, i.e. Vector[Boxed] -> Vector[Vector[Boxed]].
     val returnType = Type.mkPureArrow(Type.mkVector(Types.Boxed, loc), Type.mkVector(Type.mkVector(Types.Boxed, loc), loc), loc)
 
-    // The type of the overall liftXY function, i.e. (i1 -> i2 -> i3 -> Vector[(o1, o2, o3, ...)]) -> (Vector[Boxed] -> Vector[Vector[Boxed]]).
     val liftType = Type.mkPureArrow(argType, returnType, loc)
 
-    // Compute the number of bound ("output") and free ("input") variables.
     val numberOfInVars = argTypes.length
     val numberOfOutVars = outVars.length
 
-    // Compute the liftXY symbol.
-    // For example, lift3X2 is a function from three arguments to a Vector of pairs.
     val sym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${numberOfInVars}X$numberOfOutVars"), liftType)
 
-    // Construct a call to the liftXY function.
     MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialization.rewriteEnumStructType(liftType), returnType, Type.Pure, loc)
   }
 
@@ -2352,12 +2162,10 @@ object SolutionLowering {
   }
 
   /**
-    * Returns the given expression `exp` in a box.
-    *
-    * @param rawTpe `exp`'s RAW substituted (pre-visit) type — NOT `exp.tpe`, which is already
-    *               enum/struct-rewritten by the time an already-visited `exp` reaches here. Used
-    *               as `Boxable.box`'s def-lookup key; see mkGetChannel's doc comment for why the
-    *               already-rewritten `.tpe` can't be reused for this.
+    * Returns `exp` boxed. `rawTpe` is `exp`'s RAW substituted (pre-visit) type — NOT `exp.tpe`,
+    * which is already enum/struct-rewritten by the time an already-visited `exp` reaches here — and
+    * is used as `Boxable.box`'s def-lookup key; see mkGetChannel's doc comment for why the
+    * already-rewritten `.tpe` can't be reused for this.
     */
   private def box(exp: MonoAst.Expr, rawTpe: Type)(implicit ctx: Context): MonoAst.Expr = {
     val loc = exp.loc
@@ -2775,16 +2583,14 @@ object SolutionLowering {
   }
 
   /**
-    * A local context threaded through `visitExp` to carry information from an
-    * enclosing `NewObject` to nested `InvokeSuperMethod` expressions.
+    * A local context threaded through `visitExp` to carry information from an enclosing
+    * `NewObject` to nested `InvokeSuperMethod` expressions.
     *
-    * @param sym     The symbol of the enclosing anonymous class.
-    *                Set to `Some` when visiting a `NewObject` method body; `None` otherwise.
-    *                Injected into `AtomicOp.InvokeSuperMethod` so the backend can generate
-    *                the `CHECKCAST` and `INVOKEVIRTUAL super$methodName` instructions.
-    * @param thisRef A `Var` expression referencing the `_this` parameter (the first formal
-    *                parameter of the JvmMethod). Prepended to `InvokeSuperMethod` arguments
-    *                so the backend receives the receiver object as the first expression.
+    * `sym` is the enclosing anonymous class symbol (`Some` when visiting a `NewObject` method
+    * body, `None` otherwise), injected into `AtomicOp.InvokeSuperMethod` so the backend can
+    * generate the `CHECKCAST` and `INVOKEVIRTUAL super$methodName` instructions. `thisRef` is a
+    * `Var` expression referencing the `_this` parameter (the JvmMethod's first formal parameter),
+    * prepended to `InvokeSuperMethod` arguments so the backend receives the receiver object first.
     */
   private case class LocalContext(sym: Option[Symbol.AnonClassSym], thisRef: Option[MonoAst.Expr])
 

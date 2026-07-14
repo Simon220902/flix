@@ -31,34 +31,27 @@ import scala.annotation.tailrec
 import scala.collection.mutable
 
 /**
-  * Solution-driven specialization: uses the solver solution from Phase 3 to specialize
-  * all defs in a single parallel pass, with no demand-driven fallback. Crashes on any
-  * call site not covered by the solution ("solver gap"), which identifies missing constraints.
+  * Solution-driven specialization: uses the solver solution from Phase 3 to specialize all defs
+  * in a single parallel pass, with no demand-driven fallback. Crashes on any call site not
+  * covered by the solution ("solver gap"), which identifies missing constraints.
   *
-  * Interplay with `SolutionLowering.scala`: this object is the entry point (`run`) and owns the
-  * `Context` lookup tables (`defTable`/`enumTable`/`structTable`), built here from the solution —
-  * but the actual per-def specialize+lower walk lives in `SolutionLowering.visitDef`, which calls
-  * back into this object's `lookupSym`/`lookupCaseSym`/`lookupStructSym`/`resolveSigSym` mid-walk
-  * to resolve each call/tag/struct site. Not a one-directional pipeline: `run` calls
-  * `SolutionLowering.visitDef`, which calls back into functions defined here.
+  * `run` is the entry point and owns the `Context` lookup tables (`defTable`/`enumTable`/
+  * `structTable`). The per-def specialize+lower walk itself lives in `[[SolutionLowering.visitDef]]`,
+  * which calls back into `lookupSym`/`lookupCaseSym`/`lookupStructSym`/`resolveSigSym` here to
+  * resolve each call/tag/struct site.
   */
 object SolutionSpecialization {
 
-  // ---- Context ----------------------------------------------------------------
-
   /**
-    * Simplified context: only accumulates specialized defs.
-    * Unlike Specialization.Context there is no work queue — all specializations are
-    * known upfront from the solver solution.
+    * Accumulates specialized defs; unlike `Specialization.Context` there is no work queue, since
+    * every specialization is known upfront from the solver solution.
     *
     * `defTable` maps (original sym, instantiated arrow type) → fresh specialized sym.
-    * `enumTable`/`structTable` map (original sym, ground type-arg tuple) → fresh specialized
-    * sym, mirroring `defTable` — see `lookupCaseSym`/`lookupStructSym` and the `Expr.Tag`/
-    * `StructNew`/`StructGet`/`StructPut`/`Pattern.Tag` cases in `SolutionLowering.visitExp`/
-    * `visitPat` (the fused specialize+lower walk) that consult them.
+    * `enumTable`/`structTable` mirror it for enums/structs, keyed by (original sym, ground
+    * type-arg tuple) — see `lookupCaseSym`/`lookupStructSym`.
     *
-    * package-visible (not `private`): `SolutionLowering.scala` (this pipeline's own fork of
-    * `Lowering.scala`) needs it as the type its `ctx` implicit is threaded through.
+    * Package-visible: `[[SolutionLowering]]` needs it as the type its `ctx` implicit is threaded
+    * through.
     */
   private[monomorph2] class Context(
     val defTable: Map[(Symbol.DefnSym, Type), Symbol.DefnSym],
@@ -71,36 +64,34 @@ object SolutionSpecialization {
   ) {
     private val specializedDefs: mutable.Map[Symbol.DefnSym, MonoAst.Def] = mutable.Map.empty
 
+    /** Records `defn` under its fresh specialized `sym`. */
     def addSpecializedDef(sym: Symbol.DefnSym, defn: MonoAst.Def): Unit =
       synchronized { specializedDefs.put(sym, defn) }
 
+    /** Returns all specialized defs recorded so far. */
     def getSpecializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
       synchronized { specializedDefs.toMap }
 
-    // Tracks which of "regularDefs"/"instanceDefs"/"defaultSigImpls" each specialized def came
-    // from (by original, pre-specialization sym) — diagnostic only, for `MonomorphBench`'s
-    // `Xmonobench` table. Tagged at both `run`'s non-parametric and parametric specialization
-    // sites, where `defToInst`/`defaultSigDefs` are already in scope to make the call.
+    // Diagnostic only, for `MonomorphBench`'s `Xmonobench` table: which of "regularDefs"/
+    // "instanceDefs"/"defaultSigImpls" each specialized def came from.
     private val defCategoryCounts: mutable.Map[String, Int] = mutable.Map.empty.withDefaultValue(0)
 
+    /** Increments the count for `category` (one of "regularDefs"/"instanceDefs"/"defaultSigImpls"). */
     def incrementDefCategory(category: String): Unit =
       synchronized { defCategoryCounts(category) = defCategoryCounts(category) + 1 }
 
+    /** Returns the per-category specialized-def counts. */
     def getDefCategoryCounts: Map[String, Int] = synchronized { defCategoryCounts.toMap }
   }
 
-  // ---- lookupSym -------------------------------------------------------------
-
   /**
     * Returns the sym to use for a call to `sym` instantiated at `it`.
-    * - Non-parametric defs: keep original sym.
-    * - Parametric defs: must be in defTable (pre-populated from solver solution).
-    * - Missing entries: crash with "Solver gap" — this identifies generator/solver gaps.
+    * - Non-parametric defs: keep the original sym.
+    * - Parametric defs: must be in `defTable` (pre-populated from the solver solution); a miss
+    *   crashes with "Solver gap", identifying a constraint-generator gap.
     *
-    * package-visible (not `private`): `SolutionLowering.lookup` calls this directly to resolve
-    * lowering-synthesized calls (e.g. channel support functions), instead of
-    * `Specialization.specializeDefnSym` — same "Solver gap" failure mode as every other call
-    * site in this pipeline, no demand-driven fallback.
+    * Package-visible: `SolutionLowering.lookup` also calls this directly to resolve
+    * lowering-synthesized calls (e.g. channel support functions).
     */
   private[monomorph2] def lookupSym(sym: Symbol.DefnSym, it: Type)
                        (implicit ctx: Context): Symbol.DefnSym = {
@@ -181,15 +172,17 @@ object SolutionSpecialization {
   private[monomorph2] def tolerant[A](lookup: => A, keep: => A): A =
     try lookup catch { case _: InternalCompilerException => keep }
 
-  // ---- StrictSubstitution (verbatim from Specialization) ----------------------
+  // StrictSubstitution and RegionInstantiation below are verbatim from Specialization.scala.
 
   /** The effect that all [[TypeConstructor.Region]] are instantiated to. */
   private val RegionInstantiation: TypeConstructor.Effect =
     TypeConstructor.Effect(Symbol.IO, Kind.Eff)
 
   private[monomorph2] object StrictSubstitution {
+    /** The empty substitution. */
     val empty: StrictSubstitution = StrictSubstitution(Substitution.empty)
 
+    /** Returns `s` as a [[StrictSubstitution]], with every type in its image simplified and grounded. */
     def mk(s: Substitution)(implicit root: TypedAst.Root, flix: Flix): StrictSubstitution = {
       val m = s.m.map {
         case (sym, tpe) => sym -> MonomorphCanon.simplify(tpe.map(MonomorphCanon.default), isGround = true)
@@ -199,6 +192,7 @@ object SolutionSpecialization {
   }
 
   private[monomorph2] case class StrictSubstitution(s: Substitution) {
+    /** Applies this substitution to `tpe0`, defaulting any free type variable to its kind's default type. */
     def apply(tpe0: Type)(implicit root: TypedAst.Root, flix: Flix): Type = tpe0 match {
       case v@Type.Var(sym, _) => s.m.get(sym) match {
         case None    => MonomorphCanon.default(v)
@@ -218,29 +212,34 @@ object SolutionSpecialization {
       case Type.UnresolvedJvmType(_, loc)  => throw InternalCompilerException("unexpected JVM type", loc)
     }
 
+    /** Returns the non-strict version of this substitution. */
     def nonStrict: Substitution = s
   }
 
-  // ---- Helpers (verbatim from Specialization) ---------------------------------
+  // The helpers below are verbatim from Specialization.scala.
 
+  /** Simplifies the types embedded in `field`. */
   private def visitStructField(field: TypedAst.StructField)(implicit root: TypedAst.Root, flix: Flix): TypedAst.StructField =
     field match {
       case TypedAst.StructField(fieldSym, tpe, loc) =>
         TypedAst.StructField(fieldSym, MonomorphCanon.simplify(tpe, isGround = false), loc)
     }
 
+  /** Simplifies the types embedded in `caze`. */
   private def visitEnumCase(caze: TypedAst.Case)(implicit root: TypedAst.Root, flix: Flix): TypedAst.Case =
     caze match {
       case TypedAst.Case(sym, tpes, sc, loc) =>
         TypedAst.Case(sym, tpes.map(MonomorphCanon.simplify(_, isGround = false)), sc, loc)
     }
 
+  /** Simplifies the types embedded in `caze`. */
   private def visitRestrictableEnumCase(caze: TypedAst.RestrictableCase)(implicit root: TypedAst.Root, flix: Flix): TypedAst.RestrictableCase =
     caze match {
       case TypedAst.RestrictableCase(caseSym0, tpes, sc, loc) =>
         TypedAst.RestrictableCase(caseSym0, tpes.map(MonomorphCanon.simplify(_, isGround = false)), sc, loc)
     }
 
+  /** Applies `StrictSubstitution.empty` to the types embedded in `op`. */
   private def visitEffectOp(op: TypedAst.Op)(implicit root: TypedAst.Root, flix: Flix): TypedAst.Op =
     op match {
       case TypedAst.Op(sym, TypedAst.Spec(doc, ann, mod, tparams, fparams0, declaredScheme, retTpe, eff, tconstrs, econstrs), loc) =>
@@ -252,6 +251,7 @@ object SolutionSpecialization {
         TypedAst.Op(sym, spec, loc)
     }
 
+  /** Returns the `def` that implements signature `sym` for the instance at `tpe`, or its trait-level default. */
   private[monomorph2] def resolveSigSym(sym: Symbol.SigSym, tpe: Type)
                             (implicit instances: Map[(Symbol.TraitSym, TypeConstructor), Instance], root: TypedAst.Root, flix: Flix): TypedAst.Def = {
     val sig = root.sigs(sym)
@@ -272,15 +272,18 @@ object SolutionSpecialization {
     }
   }
 
+  /** Merges `envs` into a single var-sym renaming map. */
   private def combineEnvs(envs: Iterable[Map[Symbol.VarSym, Symbol.VarSym]]): Map[Symbol.VarSym, Symbol.VarSym] =
     envs.foldLeft(Map.empty[Symbol.VarSym, Symbol.VarSym])(_ ++ _)
 
+  /** Specializes `fparams0` under `subst0`, returning the fresh params and the old-to-fresh var-sym renaming. */
   private[monomorph2] def specializeFormalParams(fparams0: List[TypedAst.FormalParam], subst0: StrictSubstitution)
                                      (implicit root: TypedAst.Root, flix: Flix): (List[TypedAst.FormalParam], Map[Symbol.VarSym, Symbol.VarSym]) = {
     val (params, envs) = fparams0.map(specializeFormalParam(_, subst0)).unzip
     (params, combineEnvs(envs))
   }
 
+  /** Specializes `fparam0` under `subst0`, returning the fresh param and its old-to-fresh var-sym renaming. */
   private[monomorph2] def specializeFormalParam(fparam0: TypedAst.FormalParam, subst0: StrictSubstitution)
                                     (implicit root: TypedAst.Root, flix: Flix): (TypedAst.FormalParam, Map[Symbol.VarSym, Symbol.VarSym]) = {
     val TypedAst.FormalParam(bnd, tpe, src, decreasing, loc) = fparam0
@@ -288,27 +291,14 @@ object SolutionSpecialization {
     (TypedAst.FormalParam(Binder(freshSym, subst0(bnd.tpe)), subst0(tpe), src, decreasing, loc), Map(bnd.sym -> freshSym))
   }
 
-  // ---- Enum/struct type rewriting -----------------------------------------------------------
-  //
-  // `lookupCaseSym`/`lookupStructSym` rewrite the *symbol* on Tag/Is/Untag/StructNew/StructGet/
-  // StructPut to the fresh specialized enum/struct sym. That alone is not enough: every `Type`
-  // value elsewhere in the tree (a `Var`'s type, a `Match`'s scrutinee type, a def's own
-  // `functionType`/`retTpe`, ...) still refers to the *original* enum/struct sym with its
-  // *concrete, ground* type arguments (e.g. `Enum(List, [Int32])`), since `StrictSubstitution`
-  // only substitutes+canonicalizes — it has no notion of the fresh specialized syms. A downstream
-  // consistency check (`main/test/.../verifier/TypeVerifier.scala`, run by `RunVerifiers`/
-  // `FlixSuite`) asserts that a `Tag`/`Is`/`Untag`'s case-sym's `enumSym` matches the enum sym
-  // embedded in the surrounding type, so once the symbol is specialized, the type has to be too,
-  // everywhere it appears, not just at the Tag/StructNew site itself.
-  //
-  // `rewriteEnumStructType` performs this rewrite. Wiring it in has two shapes, because it must
-  // run *after* `lookupCaseSym`/`lookupStructSym` build their lookup keys from the raw, un-rewritten
-  // type (rewriting first would make the lookup key already-rewritten and self-defeating):
-  //   - Defs: `SolutionLowering.visitType` calls it inline at every type-construction site in the
-  //     fused specialize+lower walk, right after lowering.
-  //   - Effects: an op's `Spec` is lowered independently of any def body, so `rewriteEffect`/
-  //     `rewriteSpec`/`rewriteFormalParam` below apply the same rewrite as an explicit post-pass
-  //     over the already-lowered `MonoAst.Effect`.
+  // `lookupCaseSym`/`lookupStructSym` only rewrite the *symbol* on Tag/Is/Untag/StructNew/
+  // StructGet/StructPut. Every other `Type` value in the tree still refers to the *original*
+  // enum/struct sym with concrete type args, since `StrictSubstitution` only substitutes and
+  // canonicalizes — it has no notion of fresh specialized syms. `TypeVerifier` asserts that a
+  // Tag/Is/Untag's case-sym's `enumSym` matches the enum sym embedded in the surrounding type, so
+  // `rewriteEnumStructType` below must rewrite the type everywhere it appears. It must run after
+  // `lookupCaseSym`/`lookupStructSym` build their lookup keys from the raw type, or the lookup
+  // keys would themselves already be rewritten and never match.
 
   /**
     * Structurally rewrites `tpe`: any `Enum(sym, args)`/`Struct(sym, args)` sub-type whose
@@ -347,6 +337,7 @@ object SolutionSpecialization {
     loop(tpe, Nil)
   }
 
+  /** Applies [[rewriteEnumStructType]] to every type embedded in `spec`. */
   private def rewriteSpec(spec: MonoAst.Spec)(implicit ctx: Context): MonoAst.Spec =
     spec.copy(
       fparams = spec.fparams.map(rewriteFormalParam),
@@ -355,24 +346,26 @@ object SolutionSpecialization {
       eff = rewriteEnumStructType(spec.eff)
     )
 
-  // Package-visible: SolutionLowering's per-def walk calls this directly wherever it lowers an
-  // already-specialized formal param (Step 2 — see rewriteEnumStructType's doc comment).
+  /**
+    * Applies [[rewriteEnumStructType]] to `fp`'s type.
+    *
+    * Package-visible: `SolutionLowering`'s per-def walk calls this directly wherever it lowers an
+    * already-specialized formal param.
+    */
   private[monomorph2] def rewriteFormalParam(fp: MonoAst.FormalParam)(implicit ctx: Context): MonoAst.FormalParam =
     fp.copy(tpe = rewriteEnumStructType(fp.tpe))
 
   /**
-    * Effect operations (`MonoAst.Op`, e.g. `Env.getArgs`'s own declared signature) carry a `Spec`
-    * — same shape as a def's — whose embedded types can reference a specialized enum/struct just
-    * as a def's can. Unlike a def, an op's `Spec` is lowered independently of any def body, so it
-    * never passes through `SolutionLowering.visitType`'s inline rewrite; this explicit post-pass
-    * is what keeps an op's declared type consistent with the specialized case/handler bodies that
-    * implement it, per `TypeVerifier`'s enumSym-matches-embedded-type invariant.
+    * Applies [[rewriteEnumStructType]] to every op's `Spec` in `eff`.
+    *
+    * An op's `Spec` is lowered independently of any def body, so it never passes through
+    * `SolutionLowering.visitType`'s inline rewrite; this explicit post-pass is what keeps it
+    * consistent with `TypeVerifier`'s enumSym-matches-embedded-type invariant.
     */
   private def rewriteEffect(eff: MonoAst.Effect)(implicit ctx: Context): MonoAst.Effect =
     eff.copy(ops = eff.ops.map(op => op.copy(spec = rewriteSpec(op.spec))))
 
-  // ---- run -------------------------------------------------------------------
-
+  /** Specializes `root` per `solution`, the constraint solver's output from Phase 3. */
   def run(root: TypedAst.Root, solution: Solution)(implicit flix: Flix): MonoAst.Root = flix.phase("Monomorpher") {
     implicit val r: TypedAst.Root = root
     val is: Map[(Symbol.TraitSym, TypeConstructor), Instance] = MonomorphCanon.mkInstanceMap(root.instances)
@@ -546,13 +539,14 @@ object SolutionSpecialization {
         rewriteEffect(SolutionLowering.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc)))
     }
 
-    // The original, polymorphic enum/struct declaration is always kept alongside the specialized
-    // declarations below, never replaced. Some enum/struct constructions are synthesized directly
-    // as MonoAst by SolutionLowering (e.g. the Datalog Fixpoint3.Ast.* enums built by mkTag),
-    // bypassing the ordinary Expr.Tag/StructNew rewrite path entirely — those references still
-    // need the original declaration to resolve against. Keeping an occasionally-unused original
-    // declaration around costs nothing and is strictly safer than trying to prove it is never
-    // needed.
+    // Original enum/struct declarations are all kept alongside the specialized ones below, never
+    // replaced. Needed because: (a) SolutionLowering synthesizes MonoAst constructions (Datalog
+    // runtime enums such as Fixpoint3.Ast.*, `FList`, `PredSym`, `Denotation`) that reference
+    // original syms and bypass the Expr.Tag/StructNew rewrite; (b) non-parametric enums/structs
+    // keep their original syms; (c) restrictable enums stay on their original (lowered) syms.
+    // Nothing downstream prunes unused enum/struct declarations — MonomorphTreeShaker only prunes
+    // defs/instances/sigs, and runs before this phase — so genuinely-unused originals currently
+    // survive to codegen; pruning them is a known follow-up.
     val enums = ParOps.parMapValues(root.enums) {
       case TypedAst.Enum(doc, ann, mod, sym, tparams, derives, cases, loc) =>
         SolutionLowering.lowerEnum(TypedAst.Enum(doc, ann, mod, sym, tparams, derives, MapOps.mapValues(cases)(visitEnumCase), loc))
