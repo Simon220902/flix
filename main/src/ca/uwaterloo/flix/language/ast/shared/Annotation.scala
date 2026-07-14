@@ -110,7 +110,7 @@ object Annotation {
     * An annotation that marks a function definition as a target for the Datalog lowering.
     *
     * A function annotated with `LoweringTargetDatalog` may not be discarded until lowering has
-    * been performed, and only if the program actually uses the Datalog subset of the language.
+    * been performed if the program uses the Datalog subset of the language.
     *
     * @param loc the source location of the annotation.
     */
@@ -119,10 +119,10 @@ object Annotation {
   }
 
   /**
-    * An annotation that marks a function definition as a target for the channel lowering.
+    * An annotation that marks a function definition as a target for the Channel lowering.
     *
-    * A function annotated with `LoweringTargetChannel` may not be discarded until lowering has
-    * been performed, and only if the program actually uses channels.
+    * A function annotated with `LoweringTargetDatalog` may not be discarded until lowering has
+    * been performed if the program uses Channels.
     *
     * @param loc the source location of the annotation.
     */
