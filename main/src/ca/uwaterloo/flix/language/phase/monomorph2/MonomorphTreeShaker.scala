@@ -26,23 +26,14 @@ import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 /**
   * Tree-shakes `root`, pruning unreachable `root.defs`, `root.instances`, and `root.sigs`.
   *
-  * Runs for both the constraint-based monomorphization pipeline and the demand-driven baseline,
-  * superseding [[ca.uwaterloo.flix.language.phase.TreeShaker1]] (now dead code) in both:
-  * `TreeShaker1` computes the same def/trait/sig reachability info this pass needs, but only
-  * ever used it to prune `root.defs`.
+  * Supersedes [[ca.uwaterloo.flix.language.phase.TreeShaker1]] in both monomorphization
+  * pipelines: `TreeShaker1` computes the same reachability info but only ever pruned defs.
+  * Pruning instances and default sig bodies matters because [[ConstraintCollection]] walks them
+  * unconditionally — left unpruned, code no reachable call site can invoke would be specialized.
   *
-  * Pruning instances and sig bodies matters because `ConstraintCollection` — unlike the
-  * demand-driven `Specialization.scala` — walks every instance implementation and default
-  * trait-sig body unconditionally, regardless of whether it is ever actually dispatched to, and
-  * its solver seeds any call found this way whose argument types are already concrete,
-  * regardless of whether the surrounding declaration is reachable. Left unpruned, that
-  * unconditional walk would specialize code no reachable call site can ever invoke.
-  *
-  * An instance is dropped entirely if its trait is never reached — the same trait-level
-  * granularity `TreeShaker1` already uses when deciding which instances' bodies to walk for
-  * transitive reachability, so this can keep a few genuinely-unused instances of an
-  * otherwise-used trait, but never drops something still needed. A default sig implementation's
-  * body is dropped if its own sig is never reached via `ApplySig`.
+  * An instance is dropped if its trait is never reached (the same trait-level granularity
+  * `TreeShaker1` uses internally), so a few unused instances of a used trait may survive, but
+  * nothing still needed is dropped. A default sig body is dropped if its sig is never applied.
   */
 object MonomorphTreeShaker {
 

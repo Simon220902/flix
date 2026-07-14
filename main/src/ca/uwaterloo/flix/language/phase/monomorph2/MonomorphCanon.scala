@@ -29,23 +29,16 @@ import scala.collection.immutable.SortedSet
   * The single, shared definition of "what a given (possibly non-ground) monomorph type becomes":
   * effect canonicalization, associated-type reduction, and defaulting of unresolved kinds.
   *
-  * Both the solver (`ConstraintSolver`, which computes types symbolically, ahead of time) and the
-  * specializer (`SolutionSpecialization`, which computes the logically same types concretely, at
-  * an actual call site) must agree on this, or their `(sym, type)` defTable keys diverge for the
-  * same instantiation.
-  *
-  * Lifted from `SolutionSpecialization.scala`'s `StrictSubstitution` (the pipeline's actual source
-  * of truth for what canonicalization should produce). `Specialization.scala` (the demand-driven
-  * baseline) keeps its own separate copy — out of scope for this unification.
+  * Both the solver ([[ConstraintSolver]], which computes types symbolically, ahead of time) and
+  * the specializer ([[SolutionSpecialization]], which computes the logically same types
+  * concretely, at an actual call site) must agree on this, or their `(sym, type)` defTable keys
+  * diverge for the same instantiation.
   */
 private[monomorph2] object MonomorphCanon {
 
   /**
     * Builds a lookup map from `(trait, type constructor)` to the instance implementing it.
-    * Shared by the solver (sig dispatch, `resolveSig`) and the specializer (`ApplySig`
-    * resolution) — pure data reshaping, not part of canonicalization proper, but duplicated
-    * the same way across both, so it lives here too. `Specialization.scala` (the demand-driven
-    * baseline) keeps its own separate copy — out of scope for this unification.
+    * Shared by the solver's sig dispatch and the specializer's `ApplySig` resolution.
     */
   def mkInstanceMap(instances: ListMap[Symbol.TraitSym, TypedAst.Instance]): Map[(Symbol.TraitSym, TypeConstructor), TypedAst.Instance] =
     instances.map { case (sym, inst) => ((sym, inst.tpe.typeConstructor.get), inst) }.toMap
@@ -98,10 +91,8 @@ private[monomorph2] object MonomorphCanon {
     val Type.Apply(tpe1, tpe2, loc) = app
     val x = normalize(tpe1)
     val y = normalize(tpe2)
-    // Check x's kind, not the original app's — substitution may change a higher-kinded var's
-    // kind. Type.Apply(x, y, _).kind is computed purely from x.kind (Kind.Arrow's codomain); y
-    // never enters into it, so checking x.kind directly is equivalent and avoids allocating a
-    // throwaway Type.Apply just to read the kind.
+    // Check x's kind, not the original app's: substitution may change a higher-kinded var's kind,
+    // and the applied kind is computed from x.kind alone, so this avoids a throwaway Type.Apply.
     (x, y) match {
       case _ if isGround && (x.kind match { case Kind.Arrow(_, k) => k == Kind.Eff; case _ => false }) => canonicalEffect(Type.Apply(x, y, loc))
       case (Type.Cst(TypeConstructor.Complement, _), y) => Type.mkComplement(y, loc)
@@ -140,12 +131,9 @@ private[monomorph2] object MonomorphCanon {
 
   /**
     * Defaults an unresolved (stray) type to its kind's ground default: `Star` (and other
-    * value-like kinds) → `AnyType`, `Eff` → `Pure`, `CaseSet` → the empty case set, `SchemaRow` →
-    * the empty row. Unconditional: a `Star` var can only be stray here because nothing in the
-    * program actually constrained it to a concrete type, so defaulting it to `AnyType` can at
-    * worst make an unreachable/dead code path fail a downstream lookup cleanly — it can't silently
-    * produce a wrong-but-plausible specialization, since a real call site would have supplied a
-    * concrete type instead of leaving the var free.
+    * value-like kinds) → `AnyType`, `Eff` → `Pure`, `CaseSet`/`SchemaRow`/`RecordRow` → empty.
+    * Safe because a var is only stray when nothing in the program constrained it to a concrete
+    * type.
     */
   def default(tpe0: Type): Type = tpe0.kind match {
     case Kind.Wild | Kind.WildCaseSet | Kind.Star | Kind.Bool | Kind.Predicate | Kind.Arrow(_, _) =>
@@ -158,8 +146,7 @@ private[monomorph2] object MonomorphCanon {
     case Kind.Error        => throw InternalCompilerException(s"Unexpected type '$tpe0'.", tpe0.loc)
   }
 
-  // ---- Record / schema helpers (used only by normalizeApply) ------------------
-
+  /** Inserts the record row `label -> tpe` into `rest`, keeping labels sorted. */
   private def mkRecordExtendSorted(label: Name.Label, tpe: Type, rest: Type, loc: SourceLocation): Type = rest match {
     case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.RecordRowExtend(l), loc1), t, loc2), r, loc3) if l.name < label.name =>
       val newRest = mkRecordExtendSorted(label, tpe, r, loc)
@@ -173,6 +160,7 @@ private[monomorph2] object MonomorphCanon {
     case Type.UnresolvedJvmType(_, _)   => throw InternalCompilerException(s"Unexpected JVM type '$rest'", rest.loc)
   }
 
+  /** Inserts the schema row `label -> tpe` into `rest`, keeping predicates sorted. */
   private def mkSchemaExtendSorted(label: Name.Pred, tpe: Type, rest: Type, loc: SourceLocation): Type = rest match {
     case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SchemaRowExtend(l), loc1), t, loc2), r, loc3) if l.name < label.name =>
       val newRest = mkSchemaExtendSorted(label, tpe, r, loc)

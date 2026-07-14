@@ -190,15 +190,9 @@ object ConstraintCollection {
     fromDefs ++ fromEnums ++ fromInstances ++ fromRestrictableEnums ++ fromStructs ++ fromSigs
   }(MonomorphDebug.DebugFlows)
 
-  // ---- Constraint generation ---------------------------------------------
-  //
-  // Every visit* function below threads an explicit, immutable `acc: List[Flow]` accumulator
-  // through the walk instead of returning `Set[Flow]` and unioning results with `++` on the way
-  // back up. Each node conses its own flow(s) onto the accumulator it receives and passes the
-  // result to its next sibling — a plain `foldLeft`/cons shape, no mutation, no per-node Set
-  // allocation or hashing. Flows may genuinely duplicate (e.g. the same call site's flow
-  // re-derived from two visits); that's fine, since dedup only needs to happen once, in
-  // `generate`'s final `.toSet` per category, rather than paying an O(n) merge cost at every node.
+  // Performance: every visit* function threads an immutable `acc: List[Flow]` accumulator (cons,
+  // no per-node Set allocation). Duplicate flows are fine — dedup happens once, in `generate`'s
+  // final `.toSet`.
 
   /**
     * Emits flow constraints for enum type applications occurring in `tpe`.
@@ -264,7 +258,6 @@ object ConstraintCollection {
     * `ef` starts as `defn.spec.eff` and is threaded through the fold exactly as the lowering does.
     */
   private def entryPointHandlerFlows(defn: TypedAst.Def, acc: List[Flow])(implicit ctx: Context): List[Flow] = {
-    // LOWERING
     if (!TypedAstOps.isEntryPoint(defn)(ctx.root)) acc
     else {
       val loc = defn.spec.eff.loc
@@ -287,13 +280,9 @@ object ConstraintCollection {
   }
 
   /**
-    * Emits flow constraints for all call sites and enum usages in `exp`.
-    *
-    * Scope: all TypedAst expression forms are covered. Datalog fixpoint nodes emit the
-    * Box/Unbox/liftN/lattice/Facts/ProjectInto/ProvenanceOf constraints for whatever
-    * `SolutionLowering.scala` will synthesize for them (see the `// LOWERING`-marked cases below).
-    * Channel nodes (NewChannel, GetChannel, etc.) likewise emit constraints for their synthesized
-    * stdlib calls directly, rather than relying on a pre-lowering pass.
+    * Emits flow constraints for all call sites and enum usages in `exp`. Datalog and channel
+    * nodes additionally emit constraints for the stdlib calls [[SolutionLowering]] will
+    * synthesize for them.
     */
   private def visitExp(exp: Expr, acc: List[Flow])(implicit ctx: Context): List[Flow] = exp match {
     case Expr.Cst(_, _, _) => acc
@@ -347,24 +336,19 @@ object ConstraintCollection {
           visitExp(body, a1)
       }
 
-    // PRE-LOWERING: pre-lowering will rewrite RestrictableTag to Tag over MVar.Enum; until then,
-    // both are handled identically here (getEnumMVarAndTypeArgs dispatches on `tpe` itself, not
-    // on which Expr node matched) — the solver just needs to handle both resulting mvars.
+    // Tag and RestrictableTag are handled identically: getEnumMVarAndTypeArgs dispatches on the
+    // type itself, and the solver handles both resulting mvar kinds.
     case Expr.Tag(_, exps, tpe, _, loc) =>
       val (mvar, tpArgs) = getEnumMVarAndTypeArgs(tpe, loc)
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       Flow(FlowInput.FlowArgs(tpArgs.map(typeToMonoArg(_))), mvar) :: acc1
 
-    // LOWERING
     case Expr.RestrictableTag(_, exps, tpe, _, loc) =>
       val (mvar, tpArgs) = getEnumMVarAndTypeArgs(tpe, loc)
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       Flow(FlowInput.FlowArgs(tpArgs.map(typeToMonoArg(_))), mvar) :: acc1
 
-    // LOWERING
     case Expr.RestrictableChoose(_, exp, rules, _, _, _) =>
-      // PRE-LOWERING: pre-lowering will rewrite RestrictableChoose to Match.
-      // Until then we recurse structurally — correct since no new call sites are introduced.
       val acc1 = visitExp(exp, acc)
       rules.foldLeft(acc1)((a, r) => visitExp(r.exp, a))
 
@@ -418,9 +402,8 @@ object ConstraintCollection {
 
     case Expr.VectorLength(exp, _) => visitExp(exp, acc)
 
-    // StructNew: mirrors Expr.Tag — emits a Flow for the struct's own MVar so a construction
-    // site's concrete type args seed the solver (visitType alone only captures the DECLARATION's
-    // own field-type structure, not where/at-what-types the struct is actually instantiated).
+    // Mirrors Expr.Tag: a construction site's concrete type args must seed the solver;
+    // visitType alone only captures the declaration's own field-type structure.
     case Expr.StructNew(_, fields, region, tpe, _, loc) =>
       val (mvar, tpArgs) = getEnumMVarAndTypeArgs(tpe, loc)
       val acc1 = fields.foldLeft(acc) { case (a, (_, e)) => visitExp(e, a) }
@@ -461,9 +444,7 @@ object ConstraintCollection {
     case Expr.Spawn(exp1, exp2, _, _, _) =>
       visitExp(exp2, visitExp(exp1, acc))
 
-    // LOWERING
-    // ParYield: Lowering synthesizes Channel.get, Channel.put, Channel.newChannel calls
-    // for each non-last fragment. Emit flows so the solver pre-populates these.
+    // Lowering synthesizes Channel.get/put/newChannel calls for each non-last fragment.
     case Expr.ParYield(frags, exp, _, _, loc) =>
       val acc1 = frags.foldLeft(acc)((a, f) => visitExp(f.exp, a))
       val acc2 = visitExp(exp, acc1)
@@ -504,37 +485,25 @@ object ConstraintCollection {
       val acc1 = constructors.foldLeft(acc)((a, c) => visitExp(c.exp, a))
       methods.foldLeft(acc1)((a, m) => visitExp(m.exp, a))
 
-    // LOWERING
-    // Channel nodes: recurse into sub-expressions AND emit flows for the @LoweringTargetChannel
-    // defs that Lowering will synthesize at code-gen time.
-    // GetChannel(<- c) → Channel.get(c): tparam a = element type = tpe
+    // Channel nodes recurse into sub-expressions AND emit flows for the @LoweringTargetChannel
+    // defs that Lowering will synthesize: GetChannel → Channel.get, PutChannel → Channel.put,
+    // NewChannel → Channel.newChannelTuple.
     case Expr.GetChannel(exp, tpe, _, loc) =>
       val acc1 = visitExp(exp, acc)
       Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(tpe)))), MVar.Def(Defs.ChannelGet)) :: acc1
 
-    // LOWERING
-    // PutChannel(channel, value) → Channel.put(value, channel): tparam a = exp2.tpe (value type)
     case Expr.PutChannel(exp1, exp2, _, _, loc) =>
       val acc1 = visitExp(exp2, visitExp(exp1, acc))
       Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(exp2.tpe)))), MVar.Def(Defs.ChannelPut)) :: acc1
 
-    // LOWERING
-    // NewChannel → Channel.newChannelTuple(size): tparam a = element type from Mpmc[a, rc]
-    // tpe may be (Mpmc[T, rc], Mpmc[T, rc]) (tuple) or Mpmc[T, rc] (single channel).
     case Expr.NewChannel(exp, tpe, _, loc) =>
       val elmType = extractChannelElm(tpe)
       val acc1 = visitExp(exp, acc)
       Flow(FlowInput.FlowArgs(List(typeToMonoArg(lowerChannelType(elmType)))), MVar.Def(Defs.ChannelNewTuple)) :: acc1
 
-    // LOWERING
-    // SelectChannel: Lowering synthesizes, per rule, a Channel.mpmcAdmin call (to build the
-    // admin list passed to the non-parametric Channel.selectFrom) and a Channel.unsafeGetAndUnlock
-    // call (to read the winning channel's value) — NOT Channel.get, which is only for the
-    // simple blocking `<- ch` form (Expr.GetChannel). The admin values are collected into a
-    // `List[ChannelMpmcAdmin]` built directly via `mkTag`/`mkList` (SolutionLowering.mkAdmins),
-    // same bypass-the-ordinary-rewrite-path situation as latticeFlows/FixpointLambda above — the
-    // `List[ChannelMpmcAdmin]` instantiation is fixed (not per-rule/per-elmType) and must be
-    // predicted here too.
+    // Lowering synthesizes, per rule, Channel.mpmcAdmin and Channel.unsafeGetAndUnlock calls
+    // (not Channel.get), plus one fixed List[ChannelMpmcAdmin] built directly via mkTag/mkList,
+    // whose instantiation must be predicted here too.
     case Expr.SelectChannel(rules, default, _, _, loc) =>
       val acc1 = rules.foldLeft(acc) { (a, r) =>
         val elmType = r.chan.tpe match {
@@ -550,12 +519,9 @@ object ConstraintCollection {
       val acc2 = default.foldLeft(acc1)((a, d) => visitExp(d, a))
       Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.ChannelMpmcAdmin))), MVar.Enum(Enums.FList)) :: acc2
 
-    // LOWERING
-    // Datalog fixpoint nodes: in addition to
-    // recursing into sub-expressions to capture any defs called inside predicates, emit flows
-    // for every Box/Unbox/liftN/lattice/Facts/ProjectInto/ProvenanceOf call that
-    // SolutionLowering.scala will synthesize for these constructs — mirroring exactly the
-    // TypedAst structure lowering itself inspects.
+    // Datalog fixpoint nodes recurse into sub-expressions AND emit flows for every
+    // Box/Unbox/liftN/lattice/Facts/ProjectInto/ProvenanceOf call SolutionLowering will
+    // synthesize, mirroring the TypedAst structure lowering itself inspects.
     case Expr.FixpointConstraintSet(cs, _, _) =>
       cs.foldLeft(acc) { (a0, c) =>
         val cparams0 = c.cparams
@@ -575,11 +541,8 @@ object ConstraintCollection {
         }
       }
 
-    // LOWERING
-    // FixpointLambda: Lowering builds a `List[PredSym]` value directly via `mkTag`/`mkList`
-    // (SolutionLowering.mkList, called from its FixpointLambda case) to pass to Solver.rename —
-    // same bypass-the-ordinary-rewrite-path situation as latticeFlows' Denotation.Relational case
-    // above, so the `List[PredSym]` instantiation must be predicted here too.
+    // Lowering builds a List[PredSym] directly via mkTag/mkList (bypassing the ordinary rewrite
+    // path), so its instantiation must be predicted here.
     case Expr.FixpointLambda(_, exp, _, _, loc) =>
       val acc1 = visitExp(exp, acc)
       Flow(FlowInput.FlowArgs(List(typeToMonoArg(Types.PredSym))), MVar.Enum(Enums.FList)) :: acc1
@@ -590,9 +553,8 @@ object ConstraintCollection {
     case Expr.FixpointSolveWithProject(exps, _, _, _, _, _) =>
       exps.foldLeft(acc)((a, e) => visitExp(e, a))
 
-    // LOWERING
-    // InjectInto: Lowering synthesizes a call to Fixpoint3.Solver.injectIntoN(p, ts), generic
-    // over the container type constructor `f` and the tuple's own component types `t1..tn`.
+    // Lowering synthesizes Fixpoint3.Solver.injectIntoN(p, ts), generic over the container
+    // constructor and the tuple's component types.
     case Expr.FixpointInjectInto(exps, _, _, _, loc) =>
       exps.foldLeft(acc) { (a, e) =>
         val (tycon, argTypes) = dealias(e.tpe) match {
@@ -610,18 +572,10 @@ object ConstraintCollection {
         Flow(FlowInput.FlowArgs(flowArgs), MVar.Def(Defs.ProjectInto(argTypes.length))) :: a1
       }
 
-    // LOWERING
-    // Query-with-select: Lowering synthesizes a call to Fixpoint3.Solver.factsN(p, d), generic
-    // over the N selected terms' own types. (The query's embedded constraint set, reached via
-    // `queryExp`'s recursion into FixpointConstraintSet, already supplies the Box/liftN flows
-    // for the underlying rule itself — `selects`/`from`/`where` here are the same information,
-    // recursed into structurally only, as before.)
+    // Lowering synthesizes Fixpoint3.Solver.factsN(p, d), generic over the N selected terms'
+    // types. Facts(arity)'s flow args must come from the resolved result type `tpe0`, NOT from
+    // `selects`' own term types, which may still carry locally-scoped type vars.
     case Expr.FixpointQueryWithSelect(exps, queryExp, selects, from, where, _, tpe0, _, loc) =>
-      // Facts(arity)'s flow args come from the query's own resolved result type `tpe0`
-      // (Vector[(t1,...,tn)], or Vector[t1] for arity 1 — matching Facts's declared signature),
-      // NOT from `selects`' own term types: those are typed in the query's local/row-polymorphic
-      // scope and may still carry a locally-scoped type var never unified back into this def's
-      // own substitution (unlike an ordinary lexically-bound expression).
       val arity = selects.length
       val innerTpe = unwrapVectorType(tpe0, loc)
       val argTypes = if (arity <= 1) List(innerTpe) else innerTpe.typeArguments
@@ -636,10 +590,8 @@ object ConstraintCollection {
       val acc5 = where.foldLeft(acc4)((a, e) => visitExp(e, a))
       Flow(FlowInput.FlowArgs(argTypes.map(typeToMonoArg(_))), MVar.Def(Defs.Facts(arity))) :: acc5
 
-    // LOWERING
-    // Query-with-provenance: Lowering boxes every goal term, unboxes every term type of every
-    // predicate the extensible-variant result type can carry, and calls Solver.provenanceOf and
-    // (internally) Vector.get at a fixed Boxed type. See mkExtVarLambda/mkUnboxedTerm.
+    // Lowering boxes every goal term, unboxes every term type the extensible-variant result can
+    // carry, and calls Solver.provenanceOf and Vector.get at a fixed Boxed type.
     case Expr.FixpointQueryWithProvenance(exps, select, _, tpe0, _, loc) =>
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       val acc2 = select match {
@@ -657,30 +609,21 @@ object ConstraintCollection {
     case Expr.Error(_, _, _) => acc
   }
 
-  // ---- Datalog helpers --------------------------------------
-  //
-  // Each of these mirrors, structurally, the corresponding synthesis logic in
-  // SolutionLowering.scala (named in each doc comment).
-
   /**
-    * Strips `Type.Alias` wrappers before structural matching. Needed anywhere this file
-    * pattern-matches a raw `Type` directly (`typeToMonoArg` already dealiases on its own path) —
-    * unlike `SolutionLowering.scala`, which runs on an already-specialized MonoAst tree (aliases
-    * stripped earlier by `StrictSubstitution`), this file walks the raw, ground `TypedAst`, where
-    * a user type alias (e.g. `type alias X = List[Int32]`) is still intact. Also used by
-    * `visitType`/`getEnumMVarAndTypeArgs`: `Type.Alias` extends `Type.BaseType`, so without this,
-    * an enum/struct field declared via an alias name (e.g. `case Foo(BoxedDenotation)`) silently
-    * matches `visitType`'s `BaseType` catch-all instead of the `Type.Apply` case that emits its
-    * flow — no crash, just a silently missing flow for that instantiation.
+    * Strips `Type.Alias` wrappers before structural matching. Required: this file walks the raw
+    * `TypedAst` where user aliases are still intact, and `Type.Alias` extends `Type.BaseType`,
+    * so an unstripped alias would silently match the wrong case and drop a flow.
     */
   private def dealias(tpe: Type): Type = tpe match {
     case Type.Alias(_, _, inner, _) => dealias(inner)
     case t => t
   }
 
+  /** Returns `true` iff `sym` is bound by one of the constraint params `cparams0`. */
   private def isQuantifiedVar(sym: Symbol.VarSym, cparams0: List[TypedAst.ConstraintParam]): Boolean =
     cparams0.exists(p => p.bnd.sym == sym)
 
+  /** Returns the free variables of `exp0` that are bound by the constraint params `cparams0`. */
   private def quantifiedVars(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr): List[(Symbol.VarSym, Type)] =
     TypedAstOps.freeVars(exp0).toList.filter { case (sym, _) => isQuantifiedVar(sym, cparams0) }
 
@@ -747,11 +690,9 @@ object ConstraintCollection {
 
   /**
     * Flows for `Fixpoint3.Ast.Shared.lattice`/`box`/`Denotation`, mirroring
-    * `SolutionLowering.mkDenotation`. The `Relational` case constructs a `Denotation[Boxed]` value
-    * directly via `mkTag`, bypassing the ordinary TypedAst-level rewrite path entirely, so its
-    * enum-construction flow must be predicted here the same way channels/Box/Unbox/liftN already
-    * are, or `enumTable` never gets an entry for it and `SolutionSpecialization`'s post-lowering
-    * rewrite pass silently falls back to the original, unspecialized `Denotation` declaration.
+    * `SolutionLowering.mkDenotation`. The `Relational` case constructs a `Denotation[Boxed]`
+    * directly via `mkTag` (bypassing the ordinary rewrite path), so its enum-construction flow
+    * must be predicted here or `enumTable` never gets an entry for it.
     */
   private def latticeFlows(den: Denotation, lastTermType: Option[Type], loc: SourceLocation, acc: List[Flow])(implicit ctx: Context): List[Flow] = den match {
     case Denotation.Relational =>
@@ -783,15 +724,10 @@ object ConstraintCollection {
   }
 
   /**
-    * Mirrors `SolutionLowering.termTypesOfRelation`, with one addition: `SolutionLowering` runs
-    * post-solve, where a stray `Kind.Star` var reaching this point has already been defaulted to
-    * `AnyType` (its own `AnyType` case, kept below); this file runs pre-solve, on raw `TypedAst`,
-    * where a relation belonging to an unused/under-constrained provenance predicate can still be
-    * a genuinely-unresolved bare `Type.Var` at this point. Correctness requirement: such a var
-    * must NOT be defaulted through to an Unbox flow (that defaulting is unsound specifically for
-    * Box/Unbox/liftN) — so it is simply skipped here
-    * (no term types recoverable for this relation) rather than defaulted or thrown: a genuine miss
-    * still surfaces as a clean Solver gap downstream, exactly as it would if no flow existed here.
+    * Mirrors `SolutionLowering.termTypesOfRelation`, with one addition: this file runs pre-solve,
+    * where a relation of an under-constrained provenance predicate can still be a bare
+    * `Type.Var`. Such a var is skipped (not defaulted — that would be unsound for Box/Unbox/liftN
+    * flows, and a genuine miss still surfaces as a clean solver gap downstream).
     */
   private def termTypesOfRelation(rel: Type, loc: SourceLocation): List[Type] = {
     def flattenApply(rel0: Type, loc0: SourceLocation): List[Type] = rel0 match {
@@ -827,15 +763,10 @@ object ConstraintCollection {
 
   /**
     * Rewrites `Sender[t]`/`Receiver[t]` to `Concurrent.Channel.Mpmc[t, IO]`, recursively —
-    * mirrors `SolutionLowering.lowerType`'s Sender/Receiver case.
-    *
-    * Used ONLY when building flows for the `@LoweringTargetChannel` defs (`Defs.ChannelGet` /
-    * `ChannelPut` / `ChannelNewTuple`), because `SolutionLowering.mkGetChannel` / `mkPutChannel` /
-    * `mkNewChannel` query `lookup` with a type that has already been run through
-    * `SolutionLowering.lowerType`. It must NOT be applied inside `typeToMonoArg` generally: an
-    * ordinary def's own specialization key (e.g. `Channel.send`) is built from `subst(itpe)`,
-    * which never calls `lowerType` and so keeps `Sender`/`Receiver` unexpanded — rewriting those
-    * flows too would corrupt that def's own defTable key instead of fixing the channel-def one.
+    * mirrors `SolutionLowering.lowerType`'s Sender/Receiver case. Used ONLY for flows targeting
+    * the `@LoweringTargetChannel` defs, whose lookup keys are built from lowered types; it must
+    * NOT be applied in `typeToMonoArg` generally, or ordinary defs' keys (e.g. `Channel.send`,
+    * which keep `Sender`/`Receiver`) would be corrupted.
     */
   private[monomorph2] def lowerChannelType(tpe: Type): Type = tpe match {
     case Type.Apply(Type.Cst(TypeConstructor.Sender, loc), elm, _) =>
@@ -868,25 +799,10 @@ object ConstraintCollection {
       ctx.tparamEnv.get(sym) match {
         case Some(idx) => MonoArg.Param(ctx.currentDecl, idx)
         case None =>
-          // DESIGN NOTE — locally-scoped type variables (e.g. region vars):
-          //
-          // Unlike Specialization.scala (which is demand-driven and always has a fully-ground
-          // substitution when it descends into a def body), we process every def statically
-          // with only its *declared* type parameters in scope. This means we can encounter
-          // type variables that are NOT type parameters of the current def — specifically,
-          // region variables introduced by `region r { ... }` expressions, which are fresh
-          // variables local to that expression and do not appear in `spec.tparams`.
-          //
-          // Example: `def f(): Unit = region r { Array.empty(r, 0); () }`
-          // When visiting the `ApplyDef(Array.empty, targs=[r, Int32])` inside the region,
-          // `r` is a Type.Var with no entry in tparamEnv.
-          //
-          // The correct treatment here mirrors Specialization.defaultType: region vars do not
-          // drive specialization, so we record them as an opaque constant. The resulting Flow
-          // is still emitted (preserving reachability), but the region arg is fixed and the
-          // solver will not propagate it further. If this causes incorrect constraints in the
-          // future, look here first — the fix might require tracking region vars separately
-          // or filtering them out of the flow args.
+          // A type variable that is not a tparam of the current decl — e.g. a region var
+          // introduced by `region r { ... }`, which is local to the expression. Mirroring
+          // Specialization.defaultType, such vars do not drive specialization: record them as an
+          // opaque constant so the flow is still emitted but the solver does not propagate them.
           MonoArg.Const(tpe)
       }
     case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
