@@ -109,12 +109,8 @@ private[monomorph2] object MonomorphDebug {
     flows.flatMap { case Flow(FlowInput.FlowArgs(args), dst) => Set(dst) ++ args.flatMap(collectMVars) }
 
   /** Returns every `MVar` referenced by a `Param` inside `arg`. */
-  private def collectMVars(arg: MonoArg): List[MVar] = arg match {
-    case MonoArg.Param(v, _)          => List(v)
-    case MonoArg.Const(_)             => Nil
-    case MonoArg.App(tc, args)        => collectMVars(tc) ++ args.flatMap(collectMVars)
-    case MonoArg.Assoc(_, arg1, _, _) => collectMVars(arg1)
-  }
+  private def collectMVars(arg: MonoArg): List[MVar] =
+    ConstraintCollection.collectParams(arg).map(_._1)
 
   /** Returns summary stats for `flows`: total flow/MVar counts plus a per-kind breakdown. */
   private def stats(flows: Set[Flow]): List[String] = {

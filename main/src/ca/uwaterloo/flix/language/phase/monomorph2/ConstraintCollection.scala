@@ -88,6 +88,14 @@ object ConstraintCollection {
     case class Assoc(sym: Symbol.AssocTypeSym, arg: MonoArg, kind: Kind, loc: SourceLocation) extends MonoArg
   }
 
+  /** Returns every `(MVar, index)` pair referenced by a `Param` inside `arg`, however deeply wrapped. */
+  def collectParams(arg: MonoArg): List[(MVar, Int)] = arg match {
+    case MonoArg.Const(_)          => Nil
+    case MonoArg.Param(v, i)       => List((v, i))
+    case MonoArg.App(tycon, args)  => collectParams(tycon) ++ args.flatMap(collectParams)
+    case MonoArg.Assoc(_, a, _, _) => collectParams(a)
+  }
+
   sealed trait FlowInput
   object FlowInput {
     case class FlowArgs(args: List[MonoArg]) extends FlowInput

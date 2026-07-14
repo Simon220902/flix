@@ -106,7 +106,7 @@ object NonMonomorphizableCheck {
     */
   def checkMonomorphizable(flows: Set[Flow]): Unit = {
     // Edges and seeds are computed in one pass over each flow's args: a position's
-    // `collectParamsWithIndex(arg)` result is needed for both the growing-edge classification and
+    // `collectParams(arg)` result is needed for both the growing-edge classification and
     // the seed check (`.isEmpty`), so computing it once and reusing it avoids a redundant
     // structural walk over `arg`.
     val edgesBuilder = List.newBuilder[Edge]
@@ -130,7 +130,7 @@ object NonMonomorphizableCheck {
           // `Fixpoint3.Phase.ProvenanceAugment.augmentOp`, region-polymorphic in its effect `r`
           // over an otherwise fixed, non-generic AST) would be misclassified as a growing cycle.
           case _ =>
-            val ps = collectParamsWithIndex(arg).distinct
+            val ps = collectParams(arg).distinct
             if (ps.isEmpty) seedsBuilder += dstV
             else {
               val growing = !isBoundedSetOp(arg)
@@ -213,14 +213,6 @@ object NonMonomorphizableCheck {
     case _: TypeConstructor.CaseUnion | _: TypeConstructor.CaseIntersection |
          _: TypeConstructor.CaseComplement | _: TypeConstructor.CaseSymmetricDiff => true
     case _ => false
-  }
-
-  /** Every `(MVar, position)` pair reachable inside `arg`, however deeply wrapped. */
-  private def collectParamsWithIndex(arg: MonoArg): List[(MVar, Int)] = arg match {
-    case MonoArg.Const(_)          => Nil
-    case MonoArg.Param(v, i)       => List((v, i))
-    case MonoArg.App(tycon, args)  => collectParamsWithIndex(tycon) ++ args.flatMap(collectParamsWithIndex)
-    case MonoArg.Assoc(_, a, _, _) => collectParamsWithIndex(a)
   }
 
   private def mvarLoc(mvar: MVar): SourceLocation = mvar match {

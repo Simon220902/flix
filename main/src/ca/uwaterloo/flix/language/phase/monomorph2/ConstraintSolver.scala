@@ -126,21 +126,12 @@ object ConstraintSolver {
   private def buildDependents(flows: List[PreparedFlow]): Map[MVar, List[PreparedFlow]] = {
     val m = mutable.Map.empty[MVar, mutable.ListBuffer[PreparedFlow]]
     for (pf <- flows) {
-      for (v <- collectParamMVars(pf.args)) {
+      val mvars = pf.args.flatMap(arg => collectParams(arg)).map(_._1).toSet
+      for (v <- mvars) {
         m.getOrElseUpdate(v, mutable.ListBuffer.empty) += pf
       }
     }
     m.map { case (k, buf) => k -> buf.toList }.toMap
-  }
-
-  private def collectParamMVars(args: List[MonoArg]): Set[MVar] =
-    args.flatMap(collectParamMVarsArg).toSet
-
-  private def collectParamMVarsArg(arg: MonoArg): Set[MVar] = arg match {
-    case MonoArg.Const(_)            => Set.empty
-    case MonoArg.Param(v, _)         => Set(v)
-    case MonoArg.App(tc, args)       => collectParamMVarsArg(tc) ++ args.flatMap(collectParamMVarsArg).toSet
-    case MonoArg.Assoc(_, a, _, _)   => collectParamMVarsArg(a)
   }
 
   // ---- Arg collapse ------------------------------------------------------------
@@ -209,7 +200,7 @@ object ConstraintSolver {
   private def prepareFlow(flow: Flow, root: TypedAst.Root)(implicit flix: Flix): PreparedFlow = flow match {
     case Flow(FlowInput.FlowArgs(args), dst) =>
       val preCollapsed = args.map { arg =>
-        if (collectParamMVarsArg(arg).isEmpty) Some(collapseArg(arg, Map.empty, root))
+        if (collectParams(arg).isEmpty) Some(collapseArg(arg, Map.empty, root))
         else None
       }
       PreparedFlow(dst, args, preCollapsed)
