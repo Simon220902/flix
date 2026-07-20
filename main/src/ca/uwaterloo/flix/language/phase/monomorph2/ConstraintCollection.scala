@@ -31,9 +31,10 @@ import scala.annotation.tailrec
 /**
   * Constraint generation for constraint-based monomorphization.
   *
-  * Walks the treeshaken `TypedAst` root and, for every definition, enum, trait instance, and
-  * default trait implementation, emits `Flow` constraints describing how concrete types and type
-  * shapes propagate into the type-parameter slots of the definitions and enums it references.
+  * Walks the treeshaken `TypedAst` root and, for every definition, enum, trait instance, default
+  * trait implementation, and effect operation signature, emits `Flow` constraints describing how
+  * concrete types and type shapes propagate into the type-parameter slots of the definitions and
+  * enums it references.
   * `ConstraintSolver` later solves these constraints to find every concrete instantiation each
   * definition/enum needs to be specialized at.
   */
@@ -156,6 +157,19 @@ object ConstraintCollection {
       }
     }.flatten.toSet
 
+    // Effect operations have a Spec (fparams/retTpe) like defs, but no body to visit — only their
+    // declared signature can ever reach an enum/struct, so this only needs visitDef's first two
+    // lines, not the full def walk. No MVar.Op exists (nothing ever specializes an op itself); a
+    // synthetic DefnSym is only the Context's placeholder for the op's own tparam positions, same
+    // trick fromSigs uses for a sig's trait-level tparam.
+    val fromEffects = ParOps.parMap(root.effects.values.flatMap(_.ops)) { op =>
+      val tparamEnv = op.spec.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
+      val defnSym = new Symbol.DefnSym(None, op.sym.namespace, op.sym.name, op.sym.loc)
+      implicit val ctx: Context = Context(MVar.Def(defnSym), tparamEnv, root, flix)
+      val acc1 = op.spec.fparams.foldLeft(List.empty[Flow]) { case (a, FormalParam(_, tpe, _, _, _)) => visitType(tpe, a) }
+      visitType(op.spec.retTpe, acc1)
+    }.flatten.toSet
+
     val fromRestrictableEnums = ParOps.parMap(root.restrictableEnums.values) { enm =>
       val tparamEnv = (enm.index :: enm.tparams).zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
       implicit val ctx: Context = Context(MVar.RestrictableEnum(enm.sym), tparamEnv, root, flix)
@@ -187,7 +201,7 @@ object ConstraintCollection {
       }
     }.flatten.toSet
 
-    fromDefs ++ fromEnums ++ fromInstances ++ fromRestrictableEnums ++ fromStructs ++ fromSigs
+    fromDefs ++ fromEnums ++ fromInstances ++ fromRestrictableEnums ++ fromStructs ++ fromSigs ++ fromEffects
   }(MonomorphDebug.DebugFlows)
 
   // Performance: every visit* function threads an immutable `acc: List[Flow]` accumulator (cons,

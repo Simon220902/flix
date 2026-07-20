@@ -47,8 +47,11 @@ object SolutionSpecialization {
     * every specialization is known upfront from the solver solution.
     *
     * `defTable` maps (original sym, instantiated arrow type) → fresh specialized sym.
-    * `enumTable`/`structTable` mirror it for enums/structs, keyed by (original sym, ground
-    * type-arg tuple) — see `lookupCaseSym`/`lookupStructSym`.
+    * `enumTable`/`structTable`/`restrictableEnumTable` mirror it for enums/structs/restrictable
+    * enums, keyed by (original sym, ground type-arg tuple) — see
+    * `lookupCaseSym`/`lookupStructSym`/`lookupRestrictableCaseSym`. `restrictableEnumTable` maps
+    * to a regular `EnumSym`: restrictable enums lower to regular enums (the restriction itself is
+    * erased, checking already concluded), so they need no fresh-symbol infrastructure of their own.
     *
     * Package-visible: `[[SolutionLowering]]` needs it as the type its `ctx` implicit is threaded
     * through.
@@ -58,6 +61,7 @@ object SolutionSpecialization {
     val allDefs: Map[Symbol.DefnSym, TypedAst.Def],
     val enumTable: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym],
     val structTable: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym],
+    val restrictableEnumTable: Map[(Symbol.RestrictableEnumSym, List[Type]), Symbol.EnumSym],
     // Carried here (rather than as a separate implicit threaded through every SolutionLowering
     // helper) solely for the fused walk's ApplySig case, which calls resolveSigSym.
     val instances: Map[(Symbol.TraitSym, TypeConstructor), Instance]
@@ -127,6 +131,24 @@ object SolutionSpecialization {
       case None =>
         throw InternalCompilerException(
           s"Solver gap: no enum specialization for ${caseSym.enumSym} at $argTypes. " +
+          "Extend the constraint generator to cover this call site.", caseSym.loc)
+    }
+  }
+
+  /**
+    * Returns the (regular) case sym to use for a restrictable tag/pattern whose original
+    * restrictable case is `caseSym` and whose ground restrictable-enum type at this expression
+    * site is `groundEnumTpe`. Unlike `lookupCaseSym`, there is no "non-generic keeps original sym"
+    * branch: a restrictable enum's type-argument list always starts with its case-set index
+    * (`Kind.CaseSet`), so `argTypes` is never empty — every reference must be in the table.
+    */
+  private[monomorph2] def lookupRestrictableCaseSym(caseSym: Symbol.RestrictableCaseSym, groundEnumTpe: Type)(implicit ctx: Context): Symbol.CaseSym = {
+    val argTypes = groundEnumTpe.typeArguments
+    ctx.restrictableEnumTable.get((caseSym.enumSym, argTypes)) match {
+      case Some(freshEnumSym) => new Symbol.CaseSym(freshEnumSym, caseSym.name, -1, caseSym.loc)
+      case None =>
+        throw InternalCompilerException(
+          s"Solver gap: no restrictable enum specialization for ${caseSym.enumSym} at $argTypes. " +
           "Extend the constraint generator to cover this call site.", caseSym.loc)
     }
   }
@@ -209,13 +231,6 @@ object SolutionSpecialization {
         TypedAst.Case(sym, tpes.map(MonomorphCanon.simplify(_, isGround = false)), sc, loc)
     }
 
-  /** Simplifies the types embedded in `caze`. */
-  private def visitRestrictableEnumCase(caze: TypedAst.RestrictableCase)(implicit root: TypedAst.Root, flix: Flix): TypedAst.RestrictableCase =
-    caze match {
-      case TypedAst.RestrictableCase(caseSym0, tpes, sc, loc) =>
-        TypedAst.RestrictableCase(caseSym0, tpes.map(MonomorphCanon.simplify(_, isGround = false)), sc, loc)
-    }
-
   /** Applies `StrictSubstitution.empty` to the types embedded in `op`. */
   private def visitEffectOp(op: TypedAst.Op)(implicit root: TypedAst.Root, flix: Flix): TypedAst.Op =
     op match {
@@ -224,7 +239,12 @@ object SolutionSpecialization {
           case TypedAst.FormalParam(varSym, tpe, src, decreasing, fpLoc) =>
             TypedAst.FormalParam(varSym, StrictSubstitution.empty(tpe), src, decreasing, fpLoc)
         }
-        val spec = TypedAst.Spec(doc, ann, mod, tparams, fparams, declaredScheme, StrictSubstitution.empty(retTpe), StrictSubstitution.empty(eff), tconstrs, econstrs)
+        // declaredScheme.base needs the same canonicalization as fparams/retTpe/eff below — its
+        // only consumer, SolutionLowering.lowerSpec, feeds it straight into functionType, and an
+        // un-canonicalized type doesn't structurally match enumTable/structTable's keys (built
+        // from canonicalized tuples throughout), so rewriteEnumStructType silently misses.
+        val canonScheme = declaredScheme.copy(base = StrictSubstitution.empty(declaredScheme.base))
+        val spec = TypedAst.Spec(doc, ann, mod, tparams, fparams, canonScheme, StrictSubstitution.empty(retTpe), StrictSubstitution.empty(eff), tconstrs, econstrs)
         TypedAst.Op(sym, spec, loc)
     }
 
@@ -278,11 +298,14 @@ object SolutionSpecialization {
   // keys would themselves already be rewritten and never match.
 
   /**
-    * Structurally rewrites `tpe`: any `Enum(sym, args)`/`Struct(sym, args)` sub-type whose
-    * `(sym, args)` pair is a key in `ctx.enumTable`/`structTable` becomes `Enum(freshSym, Nil)`/
-    * `Struct(freshSym, Nil)` (fully specialized, no more type arguments); anything else is left
-    * alone except for recursing into its own sub-parts (which may themselves need rewriting,
-    * e.g. `List[Option[Int32]]` needs both `List` and `Option` rewritten if both were specialized).
+    * Structurally rewrites `tpe`: any `Enum(sym, args)`/`Struct(sym, args)`/
+    * `RestrictableEnum(sym, args)` sub-type whose `(sym, args)` pair is a key in
+    * `ctx.enumTable`/`ctx.structTable`/`ctx.restrictableEnumTable` becomes `Enum(freshSym, Nil)`/
+    * `Struct(freshSym, Nil)` (fully specialized, no more type arguments) — note a
+    * `RestrictableEnum` reference becomes a plain `Enum` type too, since that table maps to a
+    * regular `EnumSym`; anything else is left alone except for recursing into its own sub-parts
+    * (which may themselves need rewriting, e.g. `List[Option[Int32]]` needs both `List` and
+    * `Option` rewritten if both were specialized).
     *
     * Package-visible: `SolutionLowering.visitType` calls this inline at every type-construction
     * site in the fused walk (folding this rewrite into the same pass instead of a separate
@@ -294,6 +317,8 @@ object SolutionSpecialization {
       head match {
         case Type.Cst(TypeConstructor.Enum(sym, _), _) if ctx.enumTable.contains((sym, args)) =>
           Type.mkEnum(ctx.enumTable((sym, args)), Nil, loc)
+        case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) if ctx.restrictableEnumTable.contains((sym, args)) =>
+          Type.mkEnum(ctx.restrictableEnumTable((sym, args)), Nil, loc)
         case Type.Cst(TypeConstructor.Struct(sym, _), _) if ctx.structTable.contains((sym, args)) =>
           Type.mkStruct(ctx.structTable((sym, args)), Nil, loc)
         case _ =>
@@ -453,6 +478,34 @@ object SolutionSpecialization {
     val enumTableMap: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym] =
       enumEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
 
+    // Same shape as enumEntries, except: (a) the tuple is zipped against `index :: tparams` (the
+    // case-set index is always the first solved type argument — see ConstraintCollection's
+    // fromRestrictableEnums), and (b) the built declaration is an ordinary TypedAst.Enum, not a
+    // TypedAst.RestrictableEnum — restrictable enums lower to regular enums, so their specialized
+    // copies can go straight through the same SolutionLowering.lowerEnum as regular enums.
+    val restrictableEnumEntries: List[(Symbol.RestrictableEnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
+      for {
+        (sym, tuples) <- solution.restrictableEnums.toList
+        enm           <- root.restrictableEnums.get(sym).toList
+        tuple         <- tuples.toList
+        substMap       = (enm.index :: enm.tparams).zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
+        freshSym       = Symbol.freshEnumSym(SolutionLowering.lowerRestrictableEnumSym(sym))
+        subst         <- try {
+                           List(StrictSubstitution.mk(Substitution(substMap)))
+                         } catch {
+                           case _: InternalCompilerException => Nil
+                         }
+      } yield {
+        val newCases = enm.cases.map { case (caseSym, TypedAst.RestrictableCase(_, tpes, sc, cloc)) =>
+          val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, -1, caseSym.loc)
+          newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
+        }
+        (sym, tuple, freshSym, TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc))
+      }
+
+    val restrictableEnumTableMap: Map[(Symbol.RestrictableEnumSym, List[Type]), Symbol.EnumSym] =
+      restrictableEnumEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
+
     val structEntries: List[(Symbol.StructSym, List[Type], Symbol.StructSym, TypedAst.Struct)] =
       for {
         (sym, tuples) <- solution.structs.toList
@@ -477,7 +530,7 @@ object SolutionSpecialization {
     val structTableMap: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym] =
       structEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
 
-    implicit val ctx: Context = new Context(defTableMap, allDefs, enumTableMap, structTableMap, is)
+    implicit val ctx: Context = new Context(defTableMap, allDefs, enumTableMap, structTableMap, restrictableEnumTableMap, is)
 
     // Biggest-first scheduling (same convention as Typer.scala/Lexer.scala/Weeder2.scala/
     // Parser2.scala's ParOps.*WithPriority uses): starting the largest defs' work first reduces
@@ -516,15 +569,16 @@ object SolutionSpecialization {
         rewriteEffect(SolutionLowering.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc)))
     }
 
-    // Original enum/struct declarations are all kept alongside the specialized ones below, never
-    // replaced. Needed because: (a) SolutionLowering synthesizes MonoAst constructions (Datalog
-    // runtime enums such as Fixpoint3.Ast.*, `FList`, `PredSym`, `Denotation`) that reference
-    // original syms and bypass the Expr.Tag/StructNew rewrite; (b) non-parametric enums/structs
-    // keep their original syms; (c) restrictable enums stay on their original (lowered) syms.
-    // Nothing downstream prunes unused enum/struct declarations — TreeShaker1 only prunes
-    // defs/instances/sigs, and runs before this phase — so genuinely-unused originals currently
-    // survive to codegen; pruning them is a known follow-up.
-    val enums = ParOps.parMapValues(root.enums) {
+    // Generic originals (tparams.nonEmpty) are dropped: every reachable instantiation already has
+    // a specialized copy in enumEntries (built from the solver solution above), and every
+    // construction/pattern site is routed there via the strict lookupCaseSym/lookupStructSym —
+    // including SolutionLowering's Datalog runtime enums (Fixpoint3.Ast.*, `FList`, `PredSym`,
+    // `Denotation`), which are ordinary solver-predicted instantiations like any other. Only
+    // non-parametric declarations keep their original sym, since they were never specialized in
+    // the first place. Restrictable enums have no non-parametric case at all (their type-argument
+    // list always starts with the case-set index) — see specializedRestrictableEnums below, which
+    // replaces them the same way.
+    val enums = ParOps.parMapValues(root.enums.filter { case (_, e) => e.tparams.isEmpty }) {
       case TypedAst.Enum(doc, ann, mod, sym, tparams, derives, cases, loc) =>
         SolutionLowering.lowerEnum(TypedAst.Enum(doc, ann, mod, sym, tparams, derives, MapOps.mapValues(cases)(visitEnumCase), loc))
     }
@@ -535,12 +589,12 @@ object SolutionSpecialization {
     val specializedEnums: Map[Symbol.EnumSym, MonoAst.Enum] =
       ParOps.parMap(enumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SolutionLowering.lowerEnum(newEnum) }.toMap
 
-    val restrictableEnums = ParOps.parMapValues(root.restrictableEnums) {
-      case TypedAst.RestrictableEnum(doc, ann, mod, sym, index, tparams, derives, cases, loc) =>
-        SolutionLowering.lowerRestrictableEnum(TypedAst.RestrictableEnum(doc, ann, mod, sym, index, tparams, derives, MapOps.mapValues(cases)(visitRestrictableEnumCase), loc))
-    }
+    // Same shape as specializedEnums, per restrictableEnumEntries — see lookupRestrictableCaseSym,
+    // which is what makes Expr.RestrictableTag/RestrictableChoosePattern reference these fresh syms.
+    val specializedRestrictableEnums: Map[Symbol.EnumSym, MonoAst.Enum] =
+      ParOps.parMap(restrictableEnumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SolutionLowering.lowerEnum(newEnum) }.toMap
 
-    val structs = ParOps.parMapValues(root.structs) {
+    val structs = ParOps.parMapValues(root.structs.filter { case (_, s) => s.tparams.isEmpty }) {
       case TypedAst.Struct(doc, ann, mod, sym, tparams, sc, fields, loc) =>
         SolutionLowering.lowerStruct(TypedAst.Struct(doc, ann, mod, sym, tparams, sc, MapOps.mapValues(fields)(visitStructField), loc))
     }
@@ -555,7 +609,7 @@ object SolutionSpecialization {
 
     MonoAst.Root(
       ctx.getSpecializedDefs,
-      enums ++ specializedEnums ++ restrictableEnums.map { case (_, v) => v.sym -> v },
+      enums ++ specializedEnums ++ specializedRestrictableEnums,
       structs ++ specializedStructs,
       effects,
       root.mainEntryPoint,

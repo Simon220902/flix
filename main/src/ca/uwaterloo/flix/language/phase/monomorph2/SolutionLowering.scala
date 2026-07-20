@@ -24,7 +24,7 @@ import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.TypedAst.ApplyPosition
 import ca.uwaterloo.flix.language.ast.shared.{BoundBy, Constant, Decreasing, Denotation, Fixity, Mutability, Polarity, PredicateAndArity, RegionScope, SolveMode, SymUse, TypeSource}
 import ca.uwaterloo.flix.language.ast.{AtomicOp, MonoAst, Name, SemanticOp, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
-import ca.uwaterloo.flix.language.phase.monomorph2.SolutionSpecialization.{Context, StrictSubstitution, lookupCaseSym, lookupStructSym, lookupSym, resolveSigSym, specializeFormalParam, specializeFormalParams}
+import ca.uwaterloo.flix.language.phase.monomorph2.SolutionSpecialization.{Context, StrictSubstitution, lookupCaseSym, lookupRestrictableCaseSym, lookupStructSym, lookupSym, resolveSigSym, specializeFormalParam, specializeFormalParams}
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Enums, Types}
 import ca.uwaterloo.flix.util.{InternalCompilerException, JvmUtils, Result}
 import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
@@ -146,35 +146,21 @@ object SolutionLowering {
 
   /**
     * Lowers the given enum `enum0`.
+    *
+    * Case field types are routed through [[visitTypeSubstituted]], not bare [[lowerType]], so a
+    * nested enum/struct reference (e.g. `Set`'s field referencing `RedBlackTree[a]`) is rewritten
+    * to its own specialized sym too — otherwise a specialized declaration's fields would still
+    * point at generic originals that Step 1 stopped emitting.
     */
-  protected[monomorph2] def lowerEnum(enum0: TypedAst.Enum): MonoAst.Enum = enum0 match {
+  protected[monomorph2] def lowerEnum(enum0: TypedAst.Enum)(implicit ctx: Context): MonoAst.Enum = enum0 match {
     case TypedAst.Enum(doc, ann, mod, sym, tparams0, _, cases0, loc) =>
       val tparams = tparams0.map(lowerTypeParam)
       val cases = cases0.map {
         case (_, TypedAst.Case(caseSym, tpes0, _, caseLoc)) =>
-          val tpes = tpes0.map(lowerType)
+          val tpes = tpes0.map(visitTypeSubstituted)
           (caseSym, MonoAst.Case(caseSym, tpes, caseLoc))
       }
       MonoAst.Enum(doc, ann, mod, sym, tparams, cases, loc)
-  }
-
-  /**
-    * Lowers the given enum `enum0` from a restrictable enum into a regular enum.
-    */
-  protected[monomorph2] def lowerRestrictableEnum(enum0: TypedAst.RestrictableEnum): MonoAst.Enum = enum0 match {
-    case TypedAst.RestrictableEnum(doc, ann, mod, sym0, index0, tparams0, _, cases0, loc) =>
-      // index is erased since related checking has concluded.
-      // Restrictable tag is lowered into a regular tag
-      val index = lowerTypeParam(index0)
-      val tparams = tparams0.map(lowerTypeParam)
-      val cases = cases0.map {
-        case (_, TypedAst.RestrictableCase(caseSym0, tpes0, _, caseLoc)) =>
-          val tpes = tpes0.map(lowerType)
-          val caseSym = lowerRestrictableCaseSym(caseSym0)
-          (caseSym, MonoAst.Case(caseSym, tpes, caseLoc))
-      }
-      val sym = lowerRestrictableEnumSym(sym0)
-      MonoAst.Enum(doc, ann, mod, sym, index :: tparams, cases, loc)
   }
 
   /**
@@ -188,13 +174,14 @@ object SolutionLowering {
   }
 
   /**
-    * Lowers the given struct `struct0`.
+    * Lowers the given struct `struct0`. Field types go through [[visitTypeSubstituted]] — see
+    * [[lowerEnum]]'s doc comment for why bare [[lowerType]] is not enough here.
     */
-  protected[monomorph2] def lowerStruct(struct0: TypedAst.Struct): MonoAst.Struct = struct0 match {
+  protected[monomorph2] def lowerStruct(struct0: TypedAst.Struct)(implicit ctx: Context): MonoAst.Struct = struct0 match {
     case TypedAst.Struct(doc, ann, mod, sym, tparams0, _, fields0, loc) =>
       val tparams = tparams0.map(lowerTypeParam)
       val fields = fields0.map {
-        case (fieldSym, field) => MonoAst.StructField(fieldSym, lowerType(field.tpe), loc)
+        case (fieldSym, field) => MonoAst.StructField(fieldSym, visitTypeSubstituted(field.tpe), loc)
       }
       MonoAst.Struct(doc, ann, mod, sym, tparams, fields.toList, loc)
   }
@@ -398,11 +385,12 @@ object SolutionLowering {
       MonoAst.Expr.ApplyAtomic(AtomicOp.Tag(newSym), es, visitTypeSubstituted(t), subst(eff), loc)
 
     case TypedAst.Expr.RestrictableTag(symUse, exps, tpe, eff, loc) =>
-      // Restrictable enums are not specialized, so this becomes an ordinary tag.
-      val caseSym = lowerRestrictableCaseSym(symUse.sym)
+      // Same shape as Expr.Tag above: the tag's own (substituted, pre-lowering) type is the
+      // lookup key, and the rewrite runs after the lookup, not before.
+      val t = subst(tpe)
+      val newSym = lookupRestrictableCaseSym(symUse.sym, t)
       val es = exps.map(visitExp(_, env0, subst))
-      val t = visitType(tpe, subst)
-      MonoAst.Expr.ApplyAtomic(AtomicOp.Tag(caseSym), es, t, subst(eff), loc)
+      MonoAst.Expr.ApplyAtomic(AtomicOp.Tag(newSym), es, visitTypeSubstituted(t), subst(eff), loc)
 
     case TypedAst.Expr.ExtTag(label, exps, tpe, eff, loc) =>
       val es = exps.map(visitExp(_, env0, subst))
@@ -898,18 +886,14 @@ object SolutionLowering {
             case TypedAst.RestrictableChoosePattern.Wild(wildTpe, wildLoc) => MonoAst.Pattern.Wild(subst(wildTpe), wildLoc)
             case TypedAst.RestrictableChoosePattern.Error(_, errLoc) => throw InternalCompilerException("unexpected restrictable choose variable", errLoc)
           }
-          val tagSymUse = lowerRestrictableCaseSymUse(symUse)
-          val p = MonoAst.Pattern.Tag(tagSymUse, termPatterns, visitType(tpe, subst), loc)
+          // Same shape as Pattern.Tag in visitPat: the pattern's own (substituted) type is the
+          // scrutinee's ground restrictable-enum type, i.e. the lookup key.
+          val t = subst(tpe)
+          val newSym = lookupRestrictableCaseSym(symUse.sym, t)
+          val p = MonoAst.Pattern.Tag(SymUse.CaseSymUse(newSym, symUse.loc), termPatterns, visitTypeSubstituted(t), loc)
           MonoAst.MatchRule(p, None, visitExp(exp, env, subst))
         case TypedAst.RestrictableChoosePattern.Error(_, loc) => throw InternalCompilerException("unexpected error restrictable choose pattern", loc)
       }
-  }
-
-  /**
-    * Lowers `sym` from a restrictable case sym use into a regular case sym use.
-    */
-  private def lowerRestrictableCaseSymUse(symUse: SymUse.RestrictableCaseSymUse): SymUse.CaseSymUse = {
-    SymUse.CaseSymUse(lowerRestrictableCaseSym(symUse.sym), symUse.sym.loc)
   }
 
   private def visitExtPat(pat0: TypedAst.ExtPattern, subst: StrictSubstitution)(implicit ctx: Context, root: TypedAst.Root, flix: Flix): (MonoAst.ExtPattern, Map[Symbol.VarSym, Symbol.VarSym]) = pat0 match {
@@ -1018,9 +1002,11 @@ object SolutionLowering {
   }
 
   /**
-    * Lowers `sym` from a restrictable enum sym into a regular enum sym.
+    * Lowers `sym` from a restrictable enum sym into a regular enum sym — the base sym that
+    * `SolutionSpecialization.restrictableEnumEntries` calls `Symbol.freshEnumSym` on to mint each
+    * specialized copy.
     */
-  private def lowerRestrictableEnumSym(sym: Symbol.RestrictableEnumSym): Symbol.EnumSym =
+  private[monomorph2] def lowerRestrictableEnumSym(sym: Symbol.RestrictableEnumSym): Symbol.EnumSym =
     new Symbol.EnumSym(None, sym.namespace, sym.name, sym.loc)
 
   /**
@@ -1219,15 +1205,6 @@ object SolutionLowering {
     })
   }
 
-  /**
-    * Lowers `sym` from a restrictable case sym into a regular case sym.
-    *
-    * NB: Ordinal is -1 because restrictable enums do not have fixed ordinals.
-    */
-  private def lowerRestrictableCaseSym(sym: Symbol.RestrictableCaseSym): Symbol.CaseSym = {
-    val enumSym = lowerRestrictableEnumSym(sym.enumSym)
-    new Symbol.CaseSym(enumSym, sym.name, -1, sym.loc)
-  }
 
   /**
     * Returns a new channel tuple (sender, receiver) expression: `%%CHANNEL_NEW%%(m)` becomes

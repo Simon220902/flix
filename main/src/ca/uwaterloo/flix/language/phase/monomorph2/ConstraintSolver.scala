@@ -36,14 +36,16 @@ import scala.collection.mutable
 object ConstraintSolver {
 
   /**
-    * The result of constraint solving: for each polymorphic def/enum/struct symbol, the set of
-    * concrete type-argument tuples it must be specialized at. Restrictable enums are not tracked:
-    * no fresh-symbol infrastructure exists for them, so they stay polymorphic.
+    * The result of constraint solving: for each polymorphic def/enum/struct/restrictable-enum
+    * symbol, the set of concrete type-argument tuples it must be specialized at. A restrictable
+    * enum's tuple always starts with its case-set index (`Kind.CaseSet`) — see
+    * `ConstraintCollection.fromRestrictableEnums`.
     */
   case class Solution(
     defs: Map[Symbol.DefnSym, Set[List[Type]]],
     enums: Map[Symbol.EnumSym, Set[List[Type]]],
-    structs: Map[Symbol.StructSym, Set[List[Type]]]
+    structs: Map[Symbol.StructSym, Set[List[Type]]],
+    restrictableEnums: Map[Symbol.RestrictableEnumSym, Set[List[Type]]]
   )
 
   /**
@@ -112,7 +114,8 @@ object ConstraintSolver {
     Solution(
       defs = solution.collect { case (MVar.Def(sym), tuples) => sym -> tuples.toSet }.toMap,
       enums = solution.collect { case (MVar.Enum(sym), tuples) => sym -> tuples.toSet }.toMap,
-      structs = solution.collect { case (MVar.Struct(sym), tuples) => sym -> tuples.toSet }.toMap
+      structs = solution.collect { case (MVar.Struct(sym), tuples) => sym -> tuples.toSet }.toMap,
+      restrictableEnums = solution.collect { case (MVar.RestrictableEnum(sym), tuples) => sym -> tuples.toSet }.toMap
     )
   }(MonomorphDebug.DebugSolution)
 

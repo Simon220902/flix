@@ -141,14 +141,15 @@ private[monomorph2] object MonomorphDebug {
     }
 
     val header = List(
-      s"total symbols: ${solution.defs.size + solution.enums.size + solution.structs.size}",
-      s"total tuples: ${(solution.defs.values ++ solution.enums.values ++ solution.structs.values).map(_.size).sum}"
+      s"total symbols: ${solution.defs.size + solution.enums.size + solution.structs.size + solution.restrictableEnums.size}",
+      s"total tuples: ${(solution.defs.values ++ solution.enums.values ++ solution.structs.values ++ solution.restrictableEnums.values).map(_.size).sum}"
     ).mkString("\n")
 
     header + "\n\n" +
       section("Defs", MVar.Def(_), solution.defs) + "\n\n" +
       section("Enums", MVar.Enum(_), solution.enums) + "\n\n" +
-      section("Structs", MVar.Struct(_), solution.structs) + "\n"
+      section("Structs", MVar.Struct(_), solution.structs) + "\n\n" +
+      section("RestrictableEnums", MVar.RestrictableEnum(_), solution.restrictableEnums) + "\n"
   }
 
   /** Returns a DOT-safe node id for `mvar`. */
