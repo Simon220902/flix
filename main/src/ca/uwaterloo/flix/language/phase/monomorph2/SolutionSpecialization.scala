@@ -115,33 +115,20 @@ object SolutionSpecialization {
     *   there is only one possible instantiation, so nothing was ever entered into `enumTable`
     *   for it (mirrors `lookupSym`'s "truly non-parametric" case for defs).
     * - Generic enums: must be in `enumTable` (pre-populated from the solver solution).
-    * - Missing entries: crash with "Solver gap", same failure mode as `lookupSym` — except for a
-    *   dead-code `AnyType` default (`isAnyType`), which isn't a real gap (see its own doc comment).
+    * - Missing entries: crash with "Solver gap" — ALWAYS, including `AnyType`-containing tuples:
+    *   pattern-only instantiations are deliberately specialized at `AnyType` by
+    *   `ConstraintCollection.visitPat` (see its ⚠️ doc comment), so no tolerance exists here.
     */
   private[monomorph2] def lookupCaseSym(caseSym: Symbol.CaseSym, groundEnumTpe: Type)(implicit ctx: Context): Symbol.CaseSym = {
     val argTypes = groundEnumTpe.typeArguments
     ctx.enumTable.get((caseSym.enumSym, argTypes)) match {
       case Some(freshEnumSym) => new Symbol.CaseSym(freshEnumSym, caseSym.name, caseSym.ordinal, caseSym.loc)
-      case None if argTypes.isEmpty || argTypes.exists(isAnyType) => caseSym
+      case None if argTypes.isEmpty => caseSym
       case None =>
         throw InternalCompilerException(
           s"Solver gap: no enum specialization for ${caseSym.enumSym} at $argTypes. " +
           "Extend the constraint generator to cover this call site.", caseSym.loc)
     }
-  }
-
-  /**
-    * True if `tpe` is (or contains) `AnyType` — the defaulted type `MonomorphCanon` assigns to a
-    * stray, otherwise-unconstrained type var (e.g. an unreachable/dead pattern-match arm). A miss
-    * against `enumTable`/`structTable` at such a type isn't a real "Solver gap": the constraint
-    * generator never saw a real value constructed at this type because there isn't one — it's a
-    * typechecking artifact, not code that runs. Keeping the original sym is the same fallback
-    * already used for genuinely non-generic types.
-    */
-  private def isAnyType(tpe: Type): Boolean = tpe match {
-    case Type.Cst(TypeConstructor.AnyType, _) => true
-    case Type.Apply(t1, t2, _) => isAnyType(t1) || isAnyType(t2)
-    case _ => false
   }
 
   /**
@@ -154,23 +141,13 @@ object SolutionSpecialization {
     val argTypes = groundStructTpe.typeArguments
     ctx.structTable.get((sym, argTypes)) match {
       case Some(freshStructSym) => freshStructSym
-      case None if argTypes.isEmpty || argTypes.exists(isAnyType) => sym
+      case None if argTypes.isEmpty => sym
       case None =>
         throw InternalCompilerException(
           s"Solver gap: no struct specialization for $sym at $argTypes. " +
           "Extend the constraint generator to cover this call site.", groundStructTpe.loc)
     }
   }
-
-  /**
-    * Runs `lookup` (a `lookupCaseSym`/`lookupStructSym` call), falling back to `keep` if it
-    * throws — used where a "Solver gap" miss doesn't necessarily mean a real constraint-generator
-    * gap: post-lowering types don't always match the pre-lowering keys `enumTable`/`structTable`
-    * were built from. Package-visible: `SolutionLowering.mkTag`, which synthesizes `Tag`
-    * expressions outside the ordinary `Expr.Tag` rewrite path, is the sole caller.
-    */
-  private[monomorph2] def tolerant[A](lookup: => A, keep: => A): A =
-    try lookup catch { case _: InternalCompilerException => keep }
 
   // StrictSubstitution and RegionInstantiation below are verbatim from Specialization.scala.
 

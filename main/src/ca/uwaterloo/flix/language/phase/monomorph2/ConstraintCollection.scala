@@ -331,8 +331,9 @@ object ConstraintCollection {
     case Expr.Match(exp, rules, _, _, _) =>
       val acc1 = visitExp(exp, acc)
       rules.foldLeft(acc1) {
-        case (a, MatchRule(_, guardOpt, body, _)) =>
-          val a1 = guardOpt.foldLeft(a)((a2, g) => visitExp(g, a2))
+        case (a, MatchRule(pat, guardOpt, body, _)) =>
+          val a0 = visitPat(pat, a)
+          val a1 = guardOpt.foldLeft(a0)((a2, g) => visitExp(g, a2))
           visitExp(body, a1)
       }
 
@@ -446,7 +447,7 @@ object ConstraintCollection {
 
     // Lowering synthesizes Channel.get/put/newChannel calls for each non-last fragment.
     case Expr.ParYield(frags, exp, _, _, loc) =>
-      val acc1 = frags.foldLeft(acc)((a, f) => visitExp(f.exp, a))
+      val acc1 = frags.foldLeft(acc)((a, f) => visitExp(f.exp, visitPat(f.pat, a)))
       val acc2 = visitExp(exp, acc1)
       frags.init.foldLeft(acc2) { (a, frag) =>
         val elmType = frag.exp.tpe
@@ -607,6 +608,36 @@ object ConstraintCollection {
         Flow(FlowInput.FlowArgs(List(typeToMonoArg(extVarType))), MVar.Def(Defs.ProvenanceOf)) :: acc3
 
     case Expr.Error(_, _, _) => acc
+  }
+
+  /**
+    * Emits flow constraints for enum instantiations mentioned by patterns.
+    *
+    * ⚠️ IMPORTANT — DELIBERATE `AnyType` SPECIALIZATION. A pattern can mention an enum
+    * instantiation that no expression ever constructs, e.g.
+    * `match None { case Some(Ok(_)) => ... }`: no `Result` value exists anywhere, so its tparams
+    * are stray and default to `AnyType`. Without these flows the solver never proposes such
+    * tuples and `SolutionSpecialization.lookupCaseSym` would miss on the pattern's lookup.
+    * We deliberately specialize these instantiations AT `AnyType` like any other tuple: the
+    * resulting declarations are dead (no value of `AnyType` can exist; fields erase to `Object`),
+    * and in exchange every specialization lookup stays strict — a table miss is ALWAYS a
+    * compiler bug ("Solver gap"), never silently tolerated. Do NOT reintroduce a
+    * keep-the-original-sym fallback here or in the lookups. And NEVER let a defaulted `AnyType`
+    * reach `Fixpoint.Boxable`'s box/unbox: their unchecked casts turn an imprecise type into a
+    * silently wrong runtime value instead of dead code (see `termTypesOfRelation`).
+    */
+  private def visitPat(pat0: TypedAst.Pattern, acc: List[Flow])(implicit ctx: Context): List[Flow] = pat0 match {
+    case TypedAst.Pattern.Tag(_, pats, tpe, loc) =>
+      val (mvar, tpArgs) = getEnumMVarAndTypeArgs(tpe, loc)
+      val acc1 = pats.foldLeft(acc)((a, p) => visitPat(p, a))
+      Flow(FlowInput.FlowArgs(tpArgs.map(typeToMonoArg(_))), mvar) :: acc1
+    case TypedAst.Pattern.Tuple(elms, _, _) =>
+      elms.toList.foldLeft(acc)((a, p) => visitPat(p, a))
+    case TypedAst.Pattern.Record(pats, pat, _, _) =>
+      val acc1 = pats.foldLeft(acc)((a, lp) => visitPat(lp.pat, a))
+      visitPat(pat, acc1)
+    case TypedAst.Pattern.Wild(_, _) | TypedAst.Pattern.Var(_, _, _) | TypedAst.Pattern.Cst(_, _, _) | TypedAst.Pattern.Error(_, _) =>
+      acc
   }
 
   /**

@@ -1541,15 +1541,16 @@ object SolutionLowering {
     * lowered but NOT YET enum/struct-rewritten type, used both as `lookupCaseSym`'s key and
     * (rewritten) as the returned node's own type.
     *
-    * `sym` is almost always non-generic (Datalog/PredSym/etc. runtime AST nodes), for which the
-    * tolerant lookup is a no-op fallback; the two actually-generic exceptions are `Enums.FList`
-    * (`mkNil`/`mkCons`) and `Enums.Denotation` (`mkDenotation`'s `Relational` case). Because `mkTag`
-    * synthesizes its own `AtomicOp.Tag` node directly instead of going through `visitExp`'s Tag
-    * case, it must perform the case-sym lookup and the enum/struct-type rewrite itself.
+    * `sym` is almost always non-generic (Datalog/PredSym/etc. runtime AST nodes); the two
+    * actually-generic exceptions are `Enums.FList` (`mkNil`/`mkCons`) and `Enums.Denotation`
+    * (`mkDenotation`'s `Relational` case), whose instantiations `ConstraintCollection` predicts.
+    * Because `mkTag` synthesizes its own `AtomicOp.Tag` node directly instead of going through
+    * `visitExp`'s Tag case, it must perform the case-sym lookup and the enum/struct-type rewrite
+    * itself. The lookup is strict: a miss is a real constraint-generator gap.
     */
   private def mkTag(sym: Symbol.EnumSym, tag: String, exps: List[MonoAst.Expr], tpe: Type, loc: SourceLocation)(implicit ctx: Context, root: TypedAst.Root): MonoAst.Expr = {
     val caseSym0 = findCaseSym(sym, tag)
-    val caseSym = SolutionSpecialization.tolerant(SolutionSpecialization.lookupCaseSym(caseSym0, tpe), caseSym0)
+    val caseSym = SolutionSpecialization.lookupCaseSym(caseSym0, tpe)
     val t = SolutionSpecialization.rewriteEnumStructType(tpe)
     MonoAst.Expr.ApplyAtomic(AtomicOp.Tag(caseSym), exps, t, Type.Pure, loc)
   }
