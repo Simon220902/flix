@@ -17,7 +17,6 @@
 package ca.uwaterloo.flix.language.phase.monomorph2
 
 import ca.uwaterloo.flix.language.ast.{SourceLocation, Type, TypeConstructor}
-import ca.uwaterloo.flix.language.phase.monomorph2.ConstraintCollection._
 
 import scala.collection.mutable
 
@@ -35,7 +34,7 @@ case class NonMonomorphizableProgramException(message: String, loc: SourceLocati
   * [[ConstraintSolver.solve]]'s fixpoint loop would grow without bound and exhaust the heap.
   *
   * Following "The Simple Essence of Monomorphization" (§3.3.2), the flow set is reinterpreted as
-  * a graph over `(MVar, tuple-position)` vertices, and we look for a "growing cycle": a reachable
+  * a graph over `(MonoVar, tuple-position)` vertices, and we look for a "growing cycle": a reachable
   * cycle with at least one edge that wraps the flowing type in an additional type constructor
   * (`a` flowing into `List[a]`). Such a cycle arises from polymorphic recursion
   * (`def f(x: a): List[a] = ...f(lst)...`) or a non-regular recursive enum/struct
@@ -43,7 +42,7 @@ case class NonMonomorphizableProgramException(message: String, loc: SourceLocati
   * ordinary, convergent self-recursion and is fine. (The paper's third case — escaping
   * existentials — cannot arise: Flix has no existential types.)
   *
-  * Every `MVar` kind participates, including `RestrictableEnum` (which the `Solution` never
+  * Every `MonoVar` kind participates, including `RestrictableEnum` (which the `Solution` never
   * reports): the solver propagates flows uniformly regardless of destination kind, so a growing
   * cycle through any kind still diverges. The check over-approximates in one known way: a
   * non-regular enum whose growing case is declared but never constructed is still rejected once
@@ -53,7 +52,7 @@ case class NonMonomorphizableProgramException(message: String, loc: SourceLocati
 object NonMonomorphizableCheck {
 
   /** One tracked slot: the `pos`'th type-parameter position of `mvar`. */
-  private case class Vertex(mvar: MVar, pos: Int)
+  private case class Vertex(mvar: MonoVar, pos: Int)
 
   /** A graph edge: `src` flows into `dst`, `growing` iff it does so wrapped in a type constructor. */
   private case class Edge(src: Vertex, dst: Vertex, growing: Boolean)
@@ -65,7 +64,7 @@ object NonMonomorphizableCheck {
   def checkMonomorphizable(flows: Set[Flow]): Unit = {
     val edgesBuilder = List.newBuilder[Edge]
     val seedsBuilder = Set.newBuilder[Vertex]
-    for (Flow(FlowInput.FlowArgs(args), dst) <- flows) {
+    for (Flow(args, dst) <- flows) {
       for ((arg, i) <- args.zipWithIndex) {
         val dstV = Vertex(dst, i)
         arg match {
@@ -77,7 +76,7 @@ object NonMonomorphizableCheck {
           // as `r + IO` in self-recursion cannot diverge the way wrapping a value in `List[_]`
           // does.
           case _ =>
-            val ps = collectParams(arg).distinct
+            val ps = MonoArg.collectParams(arg).distinct
             if (ps.isEmpty) seedsBuilder += dstV
             else {
               val growing = !isBoundedSetOp(arg)
@@ -101,11 +100,11 @@ object NonMonomorphizableCheck {
       case Some(edge) =>
         throw NonMonomorphizableProgramException(
           s"Program is not monomorphizable: found an infinitely-growing recursive type " +
-          s"involving ${MonomorphDebug.mvarLabel(edge.src.mvar)}. This indicates polymorphic recursion " +
+          s"involving ${MonomorphDebug.monoVarLabel(edge.src.mvar)}. This indicates polymorphic recursion " +
           s"(e.g. `def f(x: a): List[a] = ...f(lst)...`) or a genuinely non-regular recursive " +
           s"enum/struct (e.g. `enum T[a] { case Base(a); case Recurse(T[Poly[a]]) }`) — Flix " +
           s"cannot generate a finite number of monomorphized copies for this definition.",
-          mvarLoc(edge.src.mvar)
+          monoVarLoc(edge.src.mvar)
         )
       case None => ()
     }
@@ -151,12 +150,12 @@ object NonMonomorphizableCheck {
   }
 
   /** Returns the source location of `mvar`'s declaration. */
-  private def mvarLoc(mvar: MVar): SourceLocation = mvar match {
-    case MVar.Def(sym)              => sym.loc
-    case MVar.Enum(sym)             => sym.loc
-    case MVar.Sig(sym)              => sym.loc
-    case MVar.RestrictableEnum(sym) => sym.loc
-    case MVar.Struct(sym)           => sym.loc
+  private def monoVarLoc(mvar: MonoVar): SourceLocation = mvar match {
+    case MonoVar.Def(sym)              => sym.loc
+    case MonoVar.Enum(sym)             => sym.loc
+    case MonoVar.Sig(sym)              => sym.loc
+    case MonoVar.RestrictableEnum(sym) => sym.loc
+    case MonoVar.Struct(sym)           => sym.loc
   }
 
   /**

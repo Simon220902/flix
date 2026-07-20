@@ -19,7 +19,7 @@ package ca.uwaterloo.flix.language.phase.monomorph2
 import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.{Kind, RigidityEnv, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.ast.shared.{RegionScope, SymUse}
-import ca.uwaterloo.flix.language.phase.monomorph2.ConstraintCollection._
+import ca.uwaterloo.flix.language.phase.monomorph2.ConstraintCollection.lowerChannelType
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols.Defs
 import ca.uwaterloo.flix.language.phase.typer.ConstraintSolver2
 import ca.uwaterloo.flix.util.InternalCompilerException
@@ -34,19 +34,6 @@ import scala.collection.mutable
   * type-argument tuples it must be specialized at.
   */
 object ConstraintSolver {
-
-  /**
-    * The result of constraint solving: for each polymorphic def/enum/struct/restrictable-enum
-    * symbol, the set of concrete type-argument tuples it must be specialized at. A restrictable
-    * enum's tuple always starts with its case-set index (`Kind.CaseSet`) — see
-    * `ConstraintCollection.fromRestrictableEnums`.
-    */
-  case class Solution(
-    defs: Map[Symbol.DefnSym, Set[List[Type]]],
-    enums: Map[Symbol.EnumSym, Set[List[Type]]],
-    structs: Map[Symbol.StructSym, Set[List[Type]]],
-    restrictableEnums: Map[Symbol.RestrictableEnumSym, Set[List[Type]]]
-  )
 
   /**
     * Solves `flows` to a fixpoint and returns the set of required specializations.
@@ -65,13 +52,13 @@ object ConstraintSolver {
     // keys of ordinary defs (e.g. Channel.send) whose own key keeps Sender/Receiver.
     val channelDefs = Set(Defs.ChannelGet, Defs.ChannelPut, Defs.ChannelNewTuple, Defs.ChannelMpmcAdmin, Defs.ChannelUnsafeGetAndUnlock)
 
-    val solution  = mutable.Map.empty[MVar, mutable.Set[List[Type]]]
-    val inFlight  = mutable.Set.empty[(MVar, List[Type])]
-    val worklist  = mutable.Queue.empty[(MVar, List[Type])]
+    val solution  = mutable.Map.empty[MonoVar, mutable.Set[List[Type]]]
+    val inFlight  = mutable.Set.empty[(MonoVar, List[Type])]
+    val worklist  = mutable.Queue.empty[(MonoVar, List[Type])]
 
-    def enqueue(dst: MVar, tuple0: List[Type]): Unit = {
+    def enqueue(dst: MonoVar, tuple0: List[Type]): Unit = {
       val tuple = dst match {
-        case MVar.Def(sym) if channelDefs.contains(sym) => tuple0.map(lowerChannelType)
+        case MonoVar.Def(sym) if channelDefs.contains(sym) => tuple0.map(lowerChannelType)
         case _                                          => tuple0
       }
       val key = (dst, tuple)
@@ -97,14 +84,14 @@ object ConstraintSolver {
 
         // Sig dispatch: resolve to impl def and forward the tuple.
         dst match {
-          case MVar.Sig(sigSym) =>
+          case MonoVar.Sig(sigSym) =>
             resolveSig(sigSym, tuple, root, instanceMap).foreach {
-              case (implSym, implArgs) => enqueue(MVar.Def(implSym), implArgs)
+              case (implSym, implArgs) => enqueue(MonoVar.Def(implSym), implArgs)
             }
           case _ => ()
         }
 
-        // Propagate: substitute this MVar's new tuple into all dependent flows.
+        // Propagate: substitute this MonoVar's new tuple into all dependent flows.
         for (pf <- dependents.getOrElse(dst, Nil)) {
           collapseArgsPrepared(pf, Map(dst -> tuple), root).foreach(groundTuple => enqueue(pf.dst, groundTuple))
         }
@@ -112,18 +99,18 @@ object ConstraintSolver {
     }
 
     Solution(
-      defs = solution.collect { case (MVar.Def(sym), tuples) => sym -> tuples.toSet }.toMap,
-      enums = solution.collect { case (MVar.Enum(sym), tuples) => sym -> tuples.toSet }.toMap,
-      structs = solution.collect { case (MVar.Struct(sym), tuples) => sym -> tuples.toSet }.toMap,
-      restrictableEnums = solution.collect { case (MVar.RestrictableEnum(sym), tuples) => sym -> tuples.toSet }.toMap
+      defs = solution.collect { case (MonoVar.Def(sym), tuples) => sym -> tuples.toSet }.toMap,
+      enums = solution.collect { case (MonoVar.Enum(sym), tuples) => sym -> tuples.toSet }.toMap,
+      structs = solution.collect { case (MonoVar.Struct(sym), tuples) => sym -> tuples.toSet }.toMap,
+      restrictableEnums = solution.collect { case (MonoVar.RestrictableEnum(sym), tuples) => sym -> tuples.toSet }.toMap
     )
   }(MonomorphDebug.DebugSolution)
 
-  /** For each MVar, the set of (prepared) flows whose args contain `Param(mvar, _)`. */
-  private def buildDependents(flows: List[PreparedFlow]): Map[MVar, List[PreparedFlow]] = {
-    val m = mutable.Map.empty[MVar, mutable.ListBuffer[PreparedFlow]]
+  /** For each MonoVar, the set of (prepared) flows whose args contain `Param(mvar, _)`. */
+  private def buildDependents(flows: List[PreparedFlow]): Map[MonoVar, List[PreparedFlow]] = {
+    val m = mutable.Map.empty[MonoVar, mutable.ListBuffer[PreparedFlow]]
     for (pf <- flows) {
-      val mvars = pf.args.flatMap(arg => collectParams(arg)).map(_._1).toSet
+      val mvars = pf.args.flatMap(arg => MonoArg.collectParams(arg)).map(_._1).toSet
       for (v <- mvars) {
         m.getOrElseUpdate(v, mutable.ListBuffer.empty) += pf
       }
@@ -137,7 +124,7 @@ object ConstraintSolver {
     * later". No defaulting or canonicalization happens here; [[collapseArg]] does that once on
     * the whole assembled type.
     */
-  private def assembleArg(arg: MonoArg, bindings: Map[MVar, List[Type]]): Option[Type] = arg match {
+  private def assembleArg(arg: MonoArg, bindings: Map[MonoVar, List[Type]]): Option[Type] = arg match {
     case MonoArg.Const(t) => Some(t)
 
     case MonoArg.Param(v, i) => bindings.get(v).flatMap { tup =>
@@ -157,7 +144,7 @@ object ConstraintSolver {
   }
 
   /** Assembles every arg in `args`, or `None` if any is not ready. */
-  private def assembleArgs(args: List[MonoArg], bindings: Map[MVar, List[Type]]): Option[List[Type]] = {
+  private def assembleArgs(args: List[MonoArg], bindings: Map[MonoVar, List[Type]]): Option[List[Type]] = {
     val resolved = args.map(assembleArg(_, bindings))
     if (resolved.forall(_.isDefined)) Some(resolved.map(_.get)) else None
   }
@@ -179,20 +166,20 @@ object ConstraintSolver {
     * `Some(result)` for a Param-free position and `None` for one that must still be collapsed
     * per-tuple via `bindings`.
     */
-  private case class PreparedFlow(dst: MVar, args: List[MonoArg], preCollapsed: List[Option[Option[Type]]])
+  private case class PreparedFlow(dst: MonoVar, args: List[MonoArg], preCollapsed: List[Option[Option[Type]]])
 
   /** Returns `flow` with its Param-free positions pre-collapsed. */
   private def prepareFlow(flow: Flow, root: TypedAst.Root)(implicit flix: Flix): PreparedFlow = flow match {
-    case Flow(FlowInput.FlowArgs(args), dst) =>
+    case Flow(args, dst) =>
       val preCollapsed = args.map { arg =>
-        if (collectParams(arg).isEmpty) Some(collapseArg(arg, Map.empty, root))
+        if (MonoArg.collectParams(arg).isEmpty) Some(collapseArg(arg, Map.empty, root))
         else None
       }
       PreparedFlow(dst, args, preCollapsed)
   }
 
   /** Collapses `pf`'s args to a ground tuple, or `None` if any position is not ready. */
-  private def collapseArgsPrepared(pf: PreparedFlow, bindings: Map[MVar, List[Type]], root: TypedAst.Root)
+  private def collapseArgsPrepared(pf: PreparedFlow, bindings: Map[MonoVar, List[Type]], root: TypedAst.Root)
                                    (implicit flix: Flix): Option[List[Type]] = {
     val resolved = pf.args.zip(pf.preCollapsed).map {
       case (_, Some(precomputed)) => precomputed
@@ -209,7 +196,7 @@ object ConstraintSolver {
     * soft. Defaulting a constrained `Star` var to `AnyType` is safe even when no instance exists:
     * `SolutionSpecialization.run` discards any speculative tuple whose reduction fails.
     */
-  private def collapseArg(arg: MonoArg, bindings: Map[MVar, List[Type]], root: TypedAst.Root)
+  private def collapseArg(arg: MonoArg, bindings: Map[MonoVar, List[Type]], root: TypedAst.Root)
                           (implicit flix: Flix): Option[Type] =
     assembleArg(arg, bindings).flatMap { raw =>
       val defaulted = rewriteRegionToIO(raw).map(MonomorphCanon.default)

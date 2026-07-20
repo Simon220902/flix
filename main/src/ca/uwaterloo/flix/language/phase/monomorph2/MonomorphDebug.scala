@@ -19,8 +19,6 @@ package ca.uwaterloo.flix.language.phase.monomorph2
 import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.Type
 import ca.uwaterloo.flix.language.dbg.AstPrinter
-import ca.uwaterloo.flix.language.phase.monomorph2.ConstraintCollection.{Flow, FlowInput, MVar, MonoArg}
-import ca.uwaterloo.flix.language.phase.monomorph2.ConstraintSolver.Solution
 import ca.uwaterloo.flix.util.FileOps
 import ca.uwaterloo.flix.util.tc.Debug
 
@@ -52,17 +50,17 @@ private[monomorph2] object MonomorphDebug {
   }
 
   /** Returns a short human-readable label for `mvar`, e.g. `Def(map)`. */
-  private[monomorph2] def mvarLabel(mvar: MVar): String = mvar match {
-    case MVar.Def(sym)              => s"Def(${sym.name})"
-    case MVar.Enum(sym)             => s"Enum(${sym.name})"
-    case MVar.Sig(sym)              => s"Sig(${sym.name})"
-    case MVar.RestrictableEnum(sym) => s"REnum(${sym.name})"
-    case MVar.Struct(sym)           => s"Struct(${sym.text})"
+  private[monomorph2] def monoVarLabel(mvar: MonoVar): String = mvar match {
+    case MonoVar.Def(sym)              => s"Def(${sym.name})"
+    case MonoVar.Enum(sym)             => s"Enum(${sym.name})"
+    case MonoVar.Sig(sym)              => s"Sig(${sym.name})"
+    case MonoVar.RestrictableEnum(sym) => s"REnum(${sym.name})"
+    case MonoVar.Struct(sym)           => s"Struct(${sym.text})"
   }
 
   /**
-    * Renders `flows` as a Graphviz DOT string: one node per MVar (boxes=defs, ellipses=enums,
-    * diamonds=sigs), seed edges from plaintext constant nodes, propagation edges between MVars.
+    * Renders `flows` as a Graphviz DOT string: one node per MonoVar (boxes=defs, ellipses=enums,
+    * diamonds=sigs), seed edges from plaintext constant nodes, propagation edges between MonoVars.
     */
   def toDot(flows: Set[Flow]): String = {
     val sb = new StringBuilder
@@ -71,22 +69,22 @@ private[monomorph2] object MonomorphDebug {
     sb.append("  node [fontname=\"Courier\", fontsize=10];\n")
     sb.append("  edge [fontname=\"Courier\", fontsize=8];\n\n")
 
-    allMVarsOf(flows).foreach { mvar =>
+    allMonoVarsOf(flows).foreach { mvar =>
       val (shape, color) = mvar match {
-        case _: MVar.Def              => ("box",     "lightblue")
-        case _: MVar.Enum             => ("ellipse", "lightyellow")
-        case _: MVar.Sig              => ("diamond", "lightgreen")
-        case _: MVar.RestrictableEnum => ("ellipse", "lightsalmon")
-        case _: MVar.Struct           => ("box",     "lightcyan")
+        case _: MonoVar.Def              => ("box",     "lightblue")
+        case _: MonoVar.Enum             => ("ellipse", "lightyellow")
+        case _: MonoVar.Sig              => ("diamond", "lightgreen")
+        case _: MonoVar.RestrictableEnum => ("ellipse", "lightsalmon")
+        case _: MonoVar.Struct           => ("box",     "lightcyan")
       }
-      sb.append(s"""  ${dotId(mvar)} [label="${dotEscape(mvarLabel(mvar))}", shape=$shape, style=filled, fillcolor=$color];\n""")
+      sb.append(s"""  ${dotId(mvar)} [label="${dotEscape(monoVarLabel(mvar))}", shape=$shape, style=filled, fillcolor=$color];\n""")
     }
 
     sb.append("\n")
 
     var seedCount = 0
-    flows.foreach { case Flow(FlowInput.FlowArgs(args), dst) =>
-      val srcMVars = args.flatMap(collectMVars)
+    flows.foreach { case Flow(args, dst) =>
+      val srcMVars = args.flatMap(collectMonoVars)
       val label = args.map(monoArgLabel).mkString(", ")
       if (srcMVars.isEmpty) {
         val sid = s"seed$seedCount"
@@ -104,38 +102,38 @@ private[monomorph2] object MonomorphDebug {
     sb.toString
   }
 
-  /** Returns every `MVar` appearing in `flows`, as either a destination or a source argument. */
-  private def allMVarsOf(flows: Set[Flow]): Set[MVar] =
-    flows.flatMap { case Flow(FlowInput.FlowArgs(args), dst) => Set(dst) ++ args.flatMap(collectMVars) }
+  /** Returns every `MonoVar` appearing in `flows`, as either a destination or a source argument. */
+  private def allMonoVarsOf(flows: Set[Flow]): Set[MonoVar] =
+    flows.flatMap { case Flow(args, dst) => Set(dst) ++ args.flatMap(collectMonoVars) }
 
-  /** Returns every `MVar` referenced by a `Param` inside `arg`. */
-  private def collectMVars(arg: MonoArg): List[MVar] =
-    ConstraintCollection.collectParams(arg).map(_._1)
+  /** Returns every `MonoVar` referenced by a `Param` inside `arg`. */
+  private def collectMonoVars(arg: MonoArg): List[MonoVar] =
+    MonoArg.collectParams(arg).map(_._1)
 
-  /** Returns summary stats for `flows`: total flow/MVar counts plus a per-kind breakdown. */
+  /** Returns summary stats for `flows`: total flow/MonoVar counts plus a per-kind breakdown. */
   private def stats(flows: Set[Flow]): List[String] = {
-    val allMVars = allMVarsOf(flows)
+    val allMVars = allMonoVarsOf(flows)
     val byKind = allMVars.groupBy {
-      case _: MVar.Def              => "Def"
-      case _: MVar.Enum             => "Enum"
-      case _: MVar.Sig              => "Sig"
-      case _: MVar.RestrictableEnum => "RestrictableEnum"
-      case _: MVar.Struct           => "Struct"
+      case _: MonoVar.Def              => "Def"
+      case _: MonoVar.Enum             => "Enum"
+      case _: MonoVar.Sig              => "Sig"
+      case _: MonoVar.RestrictableEnum => "RestrictableEnum"
+      case _: MonoVar.Struct           => "Struct"
     }.view.mapValues(_.size).toList.sortBy(_._1)
-    s"flows: ${flows.size}" :: s"distinct MVars: ${allMVars.size}" :: byKind.map { case (k, n) => s"  $k: $n" }
+    s"flows: ${flows.size}" :: s"distinct MonoVars: ${allMVars.size}" :: byKind.map { case (k, n) => s"  $k: $n" }
   }
 
   /** Returns a plain-text listing of `flows`, one line per flow: `<args> -> <destination>`. */
   private def flowsToText(flows: Set[Flow]): String =
-    flows.toList.map { case Flow(FlowInput.FlowArgs(args), dst) =>
-      s"${args.map(monoArgLabel).mkString(", ")} -> ${mvarLabel(dst)}"
+    flows.toList.map { case Flow(args, dst) =>
+      s"${args.map(monoArgLabel).mkString(", ")} -> ${monoVarLabel(dst)}"
     }.sorted.mkString("\n")
 
   /** Returns a plain-text listing of `solution`: summary stats, then every solved tuple by category. */
   private def solutionToText(solution: Solution): String = {
-    def section[K](title: String, mk: K => MVar, m: Map[K, Set[List[Type]]]): String = {
+    def section[K](title: String, mk: K => MonoVar, m: Map[K, Set[List[Type]]]): String = {
       val lines = m.toList.map { case (k, tuples) =>
-        s"${mvarLabel(mk(k))} -> ${tuples.toList.map(t => s"[${t.mkString(", ")}]").sorted.mkString(", ")}"
+        s"${monoVarLabel(mk(k))} -> ${tuples.toList.map(t => s"[${t.mkString(", ")}]").sorted.mkString(", ")}"
       }.sorted
       s"$title (${m.size} symbols, ${m.values.map(_.size).sum} tuples):\n" + lines.mkString("\n")
     }
@@ -146,27 +144,27 @@ private[monomorph2] object MonomorphDebug {
     ).mkString("\n")
 
     header + "\n\n" +
-      section("Defs", MVar.Def(_), solution.defs) + "\n\n" +
-      section("Enums", MVar.Enum(_), solution.enums) + "\n\n" +
-      section("Structs", MVar.Struct(_), solution.structs) + "\n\n" +
-      section("RestrictableEnums", MVar.RestrictableEnum(_), solution.restrictableEnums) + "\n"
+      section("Defs", MonoVar.Def(_), solution.defs) + "\n\n" +
+      section("Enums", MonoVar.Enum(_), solution.enums) + "\n\n" +
+      section("Structs", MonoVar.Struct(_), solution.structs) + "\n\n" +
+      section("RestrictableEnums", MonoVar.RestrictableEnum(_), solution.restrictableEnums) + "\n"
   }
 
   /** Returns a DOT-safe node id for `mvar`. */
-  private def dotId(mvar: MVar): String = {
+  private def dotId(mvar: MonoVar): String = {
     val raw = mvar match {
-      case MVar.Def(sym)              => s"def_${sanitize(sym.toString)}"
-      case MVar.Enum(sym)             => s"enum_${sanitize(sym.toString)}"
-      case MVar.Sig(sym)              => s"sig_${sanitize(sym.toString)}"
-      case MVar.RestrictableEnum(sym) => s"renum_${sanitize(sym.toString)}"
-      case MVar.Struct(sym)           => s"struct_${sanitize(sym.toString)}"
+      case MonoVar.Def(sym)              => s"def_${sanitize(sym.toString)}"
+      case MonoVar.Enum(sym)             => s"enum_${sanitize(sym.toString)}"
+      case MonoVar.Sig(sym)              => s"sig_${sanitize(sym.toString)}"
+      case MonoVar.RestrictableEnum(sym) => s"renum_${sanitize(sym.toString)}"
+      case MonoVar.Struct(sym)           => s"struct_${sanitize(sym.toString)}"
     }
     s""""$raw""""
   }
 
   /** Returns a short human-readable label for `arg`. */
   private def monoArgLabel(arg: MonoArg): String = arg match {
-    case MonoArg.Param(v, i)         => s"p(${mvarLabel(v)},$i)"
+    case MonoArg.Param(v, i)         => s"p(${monoVarLabel(v)},$i)"
     case MonoArg.Const(tpe)          => tpe.toString
     case MonoArg.App(tc, args)       => s"App(${monoArgLabel(tc)},${args.map(monoArgLabel).mkString(",")})"
     case MonoArg.Assoc(sym, a, _, _) => s"Assoc(${sym.name},${monoArgLabel(a)})"
