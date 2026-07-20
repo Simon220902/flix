@@ -23,7 +23,7 @@ import ca.uwaterloo.flix.language.fmt.FormatOptions
 import ca.uwaterloo.flix.language.phase.*
 import ca.uwaterloo.flix.language.phase.jvm.{CodeGen, JvmLoader, JvmWriter}
 import ca.uwaterloo.flix.language.phase.monomorph.Specialization
-import ca.uwaterloo.flix.language.phase.monomorph2.{ConstraintCollection, ConstraintSolver, NonMonomorphizableCheck, SolutionSpecialization}
+import ca.uwaterloo.flix.language.phase.monomorph2.ConstraintMonomorphization
 import ca.uwaterloo.flix.language.phase.optimizer.{LambdaDrop, Optimizer}
 import ca.uwaterloo.flix.language.{CompilationMessage, GenSym}
 import ca.uwaterloo.flix.runtime.CompilationResult
@@ -648,26 +648,13 @@ class Flix {
     // Initialize fork-join thread pool.
     initForkJoinPool()
 
+    var treeShaker1Ast = TreeShaker1.run(typedAst)
+    // Note: Do not null typedAst. It is used later.
+
     var monomorpherAst =
-      if (options.xnewmono) {
-        var monomorphTreeShakerAst = TreeShaker1.run(typedAst)
-        val constraints = ConstraintCollection.generate(monomorphTreeShakerAst)
-        flix.phase("NonMonomorphizableCheck") {
-          NonMonomorphizableCheck.checkMonomorphizable(constraints)
-        }(AstPrinter.DebugNoOp())
-        val solution    = ConstraintSolver.solve(constraints, monomorphTreeShakerAst)
-        val monomorpherAst = SolutionSpecialization.run(monomorphTreeShakerAst, solution)
-        monomorphTreeShakerAst = null // Explicitly null-out such that the memory becomes eligible for GC.
-        monomorpherAst
-      } else {
-        var treeShaker1Ast = TreeShaker1.run(typedAst)
-        // Note: Do not null typedAst. It is used later.
-
-        val monomorpherAst = Specialization.run(treeShaker1Ast)
-        treeShaker1Ast = null // Explicitly null-out such that the memory becomes eligible for GC.
-
-        monomorpherAst
-      }
+      if (options.xnewmono) ConstraintMonomorphization.run(treeShaker1Ast)
+      else Specialization.run(treeShaker1Ast)
+    treeShaker1Ast = null // Explicitly null-out such that the memory becomes eligible for GC.
     flix.emitEvent(FlixEvent.AfterMonomorph(monomorpherAst))
 
     var lambdaDropAst = LambdaDrop.run(monomorpherAst)
