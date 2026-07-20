@@ -521,7 +521,7 @@ object SolutionSpecialization {
     // runtime enums such as Fixpoint3.Ast.*, `FList`, `PredSym`, `Denotation`) that reference
     // original syms and bypass the Expr.Tag/StructNew rewrite; (b) non-parametric enums/structs
     // keep their original syms; (c) restrictable enums stay on their original (lowered) syms.
-    // Nothing downstream prunes unused enum/struct declarations — MonomorphTreeShaker only prunes
+    // Nothing downstream prunes unused enum/struct declarations — TreeShaker1 only prunes
     // defs/instances/sigs, and runs before this phase — so genuinely-unused originals currently
     // survive to codegen; pruning them is a known follow-up.
     val enums = ParOps.parMapValues(root.enums) {

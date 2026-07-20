@@ -293,7 +293,7 @@ object MonomorphBench {
       // NonMonomorphizableCheck: promoted to its own top-level flix.phase(...) in Flix.scala
       // (previously ran nested inside ConstraintSolver.solve, folded into that phase's own
       // timing) — belongs in the monomorph-phase total same as its former host did.
-      val monomorphPhases = Set("MonomorphTreeShaker", "ConstraintCollection", "ConstraintSolver", "NonMonomorphizableCheck", "TreeShaker1", "Monomorpher")
+      val monomorphPhases = Set("ConstraintCollection", "ConstraintSolver", "NonMonomorphizableCheck", "TreeShaker1", "Monomorpher")
       val monomorphSubPhaseNs = phases.collect { case (phase, time) if monomorphPhases.contains(phase) => phase -> time }
       val monomorphTimeNs = monomorphSubPhaseNs.map(_._2).sum
       val subPhaseTimesMs = monomorphSubPhaseNs.map { case (phase, time) => phase -> time / 1_000_000 }.toMap
@@ -458,7 +458,7 @@ object MonomorphBench {
       f"|   $label%-20s |                     | ${value.map(_.toString).getOrElse("n/a")}%16s |          |                    |"
 
     // Per-subphase breakdown of "monomorph phase time" — the two pipelines have different phase
-    // sets (baseline: TreeShaker1/Monomorpher; new: MonomorphTreeShaker/ConstraintCollection/
+    // sets (baseline: TreeShaker1/Monomorpher; new: TreeShaker1/ConstraintCollection/
     // ConstraintSolver/Monomorpher — see Metrics' doc comment on subPhaseTimesMs), so this prints
     // whichever side actually has each phase name, blank on the other side rather than assuming
     // a 1:1 correspondence. No CI/significance column — see subPhaseTimesMs' own doc comment.
