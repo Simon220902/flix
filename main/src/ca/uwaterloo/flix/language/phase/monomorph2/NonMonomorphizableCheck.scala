@@ -17,14 +17,8 @@
 package ca.uwaterloo.flix.language.phase.monomorph2
 
 import ca.uwaterloo.flix.language.ast.{SourceLocation, Type, TypeConstructor}
-
+import ca.uwaterloo.flix.util.InternalCompilerException
 import scala.collection.mutable
-
-// TODO Make it a proper compiler error-message
-/**
-  * Thrown when the flow set contains a growing cycle (see [[NonMonomorphizableCheck]]).
-  */
-case class NonMonomorphizableProgramException(message: String, loc: SourceLocation) extends RuntimeException(s"$message ($loc)")
 
 /**
   * Rejects non-monomorphizable programs (flow sets with no finite solution) before
@@ -50,9 +44,10 @@ object NonMonomorphizableCheck {
   /** A graph edge: `src` flows into `dst`, `growing` iff it does so wrapped in a type constructor. */
   private case class Edge(src: Vertex, dst: Vertex, growing: Boolean)
 
+  // TODO Make it a proper compiler error-message
   /**
     * Checks whether `flows` contains a reachable growing cycle and throws
-    * [[NonMonomorphizableProgramException]] if so.
+    * [[InternalCompilerException]] if so.
     */
   def checkMonomorphizable(flows: Set[Flow]): Unit = {
     val edgesBuilder = List.newBuilder[Edge]
@@ -91,7 +86,7 @@ object NonMonomorphizableCheck {
     // suffices because a reachable set is closed under following edges forward.
     edges.find(e => e.growing && reachable(e.src) && sccOf(e.src) == sccOf(e.dst)) match {
       case Some(edge) =>
-        throw NonMonomorphizableProgramException(
+        throw InternalCompilerException(
           s"Program is not monomorphizable: found an infinitely-growing recursive type " +
           s"involving ${MonomorphDebug.monoVarLabel(edge.src.mvar)}. This indicates polymorphic recursion " +
           s"(e.g. `def f(x: a): List[a] = ...f(lst)...`) or a genuinely non-regular recursive " +
