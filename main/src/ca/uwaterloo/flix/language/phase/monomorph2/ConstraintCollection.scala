@@ -80,19 +80,6 @@ object ConstraintCollection {
       }
     }.flatten.toSet
 
-    // Effect operations have a Spec (fparams/retTpe) like defs, but no body to visit — only their
-    // declared signature can ever reach an enum/struct, so this only needs visitDef's first two
-    // lines, not the full def walk. No MonoVar.Op exists (nothing ever specializes an op itself); a
-    // synthetic DefnSym is only the Context's placeholder for the op's own tparam positions, same
-    // trick fromSigs uses for a sig's trait-level tparam.
-    val fromEffects = ParOps.parMap(root.effects.values.flatMap(_.ops)) { op =>
-      val tparamEnv = op.spec.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
-      val defnSym = new Symbol.DefnSym(None, op.sym.namespace, op.sym.name, op.sym.loc)
-      implicit val ctx: Context = Context(MonoVar.Def(defnSym), tparamEnv, root, flix)
-      val acc1 = op.spec.fparams.foldLeft(List.empty[Flow]) { case (a, FormalParam(_, tpe, _, _, _)) => visitType(tpe, a) }
-      visitType(op.spec.retTpe, acc1)
-    }.flatten.toSet
-
     val fromRestrictableEnums = ParOps.parMap(root.restrictableEnums.values) { enm =>
       val tparamEnv = (enm.index :: enm.tparams).zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
       implicit val ctx: Context = Context(MonoVar.RestrictableEnum(enm.sym), tparamEnv, root, flix)
@@ -105,13 +92,13 @@ object ConstraintCollection {
       visitStruct(struct, Nil)
     }.flatten.toSet
 
-    // Visit default trait implementations (root.sigs with exp.isDefined).
-    // These bodies contain calls to regular defs and need their flows tracked so the solver
-    // can propagate when the sig is dispatched to its default impl.
+    // Visits default trait-impl bodies (root.sigs with exp.isDefined) so dispatched sigs propagate.
+    // fromSigs/fromEffects synthesize a DefnSym so their own tparams  classify as Param, not
+    // wrongly-ground Const. (Same is true for fromEffects)
     val fromSigs = ParOps.parMap(root.sigs.values.filter(_.exp.isDefined)) { sig =>
-      // The trait's own tparam (e.g. `t` in `Foldable[t]`) is NOT in sig.spec.tparams but IS
-      // a free variable in the default impl body. Include it at index 0 so typeToMonoArg can
-      // represent it as Param(defnSym, 0). Solver tuple layout: [traitType, ...sig-own args].
+      // traitTparam (e.g. `t` in `Foldable[t]`) isn't in sig.spec.tparams but is free in the
+      // default impl body — prepended so index 0 matches ConstraintSolver.resolveSig's tuple
+      // layout: [traitType, ...sig-own args].
       val trt = root.traits(sig.sym.trt)
       val traitTparam = trt.tparam
       val allTparams = traitTparam :: sig.spec.tparams
@@ -122,6 +109,14 @@ object ConstraintCollection {
         implicit val ctx: Context = Context(MonoVar.Def(defnSym), tparamEnv, root, flix)
         sig.exp.map(e => visitExp(e, Nil)).getOrElse(Nil)
       }
+    }.flatten.toSet
+
+    val fromEffects = ParOps.parMap(root.effects.values.flatMap(_.ops)) { op =>
+      val tparamEnv = op.spec.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
+      val defnSym = new Symbol.DefnSym(None, op.sym.namespace, op.sym.name, op.sym.loc)
+      implicit val ctx: Context = Context(MonoVar.Def(defnSym), tparamEnv, root, flix)
+      val acc1 = op.spec.fparams.foldLeft(List.empty[Flow]) { case (a, FormalParam(_, tpe, _, _, _)) => visitType(tpe, a) }
+      visitType(op.spec.retTpe, acc1)
     }.flatten.toSet
 
     fromDefs ++ fromEnums ++ fromInstances ++ fromRestrictableEnums ++ fromStructs ++ fromSigs ++ fromEffects
@@ -138,22 +133,22 @@ object ConstraintCollection {
     // Deep alias erasure above because flattenApply/.typeArguments below don't check for Type.Alias
     case at @ Type.AssocType(_, arg, _, _) =>
       // If the associated type is ground, resolve it and continue; otherwise recurse into arg.
-      if (tpe0.typeVars.isEmpty) visitType(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix), acc)
+      if (at.typeVars.isEmpty) visitType(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix), acc)
       else visitType(arg, acc)
     case _: Type.BaseType
          | Type.Var(_, _)
          | Type.Cst(_, _) => acc
     case app @ Type.Apply(_, _, _) =>
-      val (appHead, tpArgs) = MonomorphHelpers.flattenApply(app)
-      val acc1 = tpArgs.foldLeft(acc)((a, t) => visitType(t, a))
-      val mvarOpt = appHead match {
+      val (head, args) = MonomorphHelpers.flattenApply(app)
+      val acc1 = args.foldLeft(acc)((a, t) => visitType(t, a))
+      val mvarOpt = head match {
         case Type.Cst(TypeConstructor.Enum(sym, _), _)             => Some(MonoVar.Enum(sym))
         case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => Some(MonoVar.RestrictableEnum(sym))
         case Type.Cst(TypeConstructor.Struct(sym, _), _)           => Some(MonoVar.Struct(sym))
         case _                                                     => None
       }
       mvarOpt match {
-        case Some(mvar) => Flow(tpArgs.map(t => typeToMonoArg(t)), mvar) :: acc1
+        case Some(mvar) => Flow(args.map(t => typeToMonoArg(t)), mvar) :: acc1
         case None       => acc1
       }
   }
@@ -165,10 +160,10 @@ object ConstraintCollection {
     enumDecl.cases.values.foldLeft(acc) { (a, cas) => cas.tpes.foldLeft(a)((a2, t) => visitType(t, a2)) }
 
   /**
-    * Emits flow constraints for all case field types in `enumDecl`.
+    * Emits flow constraints for all case field types in `restrictableEnumDecl`.
     */
-  private def visitRestrictableEnum(enumDecl: TypedAst.RestrictableEnum, acc: List[Flow])(implicit ctx: Context): List[Flow] =
-    enumDecl.cases.values.foldLeft(acc) { (a, cas) => cas.tpes.foldLeft(a)((a2, t) => visitType(t, a2)) }
+  private def visitRestrictableEnum(restrictableEnumDecl: TypedAst.RestrictableEnum, acc: List[Flow])(implicit ctx: Context): List[Flow] =
+    restrictableEnumDecl.cases.values.foldLeft(acc) { (a, cas) => cas.tpes.foldLeft(a)((a2, t) => visitType(t, a2)) }
 
   /**
     * Emits flow constraints for all field types in `structDecl`.
@@ -730,36 +725,39 @@ object ConstraintCollection {
     case other => other
   }
 
-  /** Converts `tpe` to a `MonoArg` relative to the current declaration context. */
-  private def typeToMonoArg(tpe: Type)(implicit ctx: Context): MonoArg = Type.eraseAliases(tpe) match {
-    case Type.Var(sym, _) =>
-      ctx.tparamEnv.get(sym) match {
-        case Some(idx) => MonoArg.Param(ctx.currentDecl, idx)
-        case None =>
-          // A type variable that is not a tparam of the current decl — e.g. a region var
-          // introduced by `region r { ... }`, which is local to the expression. Mirroring
-          // Specialization.default, such vars do not drive specialization: record them as an
-          // opaque constant so the flow is still emitted but the solver does not propagate them.
-          MonoArg.Const(tpe)
-      }
-    case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
-      // Ground: resolve eagerly. Non-ground: record symbolically for the solver.
-      if (tpe.typeVars.isEmpty) MonoArg.Const(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix))
-      else MonoArg.Assoc(symUse.sym, typeToMonoArg(arg), kind, assocLoc)
-    case Type.Cst(_, _) | _: Type.BaseType =>
-      MonoArg.Const(tpe)
-    case Type.Apply(_, _, _) =>
-      if (tpe.kind == Kind.Eff && tpe.typeVars.isEmpty)
-        // Guard: effect formulas occasionally contain non-effect constructors (e.g. data types in
-        // complement/union positions). canonicalEffect will throw on those; fall back to Const.
-        try MonoArg.Const(MonomorphCanon.canonicalEffect(tpe))
-        catch { case _: ca.uwaterloo.flix.util.InternalCompilerException => MonoArg.Const(tpe) }
-      else {
-        val (head, args) = MonomorphHelpers.flattenApply(tpe)
-        MonoArg.App(typeToMonoArg(head), args.map(arg => typeToMonoArg(arg)))
-      }
-    case other =>
-      MonoArg.Const(other)
+  /** Converts `tpe0` to a `MonoArg` relative to the current declaration context. */
+  private def typeToMonoArg(tpe0: Type)(implicit ctx: Context): MonoArg = {
+    val tpe = Type.eraseAliases(tpe0)
+    tpe match {
+      case Type.Var(sym, _) =>
+        ctx.tparamEnv.get(sym) match {
+          case Some(idx) => MonoArg.Param(ctx.currentDecl, idx)
+          case None =>
+            // A type variable that is not a tparam of the current decl — e.g. a region var
+            // introduced by `region r { ... }`, which is local to the expression. Mirroring
+            // Specialization.default, such vars do not drive specialization: record them as an
+            // opaque constant so the flow is still emitted but the solver does not propagate them.
+            MonoArg.Const(tpe)
+        }
+      case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
+        // Ground: resolve eagerly. Non-ground: record symbolically for the solver.
+        if (tpe.typeVars.isEmpty) MonoArg.Const(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix))
+        else MonoArg.Assoc(symUse.sym, typeToMonoArg(arg), kind, assocLoc)
+      case Type.Cst(_, _) | _: Type.BaseType =>
+        MonoArg.Const(tpe)
+      case Type.Apply(_, _, _) =>
+        if (tpe.kind == Kind.Eff && tpe.typeVars.isEmpty)
+          // simplify reduces any AssocType nested in the formula (e.g. `Foo.Aef[a] + IO`) before
+          // folding it via canonicalEffect — calling canonicalEffect directly would throw, since
+          // evalEffect has no AssocType case.
+          MonoArg.Const(MonomorphCanon.simplify(tpe, isGround = true)(ctx.root, ctx.flix))
+        else {
+          val (head, args) = MonomorphHelpers.flattenApply(tpe)
+          MonoArg.App(typeToMonoArg(head), args.map(arg => typeToMonoArg(arg)))
+        }
+      case other =>
+        MonoArg.Const(other)
+    }
   }
 
   /** Returns the enum/struct `MonoVar` and type arguments of `tpe0`. */
