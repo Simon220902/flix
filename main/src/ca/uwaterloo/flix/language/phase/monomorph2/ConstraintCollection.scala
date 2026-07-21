@@ -25,9 +25,6 @@ import ca.uwaterloo.flix.language.phase.monomorph.Symbols
 import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Enums, Types}
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
-import scala.annotation.tailrec
-
-
 /**
   * Constraint generation for constraint-based monomorphization: emits `Flow` constraints
   * describing how concrete types propagate through the program, for [[ConstraintSolver]] to solve.
@@ -137,7 +134,7 @@ object ConstraintCollection {
   /**
     * Emits flow constraints for enum type applications occurring in `tpe`.
     */
-  private def visitType(tpe0: Type, acc: List[Flow])(implicit ctx: Context): List[Flow] = dealias(tpe0) match {
+  private def visitType(tpe0: Type, acc: List[Flow])(implicit ctx: Context): List[Flow] = Type.eraseAliases(tpe0) match {
     case at @ Type.AssocType(_, arg, _, _) =>
       // If the associated type is ground, resolve it and continue; otherwise recurse into arg.
       if (tpe0.typeVars.isEmpty) visitType(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix), acc)
@@ -146,7 +143,7 @@ object ConstraintCollection {
          | Type.Var(_, _)
          | Type.Cst(_, _) => acc
     case app @ Type.Apply(_, _, loc) =>
-      val (appHead, tpArgs) = flattenApply(app)
+      val (appHead, tpArgs) = MonomorphHelpers.flattenApply(app)
       val acc1 = tpArgs.foldLeft(acc)((a, t) => visitType(t, a))
       val mvarOpt = appHead match {
         case Type.Cst(TypeConstructor.Enum(sym, _), _)             => Some(MonoVar.Enum(sym))
@@ -498,9 +495,8 @@ object ConstraintCollection {
     // constructor and the tuple's component types.
     case Expr.FixpointInjectInto(exps, _, _, _, loc) =>
       exps.foldLeft(acc) { (a, e) =>
-        val (tycon, argTypes) = dealias(e.tpe) match {
-          case Type.Apply(tc, innerType0, _) =>
-            val innerType = dealias(innerType0)
+        val (tycon, argTypes) = Type.eraseAliases(e.tpe) match {
+          case Type.Apply(tc, innerType, _) =>
             innerType.typeConstructor match {
               case Some(TypeConstructor.Tuple(_)) => (tc, innerType.typeArguments)
               case Some(TypeConstructor.Unit)     => (tc, Nil)
@@ -580,24 +576,6 @@ object ConstraintCollection {
       acc
   }
 
-  /**
-    * Strips `Type.Alias` wrappers before structural matching. Required: this file walks the raw
-    * `TypedAst` where user aliases are still intact, and `Type.Alias` extends `Type.BaseType`,
-    * so an unstripped alias would silently match the wrong case and drop a flow.
-    */
-  private def dealias(tpe: Type): Type = tpe match {
-    case Type.Alias(_, _, inner, _) => dealias(inner)
-    case t => t
-  }
-
-  /** Returns `true` iff `sym` is bound by one of the constraint params `cparams0`. */
-  private def isQuantifiedVar(sym: Symbol.VarSym, cparams0: List[TypedAst.ConstraintParam]): Boolean =
-    cparams0.exists(p => p.bnd.sym == sym)
-
-  /** Returns the free variables of `exp0` that are bound by the constraint params `cparams0`. */
-  private def quantifiedVars(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr): List[(Symbol.VarSym, Type)] =
-    TypedAstOps.freeVars(exp0).toList.filter { case (sym, _) => isQuantifiedVar(sym, cparams0) }
-
   /** A flow for `Fixpoint3.Boxable.box` at type `tpe` — mirrors `SolutionLowering.box`. */
   private def boxFlow(tpe: Type)(implicit ctx: Context): Flow =
     Flow(List(typeToMonoArg(tpe)), MonoVar.Def(Defs.Box))
@@ -610,9 +588,9 @@ object ConstraintCollection {
     */
   private def headTermFlows(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, acc: List[Flow])(implicit ctx: Context): List[Flow] = exp0 match {
     case Expr.Var(sym, tpe, _) =>
-      if (isQuantifiedVar(sym, cparams0)) acc else boxFlow(tpe) :: acc
+      if (MonomorphHelpers.isQuantifiedVar(sym, cparams0)) acc else boxFlow(tpe) :: acc
     case _ =>
-      val fvs = quantifiedVars(cparams0, exp0)
+      val fvs = MonomorphHelpers.quantifiedVars(cparams0, exp0)
       if (fvs.isEmpty) boxFlow(exp0.tpe) :: acc
       else Flow((fvs.map(_._2) :+ exp0.tpe).map(typeToMonoArg(_)), MonoVar.Def(Defs.Lift(fvs.length))) :: acc
   }
@@ -625,7 +603,7 @@ object ConstraintCollection {
     terms.foldLeft(acc) {
       case (a, TypedAst.Pattern.Wild(_, _)) => a
       case (a, TypedAst.Pattern.Var(bnd, tpe, _)) =>
-        if (isQuantifiedVar(bnd.sym, cparams0)) a else boxFlow(tpe) :: a
+        if (MonomorphHelpers.isQuantifiedVar(bnd.sym, cparams0)) a else boxFlow(tpe) :: a
       case (a, TypedAst.Pattern.Cst(_, tpe, _)) => boxFlow(tpe) :: a
       case (a, _) => a
     }
@@ -636,7 +614,7 @@ object ConstraintCollection {
     * nothing is emitted in that case.
     */
   private def guardLiftFlow(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, acc: List[Flow])(implicit ctx: Context): List[Flow] = {
-    val fvs = quantifiedVars(cparams0, exp0)
+    val fvs = MonomorphHelpers.quantifiedVars(cparams0, exp0)
     if (fvs.isEmpty) acc
     else Flow(fvs.map(kv => typeToMonoArg(kv._2)), MonoVar.Def(Defs.LiftB(fvs.length))) :: acc
   }
@@ -650,9 +628,9 @@ object ConstraintCollection {
     * tuple type), so a structural "is this a Tuple" check would wrongly decompose it.
     */
   private def functionalLiftFlow(cparams0: List[TypedAst.ConstraintParam], outArity: Int, exp0: TypedAst.Expr, loc: SourceLocation)(implicit ctx: Context): Flow = {
-    val inVars = quantifiedVars(cparams0, exp0)
-    val inner = dealias(exp0.tpe) match {
-      case Type.Apply(Type.Cst(TypeConstructor.Vector, _), t, _) => dealias(t)
+    val inVars = MonomorphHelpers.quantifiedVars(cparams0, exp0)
+    val inner = Type.eraseAliases(exp0.tpe) match {
+      case Type.Apply(Type.Cst(TypeConstructor.Vector, _), t, _) => t
       case t => throw InternalCompilerException(s"Expected Vector[_], but got $t", loc)
     }
     val outTypes = if (outArity <= 1) List(inner) else inner.typeArguments
@@ -675,14 +653,14 @@ object ConstraintCollection {
   }
 
   /** Returns `t` from `Vector[t]` — mirrors `SolutionLowering.unwrapVectorType`. */
-  private def unwrapVectorType(tpe: Type, loc: SourceLocation): Type = dealias(tpe) match {
-    case Type.Apply(Type.Cst(TypeConstructor.Vector, _), extType, _) => dealias(extType)
+  private def unwrapVectorType(tpe: Type, loc: SourceLocation): Type = Type.eraseAliases(tpe) match {
+    case Type.Apply(Type.Cst(TypeConstructor.Vector, _), extType, _) => extType
     case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Vector, _), _, _), but got $t", loc)
   }
 
   /** Mirrors `SolutionLowering.predicatesOfExtVar`. */
-  private def predicatesOfExtVar(tpe: Type, loc: SourceLocation): List[(Name.Pred, List[Type])] = dealias(tpe) match {
-    case Type.Apply(Type.Cst(TypeConstructor.Extensible, _), tpe1, loc1) => predicatesOfSchemaRow(dealias(tpe1), loc1)
+  private def predicatesOfExtVar(tpe: Type, loc: SourceLocation): List[(Name.Pred, List[Type])] = Type.eraseAliases(tpe) match {
+    case Type.Apply(Type.Cst(TypeConstructor.Extensible, _), tpe1, loc1) => predicatesOfSchemaRow(tpe1, loc1)
     case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Extensible, _), _, _), but got $t", loc)
   }
 
@@ -751,16 +729,6 @@ object ConstraintCollection {
     case other => other
   }
 
-  /** Walks `tpe`'s `Type.Apply` chain once, returning its head and its args in left-to-right order. */
-  private def flattenApply(tpe: Type): (Type, List[Type]) = {
-    @tailrec
-    def loop(t: Type, argsAcc: List[Type]): (Type, List[Type]) = t match {
-      case Type.Apply(t1, t2, _) => loop(t1, t2 :: argsAcc)
-      case head => (head, argsAcc)
-    }
-    loop(tpe, Nil)
-  }
-
   /**
     * Converts `tpe` to a `MonoArg` relative to the current declaration context.
     * Type variables bound by the current declaration become `Param`; everything else becomes `Const` or `App`.
@@ -791,7 +759,7 @@ object ConstraintCollection {
         try MonoArg.Const(MonomorphCanon.canonicalEffect(tpe))
         catch { case _: ca.uwaterloo.flix.util.InternalCompilerException => MonoArg.Const(tpe) }
       else {
-        val (head, args) = flattenApply(tpe)
+        val (head, args) = MonomorphHelpers.flattenApply(tpe)
         MonoArg.App(typeToMonoArg(head), args.map(arg => typeToMonoArg(arg)))
       }
     case other =>
@@ -800,8 +768,8 @@ object ConstraintCollection {
 
   /** Returns the enum/struct `MonoVar` and type arguments for a fully-applied enum/struct type. */
   private def getEnumMonoVarAndTypeArgs(tpe0: Type, loc: SourceLocation): (MonoVar, List[Type]) = {
-    val tpe = dealias(tpe0)
-    val (head, args) = flattenApply(tpe)
+    val tpe = Type.eraseAliases(tpe0)
+    val (head, args) = MonomorphHelpers.flattenApply(tpe)
     head match {
       case Type.Cst(TypeConstructor.Enum(sym, _), _)             => (MonoVar.Enum(sym), args)
       case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => (MonoVar.RestrictableEnum(sym), args)

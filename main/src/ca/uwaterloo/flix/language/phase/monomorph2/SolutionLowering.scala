@@ -1736,7 +1736,7 @@ object SolutionLowering {
       // Compute the universally quantified variables (i.e. the variables not bound by the local scope).
       // NB: quantified on RAW syms (cparams vs. exp0), then mapped through env/subst — the syms
       // must match the visited exp's renamed vars inside mkFunctional's substExp.
-      val inVars = quantifiedVars(cparams0, exp0).map { case (sym, tpe) => (env(sym), subst(tpe)) }
+      val inVars = MonomorphHelpers.quantifiedVars(cparams0, exp0).map { case (sym, tpe) => (env(sym), subst(tpe)) }
       val exp = visitExp(exp0, env, subst)
       val outVars = outVars0.map(b => env(b.sym))
       mkFunctional(outVars, inVars, exp, subst(exp0.tpe), loc)
@@ -1744,7 +1744,7 @@ object SolutionLowering {
     case TypedAst.Predicate.Body.Guard(exp0, loc) =>
       // Compute the universally quantified variables (i.e. the variables not bound by the local scope).
       // NB: same env/subst mapping as Functional above, for the same reason (mkGuard's substExp).
-      val quantifiedFreeVars = quantifiedVars(cparams0, exp0).map { case (sym, tpe) => (env(sym), subst(tpe)) }
+      val quantifiedFreeVars = MonomorphHelpers.quantifiedVars(cparams0, exp0).map { case (sym, tpe) => (env(sym), subst(tpe)) }
       val exp = visitExp(exp0, env, subst)
       mkGuard(quantifiedFreeVars, exp, loc)
 
@@ -1759,7 +1759,7 @@ object SolutionLowering {
   private def lowerHeadTerm(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, env: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     exp0 match {
       case TypedAst.Expr.Var(sym, _, _) =>
-        if (isQuantifiedVar(sym, cparams0)) {
+        if (MonomorphHelpers.isQuantifiedVar(sym, cparams0)) {
           mkHeadTermVar(env(sym))
         } else {
           mkHeadTermLit(box(visitExp(exp0, env, subst), subst(exp0.tpe)))
@@ -1767,7 +1767,7 @@ object SolutionLowering {
 
       case _ =>
         // The universally quantified variables (i.e. the variables not bound by the local scope).
-        val quantifiedFreeVars = quantifiedVars(cparams0, exp0)
+        val quantifiedFreeVars = MonomorphHelpers.quantifiedVars(cparams0, exp0)
 
         if (quantifiedFreeVars.isEmpty) {
           mkHeadTermLit(box(visitExp(exp0, env, subst), subst(exp0.tpe)))
@@ -1787,7 +1787,7 @@ object SolutionLowering {
       mkBodyTermWild(loc)
 
     case TypedAst.Pattern.Var(bnd, tpe, loc) =>
-      if (isQuantifiedVar(bnd.sym, cparams0)) {
+      if (MonomorphHelpers.isQuantifiedVar(bnd.sym, cparams0)) {
         // Case 1: Quantified variable.
         mkBodyTermVar(env(bnd.sym))
       } else {
@@ -2157,26 +2157,6 @@ object SolutionLowering {
   private def mkVector(exps: List[MonoAst.Expr], elmType: Type, loc: SourceLocation): MonoAst.Expr = {
     MonoAst.Expr.ApplyAtomic(AtomicOp.VectorLit, exps, Type.mkVector(elmType, loc), Type.Pure, loc)
   }
-
-  /**
-    * Return a list of quantified variables in the given expression `exp0`.
-    *
-    * A variable is quantified (i.e. *NOT* lexically bound) if it occurs in the expression `exp0`
-    * but not in the constraint params `cparams0` of the constraint.
-    */
-  private def quantifiedVars(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr): List[(Symbol.VarSym, Type)] = {
-    TypedAstOps.freeVars(exp0).toList.filter {
-      case (sym, _) => isQuantifiedVar(sym, cparams0)
-    }
-  }
-
-  /**
-    * Returns `true` if the given variable symbol `sym` is a quantified variable according to the given constraint params `cparams0`.
-    *
-    * That is, the variable symbol is *NOT* lexically bound.
-    */
-  private def isQuantifiedVar(sym: Symbol.VarSym, cparams0: List[TypedAst.ConstraintParam]): Boolean =
-    cparams0.exists(p => p.bnd.sym == sym)
 
   /*
    * Methods for substitution

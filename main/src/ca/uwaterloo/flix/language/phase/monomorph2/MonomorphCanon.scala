@@ -21,7 +21,7 @@ import ca.uwaterloo.flix.language.ast.{Kind, Name, RigidityEnv, SourceLocation, 
 import ca.uwaterloo.flix.language.ast.shared.RegionScope
 import ca.uwaterloo.flix.language.phase.typer.{Progress, TypeReduction2}
 import ca.uwaterloo.flix.util.InternalCompilerException
-import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListMap}
+import ca.uwaterloo.flix.util.collection.CofiniteSet
 
 import scala.collection.immutable.SortedSet
 
@@ -35,13 +35,6 @@ import scala.collection.immutable.SortedSet
   * diverge for the same instantiation.
   */
 private[monomorph2] object MonomorphCanon {
-
-  /**
-    * Builds a lookup map from `(trait, type constructor)` to the instance implementing it.
-    * Shared by the solver's sig dispatch and the specializer's `ApplySig` resolution.
-    */
-  def mkInstanceMap(instances: ListMap[Symbol.TraitSym, TypedAst.Instance]): Map[(Symbol.TraitSym, TypeConstructor), TypedAst.Instance] =
-    instances.map { case (sym, inst) => ((sym, inst.tpe.typeConstructor.get), inst) }.toMap
 
   /** Returns the canonical form of the ground effect type `eff`. */
   def canonicalEffect(eff: Type): Type = coSetToType(evalEffect(eff), eff.loc)

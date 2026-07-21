@@ -26,7 +26,6 @@ import ca.uwaterloo.flix.language.phase.unification.Substitution
 import ca.uwaterloo.flix.util.collection.MapOps
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
-import scala.annotation.tailrec
 import scala.collection.mutable
 
 /**
@@ -311,7 +310,7 @@ object SolutionSpecialization {
     */
   private[monomorph2] def rewriteEnumStructType(tpe: Type)(implicit ctx: Context): Type = tpe match {
     case Type.Apply(_, _, loc) =>
-      val (head, args) = flattenApply(tpe)
+      val (head, args) = MonomorphHelpers.flattenApply(tpe)
       head match {
         case Type.Cst(TypeConstructor.Enum(sym, _), _) if ctx.enumTable.contains((sym, args)) =>
           Type.mkEnum(ctx.enumTable((sym, args)), Nil, loc)
@@ -325,16 +324,6 @@ object SolutionSpecialization {
     case Type.Alias(sym, args, inner, loc) =>
       Type.Alias(sym, args.map(rewriteEnumStructType), rewriteEnumStructType(inner), loc)
     case _ => tpe // Var, other Cst, AssocType, etc. — nothing to rewrite.
-  }
-
-  /** Walks `tpe`'s `Type.Apply` chain once, returning its head and its args in left-to-right order. */
-  private def flattenApply(tpe: Type): (Type, List[Type]) = {
-    @tailrec
-    def loop(t: Type, argsAcc: List[Type]): (Type, List[Type]) = t match {
-      case Type.Apply(t1, t2, _) => loop(t1, t2 :: argsAcc)
-      case head => (head, argsAcc)
-    }
-    loop(tpe, Nil)
   }
 
   /** Applies [[rewriteEnumStructType]] to every type embedded in `spec`. */
@@ -368,7 +357,7 @@ object SolutionSpecialization {
   /** Specializes `root` per `solution`, the constraint solver's output from Phase 3. */
   def run(root: TypedAst.Root, solution: Solution)(implicit flix: Flix): MonoAst.Root = flix.phase("Monomorpher") {
     implicit val r: TypedAst.Root = root
-    val is: Map[(Symbol.TraitSym, TypeConstructor), Instance] = MonomorphCanon.mkInstanceMap(root.instances)
+    val is: Map[(Symbol.TraitSym, TypeConstructor), Instance] = MonomorphHelpers.mkInstanceMap(root.instances)
 
     // Instance defs live in root.instances, not root.defs — merge for unified lookup.
     // Also track which instance each def belongs to, so we can use inst.tparams when building subst.
