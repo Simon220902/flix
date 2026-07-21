@@ -135,6 +135,7 @@ object ConstraintCollection {
     * Emits flow constraints for enum type applications occurring in `tpe`.
     */
   private def visitType(tpe0: Type, acc: List[Flow])(implicit ctx: Context): List[Flow] = Type.eraseAliases(tpe0) match {
+    // Deep alias erasure above because flattenApply/.typeArguments below don't check for Type.Alias
     case at @ Type.AssocType(_, arg, _, _) =>
       // If the associated type is ground, resolve it and continue; otherwise recurse into arg.
       if (tpe0.typeVars.isEmpty) visitType(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix), acc)
@@ -142,7 +143,7 @@ object ConstraintCollection {
     case _: Type.BaseType
          | Type.Var(_, _)
          | Type.Cst(_, _) => acc
-    case app @ Type.Apply(_, _, loc) =>
+    case app @ Type.Apply(_, _, _) =>
       val (appHead, tpArgs) = MonomorphHelpers.flattenApply(app)
       val acc1 = tpArgs.foldLeft(acc)((a, t) => visitType(t, a))
       val mvarOpt = appHead match {
@@ -729,18 +730,15 @@ object ConstraintCollection {
     case other => other
   }
 
-  /**
-    * Converts `tpe` to a `MonoArg` relative to the current declaration context.
-    * Type variables bound by the current declaration become `Param`; everything else becomes `Const` or `App`.
-    */
-  private def typeToMonoArg(tpe: Type)(implicit ctx: Context): MonoArg = tpe match {
+  /** Converts `tpe` to a `MonoArg` relative to the current declaration context. */
+  private def typeToMonoArg(tpe: Type)(implicit ctx: Context): MonoArg = Type.eraseAliases(tpe) match {
     case Type.Var(sym, _) =>
       ctx.tparamEnv.get(sym) match {
         case Some(idx) => MonoArg.Param(ctx.currentDecl, idx)
         case None =>
           // A type variable that is not a tparam of the current decl — e.g. a region var
           // introduced by `region r { ... }`, which is local to the expression. Mirroring
-          // Specialization.defaultType, such vars do not drive specialization: record them as an
+          // Specialization.default, such vars do not drive specialization: record them as an
           // opaque constant so the flow is still emitted but the solver does not propagate them.
           MonoArg.Const(tpe)
       }
@@ -748,8 +746,6 @@ object ConstraintCollection {
       // Ground: resolve eagerly. Non-ground: record symbolically for the solver.
       if (tpe.typeVars.isEmpty) MonoArg.Const(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix))
       else MonoArg.Assoc(symUse.sym, typeToMonoArg(arg), kind, assocLoc)
-    case Type.Alias(_, _, inner, _) =>
-      typeToMonoArg(inner)
     case Type.Cst(_, _) | _: Type.BaseType =>
       MonoArg.Const(tpe)
     case Type.Apply(_, _, _) =>
