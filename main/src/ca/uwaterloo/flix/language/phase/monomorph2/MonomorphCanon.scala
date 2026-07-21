@@ -36,9 +36,11 @@ import scala.collection.immutable.SortedSet
   */
 private[monomorph2] object MonomorphCanon {
 
+  // Ported from monomorph.Specialization.canonicalEffect; keep in sync if that baseline changes.
   /** Returns the canonical form of the ground effect type `eff`. */
   def canonicalEffect(eff: Type): Type = coSetToType(evalEffect(eff), eff.loc)
 
+  // Ported from monomorph.Specialization.eval; keep in sync if that baseline changes.
   /**
     * Evaluates the ground effect `eff` to a set of effect symbols.
     *
@@ -58,12 +60,14 @@ private[monomorph2] object MonomorphCanon {
     case other => throw InternalCompilerException(s"Unexpected effect $other", other.loc)
   }
 
+  // Ported from monomorph.Specialization.coSetToType; keep in sync if that baseline changes.
   /** Returns the [[Type]] representation of `set` at `loc`. */
   def coSetToType(set: CofiniteSet[Symbol.EffSym], loc: SourceLocation): Type = set match {
     case CofiniteSet.Set(s)   => Type.mkUnion(s.toList.map(sym => Type.Cst(TypeConstructor.Effect(sym, Kind.Eff), loc)), loc)
     case CofiniteSet.Compl(s) => Type.mkComplement(Type.mkUnion(s.toList.map(sym => Type.Cst(TypeConstructor.Effect(sym, Kind.Eff), loc)), loc), loc)
   }
 
+  // Ported from monomorph.Specialization.reduceAssocType; keep in sync if that baseline changes.
   /** Reduces a ground associated type to its concrete type via the EqualityEnv. */
   def reduceAssocType(assoc: Type.AssocType)(implicit root: TypedAst.Root, flix: Flix): Type = {
     val progress = Progress()
@@ -73,12 +77,13 @@ private[monomorph2] object MonomorphCanon {
     else throw InternalCompilerException(s"Could not reduce associated type $assoc", assoc.loc)
   }
 
+  // Ported from monomorph.Specialization.normalizeApply; keep in sync if that baseline changes.
   /**
-    * Rebuilds `Type.Apply(normalize(tpe1), normalize(tpe2), loc)`, folding ground effect and
-    * case-set/record-row/schema-row formulas via the same smart constructors used elsewhere, so
-    * the result matches what the specializer's query is built from (e.g. `{Cst} + {}` collapses
-    * to `{Cst}`, not a raw `CaseUnion` node; a ground effect formula collapses to its canonical
-    * union-of-constants form).
+    * Rebuilds `Type.Apply(normalize(tpe1), normalize(tpe2), loc)`, folding ground effect,
+    * bool, and case-set/record-row/schema-row formulas via the same smart constructors used
+    * elsewhere, so the result matches what the specializer's query is built from (e.g. `{Cst} + {}`
+    * collapses to `{Cst}`, not a raw `CaseUnion` node; a ground effect formula collapses to its
+    * canonical union-of-constants form).
     */
   def normalizeApply(normalize: Type => Type, app: Type.Apply, isGround: Boolean): Type = {
     val Type.Apply(tpe1, tpe2, loc) = app
@@ -93,6 +98,11 @@ private[monomorph2] object MonomorphCanon {
       case (Type.Apply(Type.Cst(TypeConstructor.Intersection, _), x, _), y) => Type.mkIntersection(x, y, loc)
       case (Type.Apply(Type.Cst(TypeConstructor.Difference, _), x, _), y) => Type.mkDifference(x, y, loc)
       case (Type.Apply(Type.Cst(TypeConstructor.SymmetricDiff, _), x, _), y) => Type.mkSymmetricDiff(x, y, loc)
+      // Bool equations don't need separate canonicalization: unlike effects, these smart
+      // constructors fully reduce a ground formula to a single True/False constant.
+      case (Type.Cst(TypeConstructor.Not, _), y) => Type.mkNot(y, loc)
+      case (Type.Apply(Type.Cst(TypeConstructor.And, _), x, _), y) => Type.mkAnd(x, y, loc)
+      case (Type.Apply(Type.Cst(TypeConstructor.Or, _), x, _), y) => Type.mkOr(x, y, loc)
       case (Type.Cst(TypeConstructor.CaseComplement(sym), _), y) => Type.mkCaseComplement(y, sym, loc)
       case (Type.Apply(Type.Cst(TypeConstructor.CaseIntersection(sym), _), x, _), y) => Type.mkCaseIntersection(x, y, sym, loc)
       case (Type.Apply(Type.Cst(TypeConstructor.CaseUnion(sym), _), x, _), y) => Type.mkCaseUnion(x, y, sym, loc)
@@ -104,6 +114,7 @@ private[monomorph2] object MonomorphCanon {
     }
   }
 
+  // Ported from monomorph.Specialization.simplify; keep in sync if that baseline changes.
   /**
     * Canonicalizes `tpe`: folds ground effect/case-set/row formulas via [[normalizeApply]] and
     * reduces ground associated types via [[reduceAssocType]]. When `isGround` is true, `tpe` is
@@ -139,6 +150,7 @@ private[monomorph2] object MonomorphCanon {
     case Kind.Error        => throw InternalCompilerException(s"Unexpected type '$tpe0'.", tpe0.loc)
   }
 
+  // Ported from monomorph.Specialization.mkRecordExtendSorted; keep in sync if that baseline changes.
   /** Inserts the record row `label -> tpe` into `rest`, keeping labels sorted. */
   private def mkRecordExtendSorted(label: Name.Label, tpe: Type, rest: Type, loc: SourceLocation): Type = rest match {
     case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.RecordRowExtend(l), loc1), t, loc2), r, loc3) if l.name < label.name =>
@@ -153,6 +165,7 @@ private[monomorph2] object MonomorphCanon {
     case Type.UnresolvedJvmType(_, _)   => throw InternalCompilerException(s"Unexpected JVM type '$rest'", rest.loc)
   }
 
+  // Ported from monomorph.Specialization.mkSchemaExtendSorted; keep in sync if that baseline changes.
   /** Inserts the schema row `label -> tpe` into `rest`, keeping predicates sorted. */
   private def mkSchemaExtendSorted(label: Name.Pred, tpe: Type, rest: Type, loc: SourceLocation): Type = rest match {
     case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SchemaRowExtend(l), loc1), t, loc2), r, loc3) if l.name < label.name =>

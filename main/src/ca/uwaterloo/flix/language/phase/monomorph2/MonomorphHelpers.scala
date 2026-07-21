@@ -53,6 +53,7 @@ private[monomorph2] object MonomorphHelpers {
   def quantifiedVars(cparams0: List[TypedAst.ConstraintParam], exp0: Expr): List[(Symbol.VarSym, Type)] =
     TypedAstOps.freeVars(exp0).toList.filter { case (sym, _) => isQuantifiedVar(sym, cparams0) }
 
+  // Ported from monomorph.Specialization.mkInstanceMap; keep in sync if that baseline changes.
   /**
     * Builds a lookup map from `(trait, type constructor)` to the instance implementing it.
     * Shared by the solver's sig dispatch and the specializer's `ApplySig` resolution.
