@@ -29,14 +29,8 @@ import scala.annotation.tailrec
 
 
 /**
-  * Constraint generation for constraint-based monomorphization.
-  *
-  * Walks the treeshaken `TypedAst` root and, for every definition, enum, trait instance, default
-  * trait implementation, and effect operation signature, emits `Flow` constraints describing how
-  * concrete types and type shapes propagate into the type-parameter slots of the definitions and
-  * enums it references.
-  * `ConstraintSolver` later solves these constraints to find every concrete instantiation each
-  * definition/enum needs to be specialized at.
+  * Constraint generation for constraint-based monomorphization: emits `Flow` constraints
+  * describing how concrete types propagate through the program, for [[ConstraintSolver]] to solve.
   */
 object ConstraintCollection {
 

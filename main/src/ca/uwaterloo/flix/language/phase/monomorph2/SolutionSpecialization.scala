@@ -30,9 +30,8 @@ import scala.annotation.tailrec
 import scala.collection.mutable
 
 /**
-  * Solution-driven specialization: uses the solver solution from Phase 3 to specialize all defs
-  * in a single parallel pass, with no demand-driven fallback. Crashes on any call site not
-  * covered by the solution ("solver gap"), which identifies missing constraints.
+  * Solution-driven specialization: uses the solver's solution to specialize all def/enum/struct/
+  * restrictable-enum in a single parallel pass.
   *
   * `run` is the entry point and owns the `Context` lookup tables (`defTable`/`enumTable`/
   * `structTable`). The per-def specialize+lower walk itself lives in `[[SolutionLowering.visitDef]]`,
