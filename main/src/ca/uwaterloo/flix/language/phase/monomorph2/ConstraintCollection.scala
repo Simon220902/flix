@@ -762,7 +762,7 @@ object ConstraintCollection {
       MonoArg.Const(other)
   }
 
-  /** Returns the enum/struct `MonoVar` and type arguments for a fully-applied enum/struct type. */
+  /** Returns the enum/struct `MonoVar` and type arguments of `tpe0`. */
   private def getEnumMonoVarAndTypeArgs(tpe0: Type, loc: SourceLocation): (MonoVar, List[Type]) = {
     val tpe = Type.eraseAliases(tpe0)
     val (head, args) = MonomorphHelpers.flattenApply(tpe)
@@ -770,7 +770,7 @@ object ConstraintCollection {
       case Type.Cst(TypeConstructor.Enum(sym, _), _)             => (MonoVar.Enum(sym), args)
       case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => (MonoVar.RestrictableEnum(sym), args)
       case Type.Cst(TypeConstructor.Struct(sym, _), _)           => (MonoVar.Struct(sym), args)
-      case _ => throw InternalCompilerException(s"ConstraintGen: bad types? ${tpe}", loc)
+      case _ => throw InternalCompilerException(s"Expected an Enum, RestrictableEnum, or Struct type, but got $tpe", loc)
     }
   }
 
