@@ -67,9 +67,8 @@ object ConstraintCollection {
     val fromInstances = ParOps.parMap(root.instances.values) { inst =>
       val instTparamEnv = inst.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
       inst.defs.flatMap { instDef =>
-        // Add spec.tparams that are NOT already covered by inst.tparams (e.g. a, b, ef in
-        // Applicative[Option].ap). Generic instances (e.g. Eq[(a, b)]) duplicate inst.tparams
-        // in spec.tparams, so filtering avoids overwriting the correct instTparam indices.
+        // Derived instances (Deriver.scala) reuse the same tparam symbols for both inst.tparams
+        // and spec.tparams; exclude that overlap here instead of reassigning it a wrong index below.
         val offset = inst.tparams.length
         val newSpecTparams = instDef.spec.tparams.filterNot(tp => instTparamEnv.contains(tp.sym))
         val specTparamEnv = newSpecTparams.zipWithIndex.map { case (tp, j) => tp.sym -> (offset + j) }.toMap
@@ -92,17 +91,15 @@ object ConstraintCollection {
       visitStruct(struct, Nil)
     }.flatten.toSet
 
-    // Visits default trait-impl bodies (root.sigs with exp.isDefined) so dispatched sigs propagate.
-    // fromSigs/fromEffects synthesize a DefnSym so their own tparams  classify as Param, not
-    // wrongly-ground Const. (Same is true for fromEffects)
     val fromSigs = ParOps.parMap(root.sigs.values.filter(_.exp.isDefined)) { sig =>
-      // traitTparam (e.g. `t` in `Foldable[t]`) isn't in sig.spec.tparams but is free in the
-      // default impl body — prepended so index 0 matches ConstraintSolver.resolveSig's tuple
-      // layout: [traitType, ...sig-own args].
+      // We prepend traitTparam (e.g. `t` in `Foldable[t]`) since it isn't in sig.spec.tparams
+      // but is free in the default impl body.
       val trt = root.traits(sig.sym.trt)
       val traitTparam = trt.tparam
       val allTparams = traitTparam :: sig.spec.tparams
       val tparamEnv = allTparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
+      // We synthesize a DefnSym so their own tparams classify as Param, not  wrongly-ground
+      // Const. (Same is true for fromEffects)
       val ns = sig.sym.trt.namespace :+ sig.sym.trt.name
       val defnSym = new Symbol.DefnSym(None, ns, sig.sym.name, sig.sym.loc)
       flix.profile(defnSym, sig.sym.loc) {
@@ -183,12 +180,7 @@ object ConstraintCollection {
 
   /**
     * Emits flow constraints for the default-handler calls that
-    * `SolutionLowering.wrapDefWithDefaultHandlers` synthesizes around entry points (main, `@Test`,
-    * `@Export`).
-    *
-    * Mirrors `SolutionLowering.wrapInHandler`: each required default handler is applied in
-    * sequence, instantiated at `(Unit -> retTpe \ ef) -> retTpe \ ((ef - handledEff) + IO)`, where
-    * `ef` starts as `defn.spec.eff` and is threaded through the fold exactly as the lowering does.
+    * `SolutionLowering.wrapDefWithDefaultHandlers` synthesizes around entry points.
     */
   private def entryPointHandlerFlows(defn: TypedAst.Def, acc: List[Flow])(implicit ctx: Context): List[Flow] = {
     if (!TypedAstOps.isEntryPoint(defn)(ctx.root)) acc
@@ -199,34 +191,35 @@ object ConstraintCollection {
       var eff = defn.spec.eff
       requiredHandlers.foldLeft(acc) { (a, handler) =>
         // Handler signature is `pub def h(f: Unit -> a \ ef): a \ ...` with tparams inferred
-        // in order of first occurrence: [ef, a] (the effect var in the arrow, then the result type).
+        // in order of first occurrence: [ef, a].
         val flow = Flow(
           List(typeToMonoArg(eff), typeToMonoArg(defn.spec.retTpe)),
           MonoVar.Def(handler.handlerSym)
         )
-        // Canonicalized to match SolutionLowering.wrapInHandler, which threads the canonical (not
-        // raw formula) effect into the next handler wrap via this same MonomorphCanon.canonicalEffect call.
         eff = MonomorphCanon.canonicalEffect(Type.mkUnion(Type.mkDifference(eff, handler.handledEff, loc), Type.IO, loc))
         flow :: a
       }
+      flows
     }
   }
 
   /**
-    * Emits flow constraints for all call sites and enum usages in `exp`. Datalog and channel
-    * nodes additionally emit constraints for the stdlib calls [[SolutionLowering]] will
-    * synthesize for them.
+    * Emits flow constraints for all call sites and enum/struct construction sites in `exp`.
+    * Datalog and channel nodes additionally emit constraints for the stdlib calls
+    * [[SolutionLowering]] will synthesize for them.
     */
-  private def visitExp(exp: Expr, acc: List[Flow])(implicit ctx: Context): List[Flow] = exp match {
+  private def visitExp(exp0: Expr, acc: List[Flow])(implicit ctx: Context): List[Flow] = exp0 match {
     case Expr.Cst(_, _, _) => acc
     case Expr.Var(_, _, _) => acc
     case Expr.Hole(_, _, _, _, _) => acc
 
     case Expr.ApplyDef(symUse, exps, targs, _, _, _, _, loc) =>
+    case Expr.ApplyDef(symUse, exps, targs, _, _, _, _, _) =>
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       Flow(targs.map(typeToMonoArg(_)), MonoVar.Def(symUse.sym)) :: acc1
 
     case Expr.ApplySig(symUse, exps, targ, targs, _, _, _, _, loc) =>
+    case Expr.ApplySig(symUse, exps, targ, targs, _, _, _, _, _) =>
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       Flow((targ :: targs).map(typeToMonoArg(_)), MonoVar.Sig(symUse.sym)) :: acc1
 
