@@ -130,7 +130,7 @@ object ConstraintCollection {
     * Emits flow constraints for enum type applications occurring in `tpe`.
     */
   private def visitType(tpe0: Type, acc: List[Flow])(implicit ctx: Context): List[Flow] = Type.eraseAliases(tpe0) match {
-    // Deep alias erasure above because flattenApply/.typeArguments below don't check for Type.Alias
+    // Deep alias erasure above because .baseType/.typeArguments below don't check for Type.Alias
     case at @ Type.AssocType(_, arg, _, _) =>
       // If the associated type is ground, resolve it and continue; otherwise recurse into arg.
       if (at.typeVars.isEmpty) visitType(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix), acc)
@@ -139,7 +139,8 @@ object ConstraintCollection {
          | Type.Var(_, _)
          | Type.Cst(_, _) => acc
     case app @ Type.Apply(_, _, _) =>
-      val (head, args) = MonomorphHelpers.flattenApply(app)
+      val head = app.baseType
+      val args = app.typeArguments
       val acc1 = args.foldLeft(acc)((a, t) => visitType(t, a))
       val mvarOpt = head match {
         case Type.Cst(TypeConstructor.Enum(sym, _), _)             => Some(MonoVar.Enum(sym))
@@ -752,8 +753,7 @@ object ConstraintCollection {
           // evalEffect has no AssocType case.
           MonoArg.Const(MonomorphCanon.simplify(tpe, isGround = true)(ctx.root, ctx.flix))
         else {
-          val (head, args) = MonomorphHelpers.flattenApply(tpe)
-          MonoArg.App(typeToMonoArg(head), args.map(arg => typeToMonoArg(arg)))
+          MonoArg.App(typeToMonoArg(tpe.baseType), tpe.typeArguments.map(arg => typeToMonoArg(arg)))
         }
       case other =>
         MonoArg.Const(other)
@@ -763,8 +763,8 @@ object ConstraintCollection {
   /** Returns the enum/struct `MonoVar` and type arguments of `tpe0`. */
   private def getEnumMonoVarAndTypeArgs(tpe0: Type, loc: SourceLocation): (MonoVar, List[Type]) = {
     val tpe = Type.eraseAliases(tpe0)
-    val (head, args) = MonomorphHelpers.flattenApply(tpe)
-    head match {
+    val args = tpe.typeArguments
+    tpe.baseType match {
       case Type.Cst(TypeConstructor.Enum(sym, _), _)             => (MonoVar.Enum(sym), args)
       case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => (MonoVar.RestrictableEnum(sym), args)
       case Type.Cst(TypeConstructor.Struct(sym, _), _)           => (MonoVar.Struct(sym), args)

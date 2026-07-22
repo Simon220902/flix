@@ -310,8 +310,8 @@ object SolutionSpecialization {
     */
   private[monomorph2] def rewriteEnumStructType(tpe: Type)(implicit ctx: Context): Type = tpe match {
     case Type.Apply(_, _, loc) =>
-      val (head, args) = MonomorphHelpers.flattenApply(tpe)
-      head match {
+      val args = tpe.typeArguments
+      tpe.baseType match {
         case Type.Cst(TypeConstructor.Enum(sym, _), _) if ctx.enumTable.contains((sym, args)) =>
           Type.mkEnum(ctx.enumTable((sym, args)), Nil, loc)
         case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) if ctx.restrictableEnumTable.contains((sym, args)) =>
@@ -319,7 +319,7 @@ object SolutionSpecialization {
         case Type.Cst(TypeConstructor.Struct(sym, _), _) if ctx.structTable.contains((sym, args)) =>
           Type.mkStruct(ctx.structTable((sym, args)), Nil, loc)
         case _ =>
-          args.foldLeft(rewriteEnumStructType(head)) { case (acc, arg) => Type.Apply(acc, rewriteEnumStructType(arg), loc) }
+          args.foldLeft(rewriteEnumStructType(tpe.baseType)) { case (acc, arg) => Type.Apply(acc, rewriteEnumStructType(arg), loc) }
       }
     case Type.Alias(sym, args, inner, loc) =>
       Type.Alias(sym, args.map(rewriteEnumStructType), rewriteEnumStructType(inner), loc)

@@ -21,24 +21,12 @@ import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.{Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.util.collection.ListMap
 
-import scala.annotation.tailrec
-
 /**
   * Generic helpers shared across the constraint-based monomorphization pipeline. Unlike
   * [[MonomorphCanon]], nothing here carries a "solver and specializer must agree" contract —
   * these are plain, reusable tree-walking utilities.
   */
 private[monomorph2] object MonomorphHelpers {
-
-  /** Walks `tpe`'s `Type.Apply` chain once, returning its head and its args in left-to-right order. */
-  def flattenApply(tpe: Type): (Type, List[Type]) = {
-    @tailrec
-    def loop(t: Type, argsAcc: List[Type]): (Type, List[Type]) = t match {
-      case Type.Apply(t1, t2, _) => loop(t1, t2 :: argsAcc)
-      case head => (head, argsAcc)
-    }
-    loop(tpe, Nil)
-  }
 
   /**
     * Returns `true` if the given variable symbol `sym` is a quantified variable according to the
