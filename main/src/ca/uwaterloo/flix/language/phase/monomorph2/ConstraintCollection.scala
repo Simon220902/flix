@@ -188,16 +188,15 @@ object ConstraintCollection {
       val loc = defn.spec.eff.loc
       val defEffects = MonomorphCanon.evalEffect(defn.spec.eff)
       val requiredHandlers = ctx.root.defaultHandlers.filter(h => defEffects.contains(h.handledSym))
-      var eff = defn.spec.eff
-      requiredHandlers.foldLeft(acc) { (a, handler) =>
+      val (flows, _) = requiredHandlers.foldLeft((acc,defn.spec.eff)) { case ((a, eff), handler) =>
         // Handler signature is `pub def h(f: Unit -> a \ ef): a \ ...` with tparams inferred
         // in order of first occurrence: [ef, a].
         val flow = Flow(
           List(typeToMonoArg(eff), typeToMonoArg(defn.spec.retTpe)),
           MonoVar.Def(handler.handlerSym)
         )
-        eff = MonomorphCanon.canonicalEffect(Type.mkUnion(Type.mkDifference(eff, handler.handledEff, loc), Type.IO, loc))
-        flow :: a
+        val residualEff = MonomorphCanon.canonicalEffect(Type.mkUnion(Type.mkDifference(eff, handler.handledEff, loc), Type.IO, loc))
+        (flow :: a, residualEff)
       }
       flows
     }
