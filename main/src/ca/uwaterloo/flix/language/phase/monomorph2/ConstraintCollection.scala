@@ -501,7 +501,7 @@ object ConstraintCollection {
     case Expr.FixpointQueryWithSelect(exps, queryExp, selects, from, where, _, tpe0, _, _) =>
       val arity = selects.length
       val innerTpe = unwrapVectorType(tpe0)
-      val argTypes = if (arity <= 1) List(innerTpe) else innerTpe.typeArguments
+      val argTypes = unmkTuplish(arity, innerTpe)
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       val acc2 = visitExp(queryExp, acc1)
       val acc3 = selects.foldLeft(acc2)((a, e) => visitExp(e, a))
@@ -619,7 +619,7 @@ object ConstraintCollection {
       case Type.Apply(Type.Cst(TypeConstructor.Vector, _), t, _) => t
       case t => throw InternalCompilerException(s"Expected Vector[_], but got $t", exp0.loc)
     }
-    val outTypes = if (outArity <= 1) List(inner) else inner.typeArguments
+    val outTypes = unmkTuplish(outArity, inner)
     Flow((inVars.map(_._2) ++ outTypes).map(typeToMonoArg(_)), MonoVar.Def(Defs.LiftXM(inVars.length, outArity)))
   }
 
@@ -643,6 +643,13 @@ object ConstraintCollection {
     case Type.Apply(Type.Cst(TypeConstructor.Vector, _), extType, _) => extType
     case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Vector, _), _, _), but got $t", tpe0.loc)
   }
+
+  /**
+    * Inverse of `Type.mkTuplish`. `arity` can't be derived from `tpe` alone — mkTuplish leaves
+    * an arity-1 result bare, so a single value can itself be tuple-typed.
+    */
+  private def unmkTuplish(arity: Int, tpe: Type): List[Type] =
+    if (arity <= 1) List(tpe) else tpe.typeArguments
 
   /** Mirrors `SolutionLowering.predicatesOfExtVar`. */
   private def predicatesOfExtVar(tpe0: Type): List[(Name.Pred, List[Type])] = Type.eraseAliases(tpe0) match {
