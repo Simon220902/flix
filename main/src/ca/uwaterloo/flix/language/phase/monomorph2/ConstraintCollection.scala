@@ -431,9 +431,9 @@ object ConstraintCollection {
     case Expr.SelectChannel(rules, default, _, _, _) =>
       val acc1 = rules.foldLeft(acc) { (a, r) =>
         val elmType = r.chan.tpe match {
-          case Type.Apply(Type.Apply(_, e, _), _, _) => e  // Mpmc[T, rc] → T
-          case Type.Apply(_, e, _)                    => e  // Sender[T] / Receiver[T] → T
-          case t                                      => t
+          // Only possible shape since ConstraintGen.visitSelectRule unifies every rule's channel with Receiver[_]
+          case Type.Apply(Type.Cst(TypeConstructor.Receiver, _), e, _) => e
+          case t => throw InternalCompilerException(s"Expected Receiver[_], but got $t", r.chan.loc)
         }
         val elmArg = typeToMonoArg(lowerChannelType(elmType))
         val a1 = visitExp(r.exp, visitExp(r.chan, a))
