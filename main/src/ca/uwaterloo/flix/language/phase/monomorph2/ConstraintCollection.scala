@@ -261,12 +261,12 @@ object ConstraintCollection {
       }
 
     case Expr.Tag(_, exps, tpe, _, _) =>
-      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe)
+      val (mvar, tpArgs) = getMonoVarAndTypeArgs(tpe)
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       Flow(tpArgs.map(typeToMonoArg(_)), mvar) :: acc1
 
     case Expr.RestrictableTag(_, exps, tpe, _, _) =>
-      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe)
+      val (mvar, tpArgs) = getMonoVarAndTypeArgs(tpe)
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       Flow(tpArgs.map(typeToMonoArg(_)), mvar) :: acc1
 
@@ -325,7 +325,7 @@ object ConstraintCollection {
     case Expr.VectorLength(exp, _) => visitExp(exp, acc)
 
     case Expr.StructNew(_, fields, region, tpe, _, _) =>
-      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe)
+      val (mvar, tpArgs) = getMonoVarAndTypeArgs(tpe)
       val acc1 = fields.foldLeft(acc) { case (a, (_, e)) => visitExp(e, a) }
       val acc2 = region.foldLeft(acc1)((a, r) => visitExp(r, a))
       Flow(tpArgs.map(typeToMonoArg(_)), mvar) :: acc2
@@ -537,7 +537,7 @@ object ConstraintCollection {
     */
   private def visitPat(pat0: TypedAst.Pattern, acc: List[Flow])(implicit ctx: Context): List[Flow] = pat0 match {
     case TypedAst.Pattern.Tag(_, pats, tpe, _) =>
-      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe)
+      val (mvar, tpArgs) = getMonoVarAndTypeArgs(tpe)
       val acc1 = pats.foldLeft(acc)((a, p) => visitPat(p, a))
       Flow(tpArgs.map(typeToMonoArg(_)), mvar) :: acc1
     case TypedAst.Pattern.Tuple(elms, _, _) =>
@@ -741,16 +741,12 @@ object ConstraintCollection {
     }
   }
 
-  /** Returns the enum/struct `MonoVar` and type arguments of `tpe0`. */
-  private def getEnumMonoVarAndTypeArgs(tpe0: Type): (MonoVar, List[Type]) = {
+  /** Returns the enum/restrictable-enum/struct `MonoVar` and type arguments of `tpe0`. */
+  private def getMonoVarAndTypeArgs(tpe0: Type): (MonoVar, List[Type]) = {
     val tpe = Type.eraseAliases(tpe0)
-    val args = tpe.typeArguments
-    tpe.baseType match {
-      case Type.Cst(TypeConstructor.Enum(sym, _), _)             => (MonoVar.Enum(sym), args)
-      case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => (MonoVar.RestrictableEnum(sym), args)
-      case Type.Cst(TypeConstructor.Struct(sym, _), _)           => (MonoVar.Struct(sym), args)
-      case _ => throw InternalCompilerException(s"Expected an Enum, RestrictableEnum, or Struct type, but got $tpe", tpe0.loc)
-    }
+    val mvar = declMonoVar(tpe.baseType).getOrElse(
+      throw InternalCompilerException(s"Expected an Enum, RestrictableEnum, or Struct type, but got $tpe", tpe0.loc))
+    (mvar, tpe.typeArguments)
   }
 
 }
