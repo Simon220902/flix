@@ -212,12 +212,10 @@ object ConstraintCollection {
     case Expr.Var(_, _, _) => acc
     case Expr.Hole(_, _, _, _, _) => acc
 
-    case Expr.ApplyDef(symUse, exps, targs, _, _, _, _, loc) =>
     case Expr.ApplyDef(symUse, exps, targs, _, _, _, _, _) =>
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       Flow(targs.map(typeToMonoArg(_)), MonoVar.Def(symUse.sym)) :: acc1
 
-    case Expr.ApplySig(symUse, exps, targ, targs, _, _, _, _, loc) =>
     case Expr.ApplySig(symUse, exps, targ, targs, _, _, _, _, _) =>
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       Flow((targ :: targs).map(typeToMonoArg(_)), MonoVar.Sig(symUse.sym)) :: acc1
@@ -264,13 +262,13 @@ object ConstraintCollection {
 
     // Tag and RestrictableTag are handled identically: getEnumMonoVarAndTypeArgs dispatches on the
     // type itself, and the solver handles both resulting mvar kinds.
-    case Expr.Tag(_, exps, tpe, _, loc) =>
-      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe, loc)
+    case Expr.Tag(_, exps, tpe, _, _) =>
+      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe)
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       Flow(tpArgs.map(typeToMonoArg(_)), mvar) :: acc1
 
-    case Expr.RestrictableTag(_, exps, tpe, _, loc) =>
-      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe, loc)
+    case Expr.RestrictableTag(_, exps, tpe, _, _) =>
+      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe)
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       Flow(tpArgs.map(typeToMonoArg(_)), mvar) :: acc1
 
@@ -330,8 +328,8 @@ object ConstraintCollection {
 
     // Mirrors Expr.Tag: a construction site's concrete type args must seed the solver;
     // visitType alone only captures the declaration's own field-type structure.
-    case Expr.StructNew(_, fields, region, tpe, _, loc) =>
-      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe, loc)
+    case Expr.StructNew(_, fields, region, tpe, _, _) =>
+      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe)
       val acc1 = fields.foldLeft(acc) { case (a, (_, e)) => visitExp(e, a) }
       val acc2 = region.foldLeft(acc1)((a, r) => visitExp(r, a))
       Flow(tpArgs.map(typeToMonoArg(_)), mvar) :: acc2
@@ -371,7 +369,7 @@ object ConstraintCollection {
       visitExp(exp2, visitExp(exp1, acc))
 
     // Lowering synthesizes Channel.get/put/newChannel calls for each non-last fragment.
-    case Expr.ParYield(frags, exp, _, _, loc) =>
+    case Expr.ParYield(frags, exp, _, _, _) =>
       val acc1 = frags.foldLeft(acc)((a, f) => visitExp(f.exp, visitPat(f.pat, a)))
       val acc2 = visitExp(exp, acc1)
       frags.init.foldLeft(acc2) { (a, frag) =>
@@ -414,15 +412,15 @@ object ConstraintCollection {
     // Channel nodes recurse into sub-expressions AND emit flows for the @LoweringTargetChannel
     // defs that Lowering will synthesize: GetChannel → Channel.get, PutChannel → Channel.put,
     // NewChannel → Channel.newChannelTuple.
-    case Expr.GetChannel(exp, tpe, _, loc) =>
+    case Expr.GetChannel(exp, tpe, _, _) =>
       val acc1 = visitExp(exp, acc)
       Flow(List(typeToMonoArg(lowerChannelType(tpe))), MonoVar.Def(Defs.ChannelGet)) :: acc1
 
-    case Expr.PutChannel(exp1, exp2, _, _, loc) =>
+    case Expr.PutChannel(exp1, exp2, _, _, _) =>
       val acc1 = visitExp(exp2, visitExp(exp1, acc))
       Flow(List(typeToMonoArg(lowerChannelType(exp2.tpe))), MonoVar.Def(Defs.ChannelPut)) :: acc1
 
-    case Expr.NewChannel(exp, tpe, _, loc) =>
+    case Expr.NewChannel(exp, tpe, _, _) =>
       val elmType = extractChannelElm(tpe)
       val acc1 = visitExp(exp, acc)
       Flow(List(typeToMonoArg(lowerChannelType(elmType))), MonoVar.Def(Defs.ChannelNewTuple)) :: acc1
@@ -430,7 +428,7 @@ object ConstraintCollection {
     // Lowering synthesizes, per rule, Channel.mpmcAdmin and Channel.unsafeGetAndUnlock calls
     // (not Channel.get), plus one fixed List[ChannelMpmcAdmin] built directly via mkTag/mkList,
     // whose instantiation must be predicted here too.
-    case Expr.SelectChannel(rules, default, _, _, loc) =>
+    case Expr.SelectChannel(rules, default, _, _, _) =>
       val acc1 = rules.foldLeft(acc) { (a, r) =>
         val elmType = r.chan.tpe match {
           case Type.Apply(Type.Apply(_, e, _), _, _) => e  // Mpmc[T, rc] → T
@@ -460,8 +458,8 @@ object ConstraintCollection {
         c.body.foldLeft(a1) {
           case (x, Predicate.Body.Guard(e, _)) =>
             guardLiftFlow(cparams0, e, visitExp(e, x))
-          case (x, Predicate.Body.Functional(outBnds, e, loc)) =>
-            functionalLiftFlow(cparams0, outBnds.length, e, loc) :: visitExp(e, x)
+          case (x, Predicate.Body.Functional(outBnds, e, _)) =>
+            functionalLiftFlow(cparams0, outBnds.length, e) :: visitExp(e, x)
           case (x, Predicate.Body.Atom(_, den, _, _, terms, _, loc)) =>
             latticeFlows(den, terms.lastOption.map(_.tpe), loc, bodyAtomTermFlows(cparams0, terms, x))
         }
@@ -469,7 +467,7 @@ object ConstraintCollection {
 
     // Lowering builds a List[PredSym] directly via mkTag/mkList (bypassing the ordinary rewrite
     // path), so its instantiation must be predicted here.
-    case Expr.FixpointLambda(_, exp, _, _, loc) =>
+    case Expr.FixpointLambda(_, exp, _, _, _) =>
       val acc1 = visitExp(exp, acc)
       Flow(List(typeToMonoArg(Types.PredSym)), MonoVar.Enum(Enums.FList)) :: acc1
 
@@ -500,9 +498,9 @@ object ConstraintCollection {
     // Lowering synthesizes Fixpoint3.Solver.factsN(p, d), generic over the N selected terms'
     // types. Facts(arity)'s flow args must come from the resolved result type `tpe0`, NOT from
     // `selects`' own term types, which may still carry locally-scoped type vars.
-    case Expr.FixpointQueryWithSelect(exps, queryExp, selects, from, where, _, tpe0, _, loc) =>
+    case Expr.FixpointQueryWithSelect(exps, queryExp, selects, from, where, _, tpe0, _, _) =>
       val arity = selects.length
-      val innerTpe = unwrapVectorType(tpe0, loc)
+      val innerTpe = unwrapVectorType(tpe0)
       val argTypes = if (arity <= 1) List(innerTpe) else innerTpe.typeArguments
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       val acc2 = visitExp(queryExp, acc1)
@@ -517,15 +515,15 @@ object ConstraintCollection {
 
     // Lowering boxes every goal term, unboxes every term type the extensible-variant result can
     // carry, and calls Solver.provenanceOf and Vector.get at a fixed Boxed type.
-    case Expr.FixpointQueryWithProvenance(exps, select, _, tpe0, _, loc) =>
+    case Expr.FixpointQueryWithProvenance(exps, select, _, tpe0, _, _) =>
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       val acc2 = select match {
         case Predicate.Head.Atom(_, _, terms, _, _) =>
           val s1 = terms.foldLeft(acc1)((a, t) => visitExp(t, a))
           terms.foldLeft(s1)((a, t) => boxFlow(t.tpe) :: a)
       }
-      val extVarType = unwrapVectorType(tpe0, loc)
-      val acc3 = predicatesOfExtVar(extVarType, loc).flatMap(_._2).foldLeft(acc2) { (a, t) =>
+      val extVarType = unwrapVectorType(tpe0)
+      val acc3 = predicatesOfExtVar(extVarType).flatMap(_._2).foldLeft(acc2) { (a, t) =>
         Flow(List(typeToMonoArg(t)), MonoVar.Def(Defs.Unbox)) :: a
       }
       Flow(List(typeToMonoArg(Types.Boxed)), MonoVar.Def(Defs.VectorGet)) ::
@@ -551,8 +549,8 @@ object ConstraintCollection {
     * silently wrong runtime value instead of dead code (see `termTypesOfRelation`).
     */
   private def visitPat(pat0: TypedAst.Pattern, acc: List[Flow])(implicit ctx: Context): List[Flow] = pat0 match {
-    case TypedAst.Pattern.Tag(_, pats, tpe, loc) =>
-      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe, loc)
+    case TypedAst.Pattern.Tag(_, pats, tpe, _) =>
+      val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe)
       val acc1 = pats.foldLeft(acc)((a, p) => visitPat(p, a))
       Flow(tpArgs.map(typeToMonoArg(_)), mvar) :: acc1
     case TypedAst.Pattern.Tuple(elms, _, _) =>
@@ -615,11 +613,11 @@ object ConstraintCollection {
     * `lift0X1(f: Vector[(o1)])`'s signature — `(o1)` is just `o1` parenthesized, never a real
     * tuple type), so a structural "is this a Tuple" check would wrongly decompose it.
     */
-  private def functionalLiftFlow(cparams0: List[TypedAst.ConstraintParam], outArity: Int, exp0: TypedAst.Expr, loc: SourceLocation)(implicit ctx: Context): Flow = {
+  private def functionalLiftFlow(cparams0: List[TypedAst.ConstraintParam], outArity: Int, exp0: TypedAst.Expr)(implicit ctx: Context): Flow = {
     val inVars = MonomorphHelpers.quantifiedVars(cparams0, exp0)
     val inner = Type.eraseAliases(exp0.tpe) match {
       case Type.Apply(Type.Cst(TypeConstructor.Vector, _), t, _) => t
-      case t => throw InternalCompilerException(s"Expected Vector[_], but got $t", loc)
+      case t => throw InternalCompilerException(s"Expected Vector[_], but got $t", exp0.loc)
     }
     val outTypes = if (outArity <= 1) List(inner) else inner.typeArguments
     Flow((inVars.map(_._2) ++ outTypes).map(typeToMonoArg(_)), MonoVar.Def(Defs.LiftXM(inVars.length, outArity)))
@@ -641,23 +639,23 @@ object ConstraintCollection {
   }
 
   /** Returns `t` from `Vector[t]` — mirrors `SolutionLowering.unwrapVectorType`. */
-  private def unwrapVectorType(tpe: Type, loc: SourceLocation): Type = Type.eraseAliases(tpe) match {
+  private def unwrapVectorType(tpe0: Type): Type = Type.eraseAliases(tpe0) match {
     case Type.Apply(Type.Cst(TypeConstructor.Vector, _), extType, _) => extType
-    case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Vector, _), _, _), but got $t", loc)
+    case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Vector, _), _, _), but got $t", tpe0.loc)
   }
 
   /** Mirrors `SolutionLowering.predicatesOfExtVar`. */
-  private def predicatesOfExtVar(tpe: Type, loc: SourceLocation): List[(Name.Pred, List[Type])] = Type.eraseAliases(tpe) match {
-    case Type.Apply(Type.Cst(TypeConstructor.Extensible, _), tpe1, loc1) => predicatesOfSchemaRow(tpe1, loc1)
-    case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Extensible, _), _, _), but got $t", loc)
+  private def predicatesOfExtVar(tpe0: Type): List[(Name.Pred, List[Type])] = Type.eraseAliases(tpe0) match {
+    case Type.Apply(Type.Cst(TypeConstructor.Extensible, _), tpe1, _) => predicatesOfSchemaRow(tpe1)
+    case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Extensible, _), _, _), but got $t", tpe0.loc)
   }
 
   /** Mirrors `SolutionLowering.predicatesOfSchemaRow`. */
-  private def predicatesOfSchemaRow(row: Type, loc: SourceLocation): List[(Name.Pred, List[Type])] = row match {
-    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SchemaRowExtend(pred), _), rel, loc2), tpe2, loc1) =>
-      (pred, termTypesOfRelation(rel, loc2)) :: predicatesOfSchemaRow(tpe2, loc1)
+  private def predicatesOfSchemaRow(row: Type): List[(Name.Pred, List[Type])] = row match {
+    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SchemaRowExtend(pred), _), rel, _), tpe2, _) =>
+      (pred, termTypesOfRelation(rel)) :: predicatesOfSchemaRow(tpe2)
     case Type.Var(_, _) | Type.SchemaRowEmpty => Nil
-    case t => throw InternalCompilerException(s"Got unexpected $t", loc)
+    case t => throw InternalCompilerException(s"Got unexpected $t", t.loc)
   }
 
   /**
@@ -666,15 +664,15 @@ object ConstraintCollection {
     * `Type.Var`. Such a var is skipped (not defaulted — that would be unsound for Box/Unbox/liftN
     * flows, and a genuine miss still surfaces as a clean solver gap downstream).
     */
-  private def termTypesOfRelation(rel: Type, loc: SourceLocation): List[Type] = {
-    def flattenApply(rel0: Type, loc0: SourceLocation): List[Type] = rel0 match {
+  private def termTypesOfRelation(rel: Type): List[Type] = {
+    def flattenApply(rel0: Type): List[Type] = rel0 match {
       case Type.Cst(TypeConstructor.Relation(_), _) => Nil
-      case Type.Apply(rest, t, loc1) => t :: flattenApply(rest, loc1)
+      case Type.Apply(rest, t, _) => t :: flattenApply(rest)
       case _ if rel0.typeConstructor.contains(TypeConstructor.AnyType) => Nil
       case Type.Var(_, _) => Nil
-      case t => throw InternalCompilerException(s"Expected Type.Apply(_, _, _), but got $t", loc0)
+      case t => throw InternalCompilerException(s"Expected Type.Apply(_, _, _), but got $t", rel0.loc)
     }
-    flattenApply(rel, loc).reverse
+    flattenApply(rel).reverse
   }
 
 
@@ -752,14 +750,14 @@ object ConstraintCollection {
   }
 
   /** Returns the enum/struct `MonoVar` and type arguments of `tpe0`. */
-  private def getEnumMonoVarAndTypeArgs(tpe0: Type, loc: SourceLocation): (MonoVar, List[Type]) = {
+  private def getEnumMonoVarAndTypeArgs(tpe0: Type): (MonoVar, List[Type]) = {
     val tpe = Type.eraseAliases(tpe0)
     val args = tpe.typeArguments
     tpe.baseType match {
       case Type.Cst(TypeConstructor.Enum(sym, _), _)             => (MonoVar.Enum(sym), args)
       case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => (MonoVar.RestrictableEnum(sym), args)
       case Type.Cst(TypeConstructor.Struct(sym, _), _)           => (MonoVar.Struct(sym), args)
-      case _ => throw InternalCompilerException(s"Expected an Enum, RestrictableEnum, or Struct type, but got $tpe", loc)
+      case _ => throw InternalCompilerException(s"Expected an Enum, RestrictableEnum, or Struct type, but got $tpe", tpe0.loc)
     }
   }
 
