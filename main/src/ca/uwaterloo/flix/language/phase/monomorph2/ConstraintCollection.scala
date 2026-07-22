@@ -138,16 +138,18 @@ object ConstraintCollection {
     case app @ Type.Apply(_, _, _) =>
       val args = app.typeArguments
       val acc1 = args.foldLeft(acc)((a, t) => visitType(t, a))
-      val mvarOpt = app.baseType match {
-        case Type.Cst(TypeConstructor.Enum(sym, _), _)             => Some(MonoVar.Enum(sym))
-        case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => Some(MonoVar.RestrictableEnum(sym))
-        case Type.Cst(TypeConstructor.Struct(sym, _), _)           => Some(MonoVar.Struct(sym))
-        case _                                                     => None
-      }
-      mvarOpt match {
+      declMonoVar(app.baseType) match {
         case Some(mvar) => Flow(args.map(t => typeToMonoArg(t)), mvar) :: acc1
         case None       => acc1
       }
+  }
+
+  /** The MonoVar of `baseType`'s enum/restrictable-enum/struct constructor, or None if it's neither. */
+  private def declMonoVar(baseType: Type): Option[MonoVar] = baseType match {
+    case Type.Cst(TypeConstructor.Enum(sym, _), _)             => Some(MonoVar.Enum(sym))
+    case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => Some(MonoVar.RestrictableEnum(sym))
+    case Type.Cst(TypeConstructor.Struct(sym, _), _)           => Some(MonoVar.Struct(sym))
+    case _                                                     => None
   }
 
   /**
@@ -527,18 +529,11 @@ object ConstraintCollection {
   /**
     * Emits flow constraints for enum instantiations mentioned by patterns.
     *
-    * ⚠️ IMPORTANT — DELIBERATE `AnyType` SPECIALIZATION. A pattern can mention an enum
-    * instantiation that no expression ever constructs, e.g.
-    * `match None { case Some(Ok(_)) => ... }`: no `Result` value exists anywhere, so its tparams
-    * are stray and default to `AnyType`. Without these flows the solver never proposes such
-    * tuples and `SolutionSpecialization.lookupCaseSym` would miss on the pattern's lookup.
-    * We deliberately specialize these instantiations AT `AnyType` like any other tuple: the
-    * resulting declarations are dead (no value of `AnyType` can exist; fields erase to `Object`),
-    * and in exchange every specialization lookup stays strict — a table miss is ALWAYS a
-    * compiler bug ("Solver gap"), never silently tolerated. Do NOT reintroduce a
-    * keep-the-original-sym fallback here or in the lookups. And NEVER let a defaulted `AnyType`
-    * reach `Fixpoint.Boxable`'s box/unbox: their unchecked casts turn an imprecise type into a
-    * silently wrong runtime value instead of dead code (see `termTypesOfRelation`).
+    * Caution: a pattern can mention an instantiation nothing ever constructs, e.g.
+    * `match None { case Some(_) => ... }` — its tparams default to `AnyType`. We still emit
+    * a flow and specialize it as dead code so lookups stay strict; never let a defaulted
+    * `AnyType` reach `Fixpoint.Boxable`'s box/unbox, whose unchecked casts would turn it into a
+    * silently wrong runtime value instead.
     */
   private def visitPat(pat0: TypedAst.Pattern, acc: List[Flow])(implicit ctx: Context): List[Flow] = pat0 match {
     case TypedAst.Pattern.Tag(_, pats, tpe, _) =>
