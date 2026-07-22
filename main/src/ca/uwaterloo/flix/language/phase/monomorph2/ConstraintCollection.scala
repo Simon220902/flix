@@ -119,10 +119,6 @@ object ConstraintCollection {
     fromDefs ++ fromEnums ++ fromInstances ++ fromRestrictableEnums ++ fromStructs ++ fromSigs ++ fromEffects
   }(MonomorphDebug.DebugFlows)
 
-  // Performance: every visit* function threads an immutable `acc: List[Flow]` accumulator (cons,
-  // no per-node Set allocation). Duplicate flows are fine — dedup happens once, in `generate`'s
-  // final `.toSet`.
-
   /**
     * Emits flow constraints for enum type applications occurring in `tpe`.
     */
