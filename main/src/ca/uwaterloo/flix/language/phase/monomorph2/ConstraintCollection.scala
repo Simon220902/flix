@@ -249,8 +249,6 @@ object ConstraintCollection {
 
     case Expr.Use(_, _, exp, _) => visitExp(exp, acc)
 
-    // Unlike the paper we don't annotate the match with the scrutinee enum type, because Flix
-    // match rules do not carry a type-parameter annotation (as they do in LangPoly).
     case Expr.Match(exp, rules, _, _, _) =>
       val acc1 = visitExp(exp, acc)
       rules.foldLeft(acc1) {
@@ -260,8 +258,6 @@ object ConstraintCollection {
           visitExp(body, a1)
       }
 
-    // Tag and RestrictableTag are handled identically: getEnumMonoVarAndTypeArgs dispatches on the
-    // type itself, and the solver handles both resulting mvar kinds.
     case Expr.Tag(_, exps, tpe, _, _) =>
       val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe)
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
@@ -326,8 +322,6 @@ object ConstraintCollection {
 
     case Expr.VectorLength(exp, _) => visitExp(exp, acc)
 
-    // Mirrors Expr.Tag: a construction site's concrete type args must seed the solver;
-    // visitType alone only captures the declaration's own field-type structure.
     case Expr.StructNew(_, fields, region, tpe, _, _) =>
       val (mvar, tpArgs) = getEnumMonoVarAndTypeArgs(tpe)
       val acc1 = fields.foldLeft(acc) { case (a, (_, e)) => visitExp(e, a) }
@@ -409,9 +403,8 @@ object ConstraintCollection {
       val acc1 = constructors.foldLeft(acc)((a, c) => visitExp(c.exp, a))
       methods.foldLeft(acc1)((a, m) => visitExp(m.exp, a))
 
-    // Channel nodes recurse into sub-expressions AND emit flows for the @LoweringTargetChannel
-    // defs that Lowering will synthesize: GetChannel → Channel.get, PutChannel → Channel.put,
-    // NewChannel → Channel.newChannelTuple.
+    // Lowering synthesizes Channel.get/put/newChannelTuple calls for GetChannel/PutChannel/
+    // NewChannel respectively.
     case Expr.GetChannel(exp, tpe, _, _) =>
       val acc1 = visitExp(exp, acc)
       Flow(List(typeToMonoArg(lowerChannelType(tpe))), MonoVar.Def(Defs.ChannelGet)) :: acc1
@@ -425,9 +418,8 @@ object ConstraintCollection {
       val acc1 = visitExp(exp, acc)
       Flow(List(typeToMonoArg(lowerChannelType(elmType))), MonoVar.Def(Defs.ChannelNewTuple)) :: acc1
 
-    // Lowering synthesizes, per rule, Channel.mpmcAdmin and Channel.unsafeGetAndUnlock calls
-    // (not Channel.get), plus one fixed List[ChannelMpmcAdmin] built directly via mkTag/mkList,
-    // whose instantiation must be predicted here too.
+    // Lowering synthesizes Channel.mpmcAdmin/unsafeGetAndUnlock calls per rule (not Channel.get),
+    // plus one fixed List[ChannelMpmcAdmin] built via mkTag/mkList.
     case Expr.SelectChannel(rules, default, _, _, _) =>
       val acc1 = rules.foldLeft(acc) { (a, r) =>
         val elmType = r.chan.tpe match {
@@ -443,9 +435,8 @@ object ConstraintCollection {
       val acc2 = default.foldLeft(acc1)((a, d) => visitExp(d, a))
       Flow(List(typeToMonoArg(Types.ChannelMpmcAdmin)), MonoVar.Enum(Enums.FList)) :: acc2
 
-    // Datalog fixpoint nodes recurse into sub-expressions AND emit flows for every
-    // Box/Unbox/liftN/lattice/Facts/ProjectInto/ProvenanceOf call SolutionLowering will
-    // synthesize, mirroring the TypedAst structure lowering itself inspects.
+    // Lowering synthesizes every Box/Unbox/liftN/lattice/Facts/ProjectInto/ProvenanceOf call for
+    // Datalog fixpoint nodes, mirroring the TypedAst structure lowering itself inspects.
     case Expr.FixpointConstraintSet(cs, _, _) =>
       cs.foldLeft(acc) { (a0, c) =>
         val cparams0 = c.cparams
@@ -465,8 +456,8 @@ object ConstraintCollection {
         }
       }
 
-    // Lowering builds a List[PredSym] directly via mkTag/mkList (bypassing the ordinary rewrite
-    // path), so its instantiation must be predicted here.
+    // Lowering synthesizes a List[PredSym] directly via mkTag/mkList (bypassing the ordinary
+    // rewrite path), so its instantiation must be predicted here.
     case Expr.FixpointLambda(_, exp, _, _, _) =>
       val acc1 = visitExp(exp, acc)
       Flow(List(typeToMonoArg(Types.PredSym)), MonoVar.Enum(Enums.FList)) :: acc1
@@ -513,8 +504,9 @@ object ConstraintCollection {
       val acc5 = where.foldLeft(acc4)((a, e) => visitExp(e, a))
       Flow(argTypes.map(typeToMonoArg(_)), MonoVar.Def(Defs.Facts(arity))) :: acc5
 
-    // Lowering boxes every goal term, unboxes every term type the extensible-variant result can
-    // carry, and calls Solver.provenanceOf and Vector.get at a fixed Boxed type.
+    // Lowering synthesizes a box call per goal term, an unbox call per term type the
+    // extensible-variant result can carry, and Solver.provenanceOf/Vector.get calls at a fixed
+    // Boxed type.
     case Expr.FixpointQueryWithProvenance(exps, select, _, tpe0, _, _) =>
       val acc1 = exps.foldLeft(acc)((a, e) => visitExp(e, a))
       val acc2 = select match {
@@ -606,12 +598,10 @@ object ConstraintCollection {
   }
 
   /**
-    * A flow for `lift{inArity}X{outArity}`, mirroring `SolutionLowering.mkFunctional`. Whether
-    * `exp0.tpe`'s inner type decomposes into `o1,...,om` or is used whole as the single `o1`
-    * depends on `outArity` (the *count* of out-vars) — NOT on whether that inner type happens to
-    * look like a tuple: an outArity-1 functional can itself bind a single tuple-typed value (as
-    * `lift0X1(f: Vector[(o1)])`'s signature — `(o1)` is just `o1` parenthesized, never a real
-    * tuple type), so a structural "is this a Tuple" check would wrongly decompose it.
+    * A flow for `lift{inArity}X{outArity}`, mirroring `SolutionLowering.mkFunctional`. `outTypes`
+    * goes through `unmkTuplish`, not a structural check, because an outArity-1 functional can
+    * itself bind a single tuple-typed value — e.g. `lift0X1(f: Vector[(o1)])`'s `(o1)` is just
+    * `o1` parenthesized, never a real tuple type.
     */
   private def functionalLiftFlow(cparams0: List[TypedAst.ConstraintParam], outArity: Int, exp0: TypedAst.Expr)(implicit ctx: Context): Flow = {
     val inVars = MonomorphHelpers.quantifiedVars(cparams0, exp0)
@@ -645,7 +635,7 @@ object ConstraintCollection {
   }
 
   /**
-    * Inverse of `Type.mkTuplish`. `arity` can't be derived from `tpe` alone — mkTuplish leaves
+    * Inverse of `Type.mkTuplish` `arity` can't be derived from `tpe` alone. `mkTuplish` leaves
     * an arity-1 result bare, so a single value can itself be tuple-typed.
     */
   private def unmkTuplish(arity: Int, tpe: Type): List[Type] =
