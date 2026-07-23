@@ -34,9 +34,9 @@ object ConstraintCollection {
   /**
     * Generation context.
     *
-    * @param tparamEnv maps the current declaration's type parameters to `MonoArg.Param`. Always
-    *                  `Param` in practice, not enforced by the type — deliberately, so entries can
-    *                  reference more than one `MonoVar` if a future scope ever needs it.
+    * @param tparamEnv maps the current declaration's type parameters to `MonoArg.Param` — always
+    *                  `Param`, not statically enforced, so a future scope could use more than one
+    *                  `MonoVar`.
     * @param root the typed AST root (needed to resolve ground associated types)
     * @param flix the Flix context (needed by TypeReduction2)
     */
