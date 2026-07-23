@@ -25,7 +25,7 @@ import ca.uwaterloo.flix.language.ast.TypedAst.ApplyPosition
 import ca.uwaterloo.flix.language.ast.shared.{BoundBy, Constant, Decreasing, Denotation, Fixity, Mutability, Polarity, PredicateAndArity, RegionScope, SolveMode, SymUse, TypeSource}
 import ca.uwaterloo.flix.language.ast.{AtomicOp, MonoAst, Name, SemanticOp, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.phase.monomorph2.SolutionSpecialization.{Context, StrictSubstitution, lookupCaseSym, lookupRestrictableCaseSym, lookupStructSym, lookupSym, resolveSigSym, specializeFormalParam, specializeFormalParams}
-import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Enums, Types}
+import ca.uwaterloo.flix.language.phase.monomorph2.Symbols.{Defs, Enums, Types}
 import ca.uwaterloo.flix.util.{InternalCompilerException, JvmUtils, Result}
 import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
 
@@ -1849,7 +1849,7 @@ object SolutionLowering {
 
     val liftType = Type.mkPureArrow(argType, returnType, exp0.loc)
 
-    val sym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${argTypes.length}"), liftType)
+    val sym = lookupSym(Defs.Lift(argTypes.length), liftType)
 
     MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialization.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
   }
@@ -1863,7 +1863,7 @@ object SolutionLowering {
 
     val liftType = Type.mkPureArrow(argType, returnType, exp0.loc)
 
-    val sym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${argTypes.length}b"), liftType)
+    val sym = lookupSym(Defs.LiftB(argTypes.length), liftType)
 
     MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialization.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
   }
@@ -1884,7 +1884,7 @@ object SolutionLowering {
     val numberOfInVars = argTypes.length
     val numberOfOutVars = outVars.length
 
-    val sym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Boxable.lift${numberOfInVars}X$numberOfOutVars"), liftType)
+    val sym = lookupSym(Defs.LiftXM(numberOfInVars, numberOfOutVars), liftType)
 
     MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialization.rewriteEnumStructType(liftType), returnType, Type.Pure, loc)
   }

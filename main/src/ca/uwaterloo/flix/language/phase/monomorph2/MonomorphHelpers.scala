@@ -19,7 +19,6 @@ package ca.uwaterloo.flix.language.phase.monomorph2
 import ca.uwaterloo.flix.language.ast.TypedAst.Expr
 import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.{Symbol, Type, TypeConstructor, TypedAst}
-import ca.uwaterloo.flix.language.phase.monomorph.Symbols
 import ca.uwaterloo.flix.util.collection.ListMap
 
 /**

@@ -20,7 +20,7 @@ import ca.uwaterloo.flix.api.Flix
 import ca.uwaterloo.flix.language.ast.{Kind, RigidityEnv, Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.language.ast.shared.{RegionScope, SymUse}
 import ca.uwaterloo.flix.language.phase.monomorph2.MonomorphHelpers.lowerChannelType
-import ca.uwaterloo.flix.language.phase.monomorph.Symbols.Defs
+import ca.uwaterloo.flix.language.phase.monomorph2.Symbols.Defs
 import ca.uwaterloo.flix.language.phase.typer.ConstraintSolver2
 import ca.uwaterloo.flix.util.InternalCompilerException
 

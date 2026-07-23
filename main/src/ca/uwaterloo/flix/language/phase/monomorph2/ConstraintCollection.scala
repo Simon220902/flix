@@ -21,8 +21,7 @@ import ca.uwaterloo.flix.language.ast.{Kind, Name, SourceLocation, Symbol, Type,
 import ca.uwaterloo.flix.language.ast.TypedAst.{Expr, FormalParam, MatchRule, Predicate}
 import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.shared.Denotation
-import ca.uwaterloo.flix.language.phase.monomorph.Symbols
-import ca.uwaterloo.flix.language.phase.monomorph.Symbols.{Defs, Enums, Types}
+import ca.uwaterloo.flix.language.phase.monomorph2.Symbols.{Defs, Enums, Types}
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
 /**

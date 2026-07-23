@@ -15,12 +15,20 @@
  * limitations under the License.
  */
 
-package ca.uwaterloo.flix.language.phase.monomorph
+package ca.uwaterloo.flix.language.phase.monomorph2
 
 import ca.uwaterloo.flix.language.ast.{Kind, SourceLocation, Symbol, Type, TypeConstructor}
 
-object Symbols {
-  protected[monomorph] object Defs {
+/**
+  * Fully-qualified stdlib symbols/types this pipeline's synthesized code refers to. A copy of
+  * `monomorph.Symbols`, not a dependency on it — kept separate so this package never needs
+  * cross-package visibility into the demand-driven baseline, and vice versa.
+  *
+  * A pure copy — the `Defs` marked (ADDED) below are the only ones the old demand-driven baseline
+  * (Specialization.scala/Lowering.scala) never references.
+  */
+private[monomorph2] object Symbols {
+  object Defs {
 
     lazy val ChannelGet: Symbol.DefnSym = Symbol.mkDefnSym("Concurrent.Channel.get")
     lazy val ChannelNew: Symbol.DefnSym = Symbol.mkDefnSym("Concurrent.Channel.newChannel")
@@ -44,9 +52,26 @@ object Symbols {
 
     def Facts(arity: Int): Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Solver.facts$arity")
 
+    // ADDED
+    def Lift(arity: Int): Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Boxable.lift$arity")
+
+    // ADDED
+    def LiftB(arity: Int): Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Boxable.lift${arity}b")
+
+    // ADDED
+    def LiftXM(inArity: Int, outArity: Int): Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Boxable.lift${inArity}X$outArity")
+
+    // ADDED
+    lazy val Lattice: Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Ast.Shared.lattice")
+    // ADDED
+    lazy val LatticeBox: Symbol.DefnSym = Symbol.mkDefnSym(s"Fixpoint$version.Ast.Shared.box")
+
+    // ADDED
+    lazy val VectorGet: Symbol.DefnSym = Symbol.mkDefnSym("Vector.get")
+
   }
 
-  protected[monomorph] object Enums {
+  object Enums {
     lazy val ChannelMpmc: Symbol.EnumSym = Symbol.mkEnumSym("Concurrent.Channel.Mpmc")
     lazy val ChannelMpmcAdmin: Symbol.EnumSym = Symbol.mkEnumSym("Concurrent.Channel.MpmcAdmin")
     lazy val ConcurrentReentrantLock: Symbol.EnumSym = Symbol.mkEnumSym("Concurrent.ReentrantLock")
@@ -75,7 +100,7 @@ object Symbols {
     lazy val JvmValue: Symbol.EnumSym = Symbol.mkEnumSym("Reflect.JvmValue")
   }
 
-  protected[monomorph] object Types {
+  object Types {
     lazy val ChannelMpmc: Type = Type.Cst(TypeConstructor.Enum(Enums.ChannelMpmc, Kind.Star ->: Kind.Eff ->: Kind.Star), SourceLocation.Unknown)
     lazy val ChannelMpmcAdmin: Type = Type.mkEnum(Enums.ChannelMpmcAdmin, Nil, SourceLocation.Unknown)
     lazy val ConcurrentReentrantLock: Type = Type.mkEnum(Enums.ConcurrentReentrantLock, Nil, SourceLocation.Unknown)
