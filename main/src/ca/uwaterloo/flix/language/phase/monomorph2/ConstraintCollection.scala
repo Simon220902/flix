@@ -366,7 +366,7 @@ object ConstraintCollection {
       val acc2 = visitExp(exp, acc1)
       frags.init.foldLeft(acc2) { (a, frag) =>
         val elmType = frag.exp.tpe
-        val elmArg = typeToMonoArg(lowerChannelType(elmType))
+        val elmArg = typeToMonoArg(MonomorphHelpers.lowerChannelType(elmType))
         Flow(List(elmArg), MonoVar.Def(Defs.ChannelNew)) ::
           Flow(List(elmArg), MonoVar.Def(Defs.ChannelPut)) ::
           Flow(List(elmArg), MonoVar.Def(Defs.ChannelGet)) :: a
@@ -405,16 +405,16 @@ object ConstraintCollection {
     // NewChannel respectively.
     case Expr.GetChannel(exp, tpe, _, _) =>
       val acc1 = visitExp(exp, acc)
-      Flow(List(typeToMonoArg(lowerChannelType(tpe))), MonoVar.Def(Defs.ChannelGet)) :: acc1
+      Flow(List(typeToMonoArg(MonomorphHelpers.lowerChannelType(tpe))), MonoVar.Def(Defs.ChannelGet)) :: acc1
 
     case Expr.PutChannel(exp1, exp2, _, _, _) =>
       val acc1 = visitExp(exp2, visitExp(exp1, acc))
-      Flow(List(typeToMonoArg(lowerChannelType(exp2.tpe))), MonoVar.Def(Defs.ChannelPut)) :: acc1
+      Flow(List(typeToMonoArg(MonomorphHelpers.lowerChannelType(exp2.tpe))), MonoVar.Def(Defs.ChannelPut)) :: acc1
 
     case Expr.NewChannel(exp, tpe, _, _) =>
       val elmType = extractChannelElm(tpe)
       val acc1 = visitExp(exp, acc)
-      Flow(List(typeToMonoArg(lowerChannelType(elmType))), MonoVar.Def(Defs.ChannelNewTuple)) :: acc1
+      Flow(List(typeToMonoArg(MonomorphHelpers.lowerChannelType(elmType))), MonoVar.Def(Defs.ChannelNewTuple)) :: acc1
 
     // Lowering synthesizes Channel.mpmcAdmin/unsafeGetAndUnlock calls per rule (not Channel.get),
     // plus one fixed List[ChannelMpmcAdmin] built via mkTag/mkList.
@@ -425,7 +425,7 @@ object ConstraintCollection {
           case Type.Apply(Type.Cst(TypeConstructor.Receiver, _), e, _) => e
           case t => throw InternalCompilerException(s"Expected Receiver[_], but got $t", r.chan.loc)
         }
-        val elmArg = typeToMonoArg(lowerChannelType(elmType))
+        val elmArg = typeToMonoArg(MonomorphHelpers.lowerChannelType(elmType))
         val a1 = visitExp(r.exp, visitExp(r.chan, a))
         Flow(List(elmArg), MonoVar.Def(Defs.ChannelUnsafeGetAndUnlock)) ::
           Flow(List(elmArg), MonoVar.Def(Defs.ChannelMpmcAdmin)) :: a1
@@ -684,25 +684,6 @@ object ConstraintCollection {
     }
   }
 
-  /**
-    * Rewrites `Sender[t]`/`Receiver[t]` to `Concurrent.Channel.Mpmc[t, IO]`, recursively —
-    * mirrors `SolutionLowering.lowerType`'s Sender/Receiver case. Used ONLY for flows targeting
-    * the `@LoweringTargetChannel` defs, whose lookup keys are built from lowered types; it must
-    * NOT be applied in `typeToMonoArg` generally, or ordinary defs' keys (e.g. `Channel.send`,
-    * which keep `Sender`/`Receiver`) would be corrupted.
-    */
-  private[monomorph2] def lowerChannelType(tpe: Type): Type = tpe match {
-    case Type.Apply(Type.Cst(TypeConstructor.Sender, loc), elm, _) =>
-      Type.Apply(Type.Apply(Symbols.Types.ChannelMpmc, lowerChannelType(elm), loc), Type.IO, loc)
-    case Type.Apply(Type.Cst(TypeConstructor.Receiver, loc), elm, _) =>
-      Type.Apply(Type.Apply(Symbols.Types.ChannelMpmc, lowerChannelType(elm), loc), Type.IO, loc)
-    case Type.Apply(t1, t2, loc) =>
-      Type.Apply(lowerChannelType(t1), lowerChannelType(t2), loc)
-    case Type.Alias(sym, args, inner, loc) =>
-      Type.Alias(sym, args.map(lowerChannelType), lowerChannelType(inner), loc)
-    case other => other
-  }
-
   /** Converts `tpe0` to a `MonoArg` relative to the current declaration context. */
   private def typeToMonoArg(tpe0: Type)(implicit ctx: Context): MonoArg = {
     val tpe = Type.eraseAliases(tpe0)
@@ -744,5 +725,4 @@ object ConstraintCollection {
       throw InternalCompilerException(s"Expected an Enum, RestrictableEnum, or Struct type, but got $tpe", tpe0.loc))
     (mvar, tpe.typeArguments)
   }
-
 }

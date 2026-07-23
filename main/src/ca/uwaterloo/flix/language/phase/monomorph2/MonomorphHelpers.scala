@@ -19,6 +19,7 @@ package ca.uwaterloo.flix.language.phase.monomorph2
 import ca.uwaterloo.flix.language.ast.TypedAst.Expr
 import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.{Symbol, Type, TypeConstructor, TypedAst}
+import ca.uwaterloo.flix.language.phase.monomorph.Symbols
 import ca.uwaterloo.flix.util.collection.ListMap
 
 /**
@@ -45,4 +46,23 @@ private[monomorph2] object MonomorphHelpers {
   /** Creates a table for fast lookup of instances. */
   def mkInstanceMap(instances: ListMap[Symbol.TraitSym, TypedAst.Instance]): Map[(Symbol.TraitSym, TypeConstructor), TypedAst.Instance] =
     instances.map { case (sym, inst) => ((sym, inst.tpe.typeConstructor.get), inst) }.toMap
+
+  /**
+    * Rewrites `Sender[t]`/`Receiver[t]` to `Concurrent.Channel.Mpmc[t, IO]`, recursively —
+    * mirrors `SolutionLowering.lowerType`'s Sender/Receiver case. Used ONLY for flows targeting
+    * the `@LoweringTargetChannel` defs, whose lookup keys are built from lowered types; it must
+    * NOT be applied in `typeToMonoArg` generally, or ordinary defs' keys (e.g. `Channel.send`,
+    * which keep `Sender`/`Receiver`) would be corrupted.
+    */
+  def lowerChannelType(tpe: Type): Type = tpe match {
+    case Type.Apply(Type.Cst(TypeConstructor.Sender, loc), elm, _) =>
+      Type.Apply(Type.Apply(Symbols.Types.ChannelMpmc, lowerChannelType(elm), loc), Type.IO, loc)
+    case Type.Apply(Type.Cst(TypeConstructor.Receiver, loc), elm, _) =>
+      Type.Apply(Type.Apply(Symbols.Types.ChannelMpmc, lowerChannelType(elm), loc), Type.IO, loc)
+    case Type.Apply(t1, t2, loc) =>
+      Type.Apply(lowerChannelType(t1), lowerChannelType(t2), loc)
+    case Type.Alias(sym, args, inner, loc) =>
+      Type.Alias(sym, args.map(lowerChannelType), lowerChannelType(inner), loc)
+    case other => other
+  }
 }
