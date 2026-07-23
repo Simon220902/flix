@@ -637,24 +637,10 @@ object ConstraintCollection {
     flattenApply(rel).reverse
   }
 
-  /**
-    * Extracts the element type T for Channel.newChannelTuple.
-    * NewChannel.tpe may be (Sender[T], Receiver[T]) where Sender/Receiver are single-arg aliases,
-    * or (Mpmc[T, rc], Mpmc[T, rc]) where Mpmc is a two-arg type constructor.
-    * In the single-channel case it may be Mpmc[T, rc] or Sender[T].
-    */
-  private def extractChannelElm(tpe: Type): Type = {
-    // Helper: extract T from a single channel type (Sender[T], Receiver[T], or Mpmc[T, rc]).
-    def elmFromChan(chan: Type): Option[Type] = chan match {
-      case Type.Apply(Type.Apply(_, elm, _), _, _) => Some(elm)  // Mpmc[T, rc] → T
-      case Type.Apply(_, elm, _)                   => Some(elm)  // Sender[T] → T
-      case _                                       => None
-    }
-    tpe match {
-      // Tuple: (ChanType1, ChanType2) — extract from first element
-      case Type.Apply(Type.Apply(_, firstChan, _), _, _) => elmFromChan(firstChan).getOrElse(tpe)
-      case _ => tpe
-    }
+  /** Extracts T from NewChannel's `(Sender[T], Receiver[T])` type — see ConstraintGen's NewChannel rule. */
+  private def extractChannelElm(tpe: Type): Type = tpe.typeArguments match {
+    case List(Type.Apply(Type.Cst(TypeConstructor.Sender | TypeConstructor.Receiver, _), elm, _), _) => elm
+    case _ => throw InternalCompilerException(s"Expected (Sender[_], Receiver[_]), but got $tpe", tpe.loc)
   }
 
   /**
