@@ -48,16 +48,13 @@ private[monomorph2] object MonomorphHelpers {
     instances.map { case (sym, inst) => ((sym, inst.tpe.typeConstructor.get), inst) }.toMap
 
   /**
-    * Rewrites `Sender[t]`/`Receiver[t]` to `Concurrent.Channel.Mpmc[t, IO]`, recursively —
-    * mirrors `SolutionLowering.lowerType`'s Sender/Receiver case. Used ONLY for flows targeting
-    * the `@LoweringTargetChannel` defs, whose lookup keys are built from lowered types; it must
-    * NOT be applied in `typeToMonoArg` generally, or ordinary defs' keys (e.g. `Channel.send`,
-    * which keep `Sender`/`Receiver`) would be corrupted.
+    * Mirrors `SolutionLowering.lowerType`'s Sender/Receiver case. Used ONLY for flows targeting
+    * `@LoweringTargetChannel` defs, whose lookup keys are built from lowered types — must NOT be
+    * applied in `typeToMonoArg` generally, or ordinary defs' keys (e.g. `Channel.send`, which keep
+    * `Sender`/`Receiver`) would be corrupted.
     */
   def lowerChannelType(tpe: Type): Type = tpe match {
-    case Type.Apply(Type.Cst(TypeConstructor.Sender, loc), elm, _) =>
-      Type.Apply(Type.Apply(Symbols.Types.ChannelMpmc, lowerChannelType(elm), loc), Type.IO, loc)
-    case Type.Apply(Type.Cst(TypeConstructor.Receiver, loc), elm, _) =>
+    case Type.Apply(Type.Cst(TypeConstructor.Sender | TypeConstructor.Receiver, loc), elm, _) =>
       Type.Apply(Type.Apply(Symbols.Types.ChannelMpmc, lowerChannelType(elm), loc), Type.IO, loc)
     case Type.Apply(t1, t2, loc) =>
       Type.Apply(lowerChannelType(t1), lowerChannelType(t2), loc)
