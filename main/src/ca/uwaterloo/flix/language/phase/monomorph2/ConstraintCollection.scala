@@ -549,12 +549,7 @@ object ConstraintCollection {
   private def boxFlow(tpe: Type)(implicit ctx: Context): Flow =
     Flow(List(typeToMonoArg(tpe)), MonoVar.Def(Defs.Box))
 
-  /**
-    * Flows for a head term — mirrors `SolutionLowering.lowerHeadTerm`'s cases 1.2/2/3: a
-    * lexically-bound Var, or a non-Var term with no quantified free vars, is boxed; a non-Var
-    * term WITH quantified free vars is lifted via `lift{arity}` instead (never both). A
-    * quantified Var itself (case 1.1) needs neither flow — it carries no runtime value of its own.
-    */
+  /** Flows for a head term — mirrors `SolutionLowering.lowerHeadTerm`. */
   private def headTermFlows(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, acc: List[Flow])(implicit ctx: Context): List[Flow] = exp0 match {
     case Expr.Var(sym, tpe, _) =>
       if (MonomorphHelpers.isQuantifiedVar(sym, cparams0)) acc else boxFlow(tpe) :: acc
@@ -564,10 +559,7 @@ object ConstraintCollection {
       else Flow((fvs.map(_._2) :+ exp0.tpe).map(typeToMonoArg(_)), MonoVar.Def(Defs.Lift(fvs.length))) :: acc
   }
 
-  /**
-    * Flows for a body atom's terms — mirrors `SolutionLowering.lowerBodyTerm`: `Wild` and a
-    * quantified `Var` need nothing; a non-quantified `Var` or any `Cst` is boxed.
-    */
+  /** Flows for a body atom's terms — mirrors `SolutionLowering.lowerBodyTerm`. */
   private def bodyAtomTermFlows(cparams0: List[TypedAst.ConstraintParam], terms: List[TypedAst.Pattern], acc: List[Flow])(implicit ctx: Context): List[Flow] =
     terms.foldLeft(acc) {
       case (a, TypedAst.Pattern.Wild(_, _)) => a
@@ -578,9 +570,8 @@ object ConstraintCollection {
     }
 
   /**
-    * A flow for `lift{arity}b`, mirroring `SolutionLowering.mkGuard`. An arity-0 guard is
-    * lowered to a plain closure with no lift call at all (`Guard0` — there is no `lift0b`), so
-    * nothing is emitted in that case.
+    * A flow for `lift{arity}b` — mirrors `SolutionLowering.mkGuard`. Arity 0 emits nothing:
+    * there is no `lift0b`.
     */
   private def guardLiftFlow(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, acc: List[Flow])(implicit ctx: Context): List[Flow] = {
     val fvs = MonomorphHelpers.quantifiedVars(cparams0, exp0)
@@ -589,10 +580,7 @@ object ConstraintCollection {
   }
 
   /**
-    * A flow for `lift{inArity}X{outArity}`, mirroring `SolutionLowering.mkFunctional`. `outTypes`
-    * goes through `unmkTuplish`, not a structural check, because an outArity-1 functional can
-    * itself bind a single tuple-typed value — e.g. `lift0X1(f: Vector[(o1)])`'s `(o1)` is just
-    * `o1` parenthesized, never a real tuple type.
+    * A flow for `lift{inArity}X{outArity}` — mirrors `SolutionLowering.mkFunctional`.
     */
   private def functionalLiftFlow(cparams0: List[TypedAst.ConstraintParam], outArity: Int, exp0: TypedAst.Expr)(implicit ctx: Context): Flow = {
     val inVars = MonomorphHelpers.quantifiedVars(cparams0, exp0)
@@ -604,12 +592,7 @@ object ConstraintCollection {
     Flow((inVars.map(_._2) ++ outTypes).map(typeToMonoArg(_)), MonoVar.Def(Defs.LiftXM(inVars.length, outArity)))
   }
 
-  /**
-    * Flows for `Fixpoint3.Ast.Shared.lattice`/`box`/`Denotation`, mirroring
-    * `SolutionLowering.mkDenotation`. The `Relational` case constructs a `Denotation[Boxed]`
-    * directly via `mkTag` (bypassing the ordinary rewrite path), so its enum-construction flow
-    * must be predicted here or `enumTable` never gets an entry for it.
-    */
+  /** Flows for `lattice`/`box`/`Denotation` — mirrors `SolutionLowering.mkDenotation`. */
   private def latticeFlows(den: Denotation, lastTermType: Option[Type], loc: SourceLocation, acc: List[Flow])(implicit ctx: Context): List[Flow] = den match {
     case Denotation.Relational =>
       Flow(List(typeToMonoArg(Types.Boxed)), MonoVar.Enum(Enums.Denotation)) :: acc
@@ -624,13 +607,6 @@ object ConstraintCollection {
     case Type.Apply(Type.Cst(TypeConstructor.Vector, _), extType, _) => extType
     case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Vector, _), _, _), but got $t", tpe0.loc)
   }
-
-  /**
-    * Inverse of `Type.mkTuplish` `arity` can't be derived from `tpe` alone. `mkTuplish` leaves
-    * an arity-1 result bare, so a single value can itself be tuple-typed.
-    */
-  private def unmkTuplish(arity: Int, tpe: Type): List[Type] =
-    if (arity <= 1) List(tpe) else tpe.typeArguments
 
   /** Mirrors `SolutionLowering.predicatesOfExtVar`. */
   private def predicatesOfExtVar(tpe0: Type): List[(Name.Pred, List[Type])] = Type.eraseAliases(tpe0) match {
@@ -647,10 +623,8 @@ object ConstraintCollection {
   }
 
   /**
-    * Mirrors `SolutionLowering.termTypesOfRelation`, with one addition: this file runs pre-solve,
-    * where a relation of an under-constrained provenance predicate can still be a bare
-    * `Type.Var`. Such a var is skipped (not defaulted — that would be unsound for Box/Unbox/liftN
-    * flows, and a genuine miss still surfaces as a clean solver gap downstream).
+    * Mirrors `SolutionLowering.termTypesOfRelation`. Unlike it, a stray `Type.Var` (pre-solve)
+    * is skipped, not defaulted — unsound for Box/Unbox/liftN.
     */
   private def termTypesOfRelation(rel: Type): List[Type] = {
     def flattenApply(rel0: Type): List[Type] = rel0 match {
@@ -662,7 +636,6 @@ object ConstraintCollection {
     }
     flattenApply(rel).reverse
   }
-
 
   /**
     * Extracts the element type T for Channel.newChannelTuple.
@@ -683,6 +656,13 @@ object ConstraintCollection {
       case _ => tpe
     }
   }
+
+  /**
+    * Inverse of `Type.mkTuplish`. `arity` can't be derived from `tpe` alone — mkTuplish leaves
+    * an arity-1 result bare, so a single value can itself be tuple-typed.
+    */
+  private def unmkTuplish(arity: Int, tpe: Type): List[Type] =
+    if (arity <= 1) List(tpe) else tpe.typeArguments
 
   /** Converts `tpe0` to a `MonoArg` relative to the current declaration context. */
   private def typeToMonoArg(tpe0: Type)(implicit ctx: Context): MonoArg = {
