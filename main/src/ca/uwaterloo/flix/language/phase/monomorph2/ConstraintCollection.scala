@@ -34,14 +34,14 @@ object ConstraintCollection {
   /**
     * Generation context.
     *
-    * @param currentDecl the decl which we are currently traversing
-    * @param tparamEnv maps the current def's type parameters to their indices
+    * @param tparamEnv maps the current declaration's type parameters to `MonoArg.Param`. Always
+    *                  `Param` in practice, not enforced by the type — deliberately, so entries can
+    *                  reference more than one `MonoVar` if a future scope ever needs it.
     * @param root the typed AST root (needed to resolve ground associated types)
     * @param flix the Flix context (needed by TypeReduction2)
     */
   case class Context(
-    currentDecl: MonoVar,
-    tparamEnv: Map[Symbol.KindedTypeVarSym, Int],
+    tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],
     root: TypedAst.Root,
     flix: Flix
   )
@@ -52,42 +52,47 @@ object ConstraintCollection {
   def generate(root: TypedAst.Root)(implicit flix: Flix): Set[Flow] = flix.phase("ConstraintCollection") {
     val fromDefs = ParOps.parMap(root.defs.values) { defn =>
       flix.profile(defn.sym, defn.loc) {
-        val tparamEnv = defn.spec.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
-        implicit val ctx: Context = Context(MonoVar.Def(defn.sym), tparamEnv, root, flix)
+        val mvar = MonoVar.Def(defn.sym)
+        val tparamEnv = defn.spec.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> MonoArg.Param(mvar, i) }.toMap
+        implicit val ctx: Context = Context(tparamEnv, root, flix)
         visitDef(defn, Nil)
       }
     }.flatten.toSet
 
     val fromEnums = ParOps.parMap(root.enums.values) { enm =>
-      val tparamEnv = enm.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
-      implicit val ctx: Context = Context(MonoVar.Enum(enm.sym), tparamEnv, root, flix)
+      val mvar = MonoVar.Enum(enm.sym)
+      val tparamEnv = enm.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> MonoArg.Param(mvar, i) }.toMap
+      implicit val ctx: Context = Context(tparamEnv, root, flix)
       visitEnum(enm, Nil)
     }.flatten.toSet
 
     val fromInstances = ParOps.parMap(root.instances.values) { inst =>
-      val instTparamEnv = inst.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
       inst.defs.flatMap { instDef =>
+        val mvar = MonoVar.Def(instDef.sym)
+        val instTparamEnv = inst.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> MonoArg.Param(mvar, i) }.toMap
         // Derived instances (Deriver.scala) reuse the same tparam symbols for both inst.tparams
         // and spec.tparams; exclude that overlap here instead of reassigning it a wrong index below.
         val offset = inst.tparams.length
         val newSpecTparams = instDef.spec.tparams.filterNot(tp => instTparamEnv.contains(tp.sym))
-        val specTparamEnv = newSpecTparams.zipWithIndex.map { case (tp, j) => tp.sym -> (offset + j) }.toMap
+        val specTparamEnv = newSpecTparams.zipWithIndex.map { case (tp, j) => tp.sym -> MonoArg.Param(mvar, offset + j) }.toMap
         flix.profile(instDef.sym, instDef.loc) {
-          implicit val ctx: Context = Context(MonoVar.Def(instDef.sym), instTparamEnv ++ specTparamEnv, root, flix)
+          implicit val ctx: Context = Context(instTparamEnv ++ specTparamEnv, root, flix)
           visitDef(instDef, Nil)
         }
       }
     }.flatten.toSet
 
     val fromRestrictableEnums = ParOps.parMap(root.restrictableEnums.values) { enm =>
-      val tparamEnv = (enm.index :: enm.tparams).zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
-      implicit val ctx: Context = Context(MonoVar.RestrictableEnum(enm.sym), tparamEnv, root, flix)
+      val mvar = MonoVar.RestrictableEnum(enm.sym)
+      val tparamEnv = (enm.index :: enm.tparams).zipWithIndex.map { case (tp, i) => tp.sym -> MonoArg.Param(mvar, i) }.toMap
+      implicit val ctx: Context = Context(tparamEnv, root, flix)
       visitRestrictableEnum(enm, Nil)
     }.flatten.toSet
 
     val fromStructs = ParOps.parMap(root.structs.values) { struct =>
-      val tparamEnv = struct.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
-      implicit val ctx: Context = Context(MonoVar.Struct(struct.sym), tparamEnv, root, flix)
+      val mvar = MonoVar.Struct(struct.sym)
+      val tparamEnv = struct.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> MonoArg.Param(mvar, i) }.toMap
+      implicit val ctx: Context = Context(tparamEnv, root, flix)
       visitStruct(struct, Nil)
     }.flatten.toSet
 
@@ -97,21 +102,23 @@ object ConstraintCollection {
       val trt = root.traits(sig.sym.trt)
       val traitTparam = trt.tparam
       val allTparams = traitTparam :: sig.spec.tparams
-      val tparamEnv = allTparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
       // We synthesize a DefnSym so their own tparams classify as Param, not  wrongly-ground
       // Const. (Same is true for fromEffects)
       val ns = sig.sym.trt.namespace :+ sig.sym.trt.name
       val defnSym = new Symbol.DefnSym(None, ns, sig.sym.name, sig.sym.loc)
+      val mvar = MonoVar.Def(defnSym)
+      val tparamEnv = allTparams.zipWithIndex.map { case (tp, i) => tp.sym -> MonoArg.Param(mvar, i) }.toMap
       flix.profile(defnSym, sig.sym.loc) {
-        implicit val ctx: Context = Context(MonoVar.Def(defnSym), tparamEnv, root, flix)
+        implicit val ctx: Context = Context(tparamEnv, root, flix)
         sig.exp.map(e => visitExp(e, Nil)).getOrElse(Nil)
       }
     }.flatten.toSet
 
     val fromEffects = ParOps.parMap(root.effects.values.flatMap(_.ops)) { op =>
-      val tparamEnv = op.spec.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> i }.toMap
       val defnSym = new Symbol.DefnSym(None, op.sym.namespace, op.sym.name, op.sym.loc)
-      implicit val ctx: Context = Context(MonoVar.Def(defnSym), tparamEnv, root, flix)
+      val mvar = MonoVar.Def(defnSym)
+      val tparamEnv = op.spec.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> MonoArg.Param(mvar, i) }.toMap
+      implicit val ctx: Context = Context(tparamEnv, root, flix)
       val acc1 = op.spec.fparams.foldLeft(List.empty[Flow]) { case (a, FormalParam(_, tpe, _, _, _)) => visitType(tpe, a) }
       visitType(op.spec.retTpe, acc1)
     }.flatten.toSet
@@ -655,15 +662,11 @@ object ConstraintCollection {
     val tpe = Type.eraseAliases(tpe0)
     tpe match {
       case Type.Var(sym, _) =>
-        ctx.tparamEnv.get(sym) match {
-          case Some(idx) => MonoArg.Param(ctx.currentDecl, idx)
-          case None =>
-            // A type variable that is not a tparam of the current decl — e.g. a region var
-            // introduced by `region r { ... }`, which is local to the expression. Mirroring
-            // Specialization.default, such vars do not drive specialization: record them as an
-            // opaque constant so the flow is still emitted but the solver does not propagate them.
-            MonoArg.Const(tpe)
-        }
+        // A type variable that is not a tparam of the current decl (absent from tparamEnv) — e.g.
+        // a region var introduced by `region r { ... }`, which is local to the expression.
+        // Mirroring Specialization.default, such vars do not drive specialization: record them as
+        // an opaque constant so the flow is still emitted but the solver does not propagate them.
+        ctx.tparamEnv.getOrElse(sym, MonoArg.Const(tpe))
       case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
         // Ground: resolve eagerly. Non-ground: record symbolically for the solver.
         if (tpe.typeVars.isEmpty) MonoArg.Const(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix))
