@@ -88,7 +88,7 @@ object NonMonomorphizableCheck {
       case Some(edge) =>
         throw InternalCompilerException(
           s"Program is not monomorphizable: found an infinitely-growing recursive type " +
-          s"involving ${MonomorphDebug.monoVarLabel(edge.src.mvar)}. This indicates polymorphic recursion " +
+          s"involving ${edge.src.mvar}. This indicates polymorphic recursion " +
           s"(e.g. `def f(x: a): List[a] = ...f(lst)...`) or a genuinely non-regular recursive " +
           s"enum/struct (e.g. `enum T[a] { case Base(a); case Recurse(T[Poly[a]]) }`) — Flix " +
           s"cannot generate a finite number of monomorphized copies for this definition.",
