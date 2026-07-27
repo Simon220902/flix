@@ -28,8 +28,7 @@ import scala.collection.mutable
   * a graph over `(MonoVar, tuple-position)` vertices, and we look for a "growing cycle": a reachable
   * cycle with at least one edge that wraps the flowing type in an additional type constructor
   * (`a` flowing into `List[a]`). Such a cycle arises from polymorphic recursion
-  * (e.g. `def f(x: a): List[a] = f(x::Nil)`) or a non-regular recursive enum/struct
-  * (`enum T[a] { case Base(a); case Recurse(T[Poly[a]]) }`). A cycle of only direct-copy edges is
+  * (e.g. `def f(x: a): List[a] = f(x::Nil)`). A cycle of only direct-copy edges is
   * ordinary, convergent self-recursion and is fine.
   *
   * The check over-approximates in one known way: a non-regular enum whose growing case is declared
@@ -56,19 +55,16 @@ object NonMonomorphizableCheck {
       for ((arg, i) <- args.zipWithIndex) {
         val dstV = Vertex(dst, i)
         arg match {
-          // A bare Param flows through unchanged: an edge, but never growth.
           case MonoArg.Param(v, j) =>
             edgesBuilder += Edge(Vertex(v, j), dstV, growing = false)
-          // Any wrapped Param is growth, except effect/case-set algebra: those are bounded,
-          // idempotent set operations over a finite universe, so forwarding e.g. an effect var
-          // as `r + IO` in self-recursion cannot diverge the way wrapping a value in `List[_]`
-          // does.
           case _ =>
             val ps = MonoArg.collectParams(arg).distinct
-            if (ps.isEmpty) seedsBuilder += dstV
+            if (ps.isEmpty)
+              seedsBuilder += dstV
             else {
-              val growing = !isBoundedSetOp(arg)
-              for ((v, j) <- ps) edgesBuilder += Edge(Vertex(v, j), dstV, growing = growing)
+              val growing = isGrowingHead(arg)
+              for ((v, j) <- ps)
+                edgesBuilder += Edge(Vertex(v, j), dstV, growing = growing)
             }
         }
       }
@@ -82,8 +78,7 @@ object NonMonomorphizableCheck {
     val vertices = edges.iterator.flatMap(e => Iterator(e.src, e.dst)).toSet
     val sccOf = stronglyConnectedComponents(vertices, adjacency)
 
-    // A growing edge whose endpoints share an SCC lies on a cycle; checking `reachable(e.src)`
-    // suffices because a reachable set is closed under following edges forward.
+    // A growing edge whose endpoints share an SCC lies on a cycle.
     edges.find(e => e.growing && reachable(e.src) && sccOf(e.src) == sccOf(e.dst)) match {
       case Some(edge) =>
         throw InternalCompilerException(
@@ -99,9 +94,7 @@ object NonMonomorphizableCheck {
   }
 
   /**
-    * Returns the vertices reachable from `seeds`. Seeds are computed per-position rather than
-    * requiring the whole flow to be ground (as real solver seeding does) — a superset that can
-    * only make the check more likely to catch a growing cycle, never less.
+    * Returns the vertices reachable from `seeds`.
     */
   private def reachableFromSeeds(seeds: Set[Vertex], adjacency: Map[Vertex, List[Vertex]]): Set[Vertex] = {
     val reachable = mutable.Set.empty[Vertex]
@@ -119,13 +112,12 @@ object NonMonomorphizableCheck {
   }
 
   /**
-    * Returns `true` iff `arg`'s outermost wrapping is an effect/case-set algebra operator.
-    * Checking only the head suffices: the kind system keeps each argument position uniformly
-    * one kind throughout.
+    * Returns `true` iff `arg`'s outermost wrapping is growing, i.e. not an effect/case-set
+    * algebra operator.
     */
-  private def isBoundedSetOp(arg: MonoArg): Boolean = arg match {
-    case MonoArg.App(MonoArg.Const(Type.Cst(tc, _)), _) => isSetAlgebraConstructor(tc)
-    case _ => false
+  private def isGrowingHead(arg: MonoArg): Boolean = arg match {
+    case MonoArg.App(MonoArg.Const(Type.Cst(tc, _)), _) => !isSetAlgebraConstructor(tc)
+    case _ => true
   }
 
   /** Returns `true` iff `tc` is an effect or case-set algebra constructor. */
@@ -148,8 +140,7 @@ object NonMonomorphizableCheck {
 
   /**
     * Tarjan's strongly-connected-components algorithm. Returns a map from each vertex to an
-    * arbitrary but consistent integer id shared by every vertex in its SCC (so two vertices are
-    * mutually reachable iff they map to the same id).
+    * arbitrary but consistent integer id shared by every vertex in its SCC.
     */
   private def stronglyConnectedComponents(vertices: Set[Vertex], adjacency: Map[Vertex, List[Vertex]]): Map[Vertex, Int] = {
     var nextIndex = 0
