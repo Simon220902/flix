@@ -190,12 +190,18 @@ object ConstraintCollection {
       val defEffects = MonomorphCanon.evalEffect(defn.spec.eff)
       val requiredHandlers = ctx.root.defaultHandlers.filter(h => defEffects.contains(h.handledSym))
       val (flows, _) = requiredHandlers.foldLeft((acc,defn.spec.eff)) { case ((a, eff), handler) =>
-        // Handler signature is `pub def h(f: Unit -> a \ ef): a \ ...` with tparams inferred
-        // in order of first occurrence: [ef, a].
-        val flow = Flow(
-          List(typeToMonoArg(eff), typeToMonoArg(defn.spec.retTpe)),
-          MonoVar.Def(handler.handlerSym)
-        )
+        // Handler signature is `pub def h(f: Unit -> a \ ef): a \ ...`, but the relative order of
+        // `a`/`ef` in the handler's own tparams isn't guaranteed.
+        val handlerDef = ctx.root.defs(handler.handlerSym)
+        val handlerTparams = handlerDef.spec.tparams
+        val effMonoArg = typeToMonoArg(eff)
+        val retTpeMonoArg = typeToMonoArg(defn.spec.retTpe)
+        val args = handlerTparams.map(_.sym.kind) match {
+          case Kind.Eff :: Kind.Star :: Nil => effMonoArg :: retTpeMonoArg :: Nil
+          case Kind.Star :: Kind.Eff :: Nil => retTpeMonoArg :: effMonoArg :: Nil
+          case _ => throw InternalCompilerException(s"Expected a default handler with exactly one Star and one Eff tparam, but found: ${handlerTparams.map(_.sym.kind)}", loc)
+        }
+        val flow = Flow(args, MonoVar.Def(handler.handlerSym))
         val residualEff = MonomorphCanon.canonicalEffect(Type.mkUnion(Type.mkDifference(eff, handler.handledEff, loc), Type.IO, loc))
         (flow :: a, residualEff)
       }
