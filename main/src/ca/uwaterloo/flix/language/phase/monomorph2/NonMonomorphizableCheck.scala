@@ -60,7 +60,6 @@ object NonMonomorphizableCheck {
     val edges = positions.flatMap { case (arg, dstV, ps) =>
       ps.map { case (v, j) => Edge(Vertex(v, j), dstV, growing = isGrowingHead(arg)) }
     }
-    val edges = edgesBuilder.result()
 
     if (edges.isEmpty) return
 
