@@ -197,8 +197,8 @@ object ConstraintCollection {
         val effMonoArg = typeToMonoArg(eff)
         val retTpeMonoArg = typeToMonoArg(defn.spec.retTpe)
         val args = handlerTparams.map(_.sym.kind) match {
-          case Kind.Eff :: Kind.Star :: Nil => effMonoArg :: retTpeMonoArg :: Nil
-          case Kind.Star :: Kind.Eff :: Nil => retTpeMonoArg :: effMonoArg :: Nil
+          case Kind.Eff  :: Kind.Star :: Nil => effMonoArg :: retTpeMonoArg :: Nil
+          case Kind.Star :: Kind.Eff  :: Nil => retTpeMonoArg :: effMonoArg :: Nil
           case _ => throw InternalCompilerException(s"Expected a default handler with exactly one Star and one Eff tparam, but found: ${handlerTparams.map(_.sym.kind)}", loc)
         }
         val flow = Flow(args, MonoVar.Def(handler.handlerSym))
