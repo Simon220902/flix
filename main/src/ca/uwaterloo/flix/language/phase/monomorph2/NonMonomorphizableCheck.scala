@@ -17,8 +17,7 @@
 package ca.uwaterloo.flix.language.phase.monomorph2
 
 import ca.uwaterloo.flix.language.ast.{SourceLocation, Type, TypeConstructor}
-import ca.uwaterloo.flix.util.InternalCompilerException
-import scala.collection.mutable
+import ca.uwaterloo.flix.util.{Graph, InternalCompilerException}
 
 /**
   * Rejects non-monomorphizable programs (flow sets with no finite solution) before
@@ -74,9 +73,10 @@ object NonMonomorphizableCheck {
     if (edges.isEmpty) return
 
     val adjacency = edges.groupMap(_.src)(_.dst)
-    val reachable = reachableFromSeeds(seedsBuilder.result(), adjacency)
+    val getAdj = (v: Vertex) => adjacency.getOrElse(v, Nil)
+    val reachable = Graph.reachable(seeds, getAdj)
     val vertices = edges.iterator.flatMap(e => Iterator(e.src, e.dst)).toSet
-    val sccOf = stronglyConnectedComponents(vertices, adjacency)
+    val sccOf = Graph.stronglyConnectedComponents(vertices, getAdj)
 
     // Detect polymorphic recursion: If a growing reachable edge is on a cycle (i.e. endpoints share SCC).
     edges.find(e => e.growing && reachable(e.src) && sccOf(e.src) == sccOf(e.dst)) match {
@@ -94,26 +94,7 @@ object NonMonomorphizableCheck {
   }
 
   /**
-    * Returns the vertices reachable from `seeds`.
-    */
-  private def reachableFromSeeds(seeds: Set[Vertex], adjacency: Map[Vertex, List[Vertex]]): Set[Vertex] = {
-    val reachable = mutable.Set.empty[Vertex]
-    val queue = mutable.Queue.empty[Vertex]
-    reachable ++= seeds
-    queue.enqueueAll(seeds)
-    while (queue.nonEmpty) {
-      val v = queue.dequeue()
-      for (w <- adjacency.getOrElse(v, Nil) if !reachable(w)) {
-        reachable += w
-        queue.enqueue(w)
-      }
-    }
-    reachable.toSet
-  }
-
-  /**
-    * Returns `true` iff `arg`'s outermost wrapping is growing, i.e. not an effect/case-set
-    * algebra operator.
+    * Returns `true` iff `arg`'s outermost wrapping is growing.
     */
   private def isGrowingHead(arg: MonoArg): Boolean = arg match {
     // a direct copy, never growth
@@ -140,54 +121,4 @@ object NonMonomorphizableCheck {
     case MonoVar.RestrictableEnum(sym) => sym.loc
     case MonoVar.Struct(sym)           => sym.loc
   }
-
-  /**
-    * Tarjan's strongly-connected-components algorithm. Returns a map from each vertex to an
-    * arbitrary but consistent integer id shared by every vertex in its SCC.
-    */
-  private def stronglyConnectedComponents(vertices: Set[Vertex], adjacency: Map[Vertex, List[Vertex]]): Map[Vertex, Int] = {
-    var nextIndex = 0
-    val index    = mutable.Map.empty[Vertex, Int]
-    val lowlink  = mutable.Map.empty[Vertex, Int]
-    val onStack  = mutable.Set.empty[Vertex]
-    val stack    = mutable.ArrayDeque.empty[Vertex]
-    val sccId    = mutable.Map.empty[Vertex, Int]
-    var nextScc  = 0
-
-    def strongConnect(v: Vertex): Unit = {
-      index(v) = nextIndex
-      lowlink(v) = nextIndex
-      nextIndex += 1
-      stack.append(v)
-      onStack += v
-
-      for (w <- adjacency.getOrElse(v, Nil)) {
-        if (!index.contains(w)) {
-          strongConnect(w)
-          lowlink(v) = math.min(lowlink(v), lowlink(w))
-        } else if (onStack(w)) {
-          lowlink(v) = math.min(lowlink(v), index(w))
-        }
-      }
-
-      if (lowlink(v) == index(v)) {
-        var w = stack.removeLast()
-        onStack -= w
-        sccId(w) = nextScc
-        while (w != v) {
-          w = stack.removeLast()
-          onStack -= w
-          sccId(w) = nextScc
-        }
-        nextScc += 1
-      }
-    }
-
-    for (v <- vertices if !index.contains(v)) {
-      strongConnect(v)
-    }
-
-    sccId.toMap
-  }
-
 }

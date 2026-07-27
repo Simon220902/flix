@@ -74,4 +74,78 @@ object Graph {
     }.getOrElse(TopologicalSort.Sorted(sorted.toList))
   }
 
+  /**
+    * Get strongly-connected-components, using Tarjan's algorithm.
+    *
+    * Returns a map from each node to an arbitrary but consistent integer id, shared by every node in its SCC.
+    *
+    * The `getAdj` function returns the adjacent nodes, i.e, the outgoing edges of a node `n`.
+    *
+    * `N` must have a well-defined equality and hashcode.
+    */
+  def stronglyConnectedComponents[N](nodes: Iterable[N], getAdj: (N => List[N])): Map[N, Int] = {
+    var nextIndex = 0
+    val index    = mutable.Map.empty[N, Int]
+    val lowlink  = mutable.Map.empty[N, Int]
+    val onStack  = mutable.Set.empty[N]
+    val stack    = mutable.ArrayDeque.empty[N]
+    val sccId    = mutable.Map.empty[N, Int]
+    var nextScc  = 0
+
+    def strongConnect(v: N): Unit = {
+      index(v) = nextIndex
+      lowlink(v) = nextIndex
+      nextIndex += 1
+      stack.append(v)
+      onStack += v
+
+      for (w <- getAdj(v)) {
+        if (!index.contains(w)) {
+          strongConnect(w)
+          lowlink(v) = math.min(lowlink(v), lowlink(w))
+        } else if (onStack(w)) {
+          lowlink(v) = math.min(lowlink(v), index(w))
+        }
+      }
+
+      if (lowlink(v) == index(v)) {
+        var w = stack.removeLast()
+        onStack -= w
+        sccId(w) = nextScc
+        while (w != v) {
+          w = stack.removeLast()
+          onStack -= w
+          sccId(w) = nextScc
+        }
+        nextScc += 1
+      }
+    }
+
+    for (v <- nodes if !index.contains(v)) {
+      strongConnect(v)
+    }
+
+    sccId.toMap
+  }
+
+  /**
+    * Get every node reachable from `seeds`, using the `getAdj` function to find adjacent nodes,
+    * i.e., the outgoing edges of a node `n`.
+    *
+    * `N` must have a well-defined equality and hashcode.
+    */
+  def reachable[N](seeds: Iterable[N], getAdj: (N => List[N])): Set[N] = {
+    val visited = mutable.Set.empty[N]
+    val queue = mutable.Queue.empty[N]
+    visited ++= seeds
+    queue.enqueueAll(seeds)
+    while (queue.nonEmpty) {
+      val v = queue.dequeue()
+      for (w <- getAdj(v) if !visited(w)) {
+        visited += w
+        queue.enqueue(w)
+      }
+    }
+    visited.toSet
+  }
 }
