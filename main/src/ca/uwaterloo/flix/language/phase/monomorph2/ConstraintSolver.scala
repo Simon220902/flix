@@ -46,10 +46,8 @@ object ConstraintSolver {
     val prepared    = flows.iterator.map(f => prepareFlow(f, root)).toList
     val dependents  = buildDependents(prepared)
 
-    // The @LoweringTargetChannel defs are looked up by SolutionLowering with a type already run
-    // through lowerType (Sender[t]/Receiver[t] rewritten to Mpmc[t, IO]), so their tuples must
-    // get the same rewrite here — but only here: applying it in typeToMonoArg would corrupt the
-    // keys of ordinary defs (e.g. Channel.send) whose own key keeps Sender/Receiver.
+    // SolutionLowering looks up @LoweringTargetChannel defs by a key already run through
+    // lowerChannelType, so their solved tuples need the same rewrite here.
     val channelDefs = Set(Defs.ChannelGet, Defs.ChannelPut, Defs.ChannelNewTuple, Defs.ChannelMpmcAdmin, Defs.ChannelUnsafeGetAndUnlock)
 
     val solution  = mutable.Map.empty[MonoVar, mutable.Set[List[Type]]]
@@ -149,10 +147,7 @@ object ConstraintSolver {
     if (resolved.forall(_.isDefined)) Some(resolved.map(_.get)) else None
   }
 
-  /**
-    * Rewrites every `Region` constant in `t` to the `IO` effect — matches `StrictSubstitution`'s
-    * treatment, applied everywhere since a region can already appear ground here.
-    */
+  /** Rewrites every `Region` constant in `t` to the `IO` effect. */
   private def rewriteRegionToIO(t: Type): Type = t match {
     case Type.Cst(TypeConstructor.Region(_), loc) => Type.Cst(TypeConstructor.Effect(Symbol.IO, Kind.Eff), loc)
     case Type.Apply(t1, t2, loc)                  => Type.Apply(rewriteRegionToIO(t1), rewriteRegionToIO(t2), loc)
@@ -210,7 +205,7 @@ object ConstraintSolver {
 
   /**
     * Resolves a sig call with type-arg `tuple` to the impl def sym and its type args.
-    * Returns `None` if the instance cannot be found (e.g. for known gap cases).
+    * Returns `None` if the instance cannot be found.
     */
   private def resolveSig(
     sigSym: Symbol.SigSym,
@@ -218,8 +213,6 @@ object ConstraintSolver {
     root: TypedAst.Root,
     instanceMap: Map[(Symbol.TraitSym, TypeConstructor), TypedAst.Instance]
   )(implicit flix: Flix): Option[(Symbol.DefnSym, List[Type])] = {
-    if (tuple.isEmpty) return None
-
     val traitType = tuple.head
     val tyCon     = traitType.typeConstructor.getOrElse(return None)
     val instance  = instanceMap.getOrElse((sigSym.trt, tyCon), return None)
