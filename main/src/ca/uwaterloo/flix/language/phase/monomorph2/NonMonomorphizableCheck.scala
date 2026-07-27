@@ -78,14 +78,14 @@ object NonMonomorphizableCheck {
     val vertices = edges.iterator.flatMap(e => Iterator(e.src, e.dst)).toSet
     val sccOf = stronglyConnectedComponents(vertices, adjacency)
 
-    // A growing edge whose endpoints share an SCC lies on a cycle.
+    // Detect polymorphic recursion: If a growing reachable edge is on a cycle (i.e. endpoints share SCC).
     edges.find(e => e.growing && reachable(e.src) && sccOf(e.src) == sccOf(e.dst)) match {
       case Some(edge) =>
         throw InternalCompilerException(
           s"Program is not monomorphizable: found an infinitely-growing recursive type " +
           s"involving ${edge.src.mvar}. This indicates polymorphic recursion " +
           s"(e.g. `def f(x: a): List[a] = ...f(lst)...`) or a genuinely non-regular recursive " +
-          s"enum/struct (e.g. `enum T[a] { case Base(a); case Recurse(T[Poly[a]]) }`) — Flix " +
+          s"enum/struct (e.g. `enum T[a] { ...case Recurse(T[List[a]])... }`) — Flix " +
           s"cannot generate a finite number of monomorphized copies for this definition.",
           monoVarLoc(edge.src.mvar)
         )
@@ -116,6 +116,9 @@ object NonMonomorphizableCheck {
     * algebra operator.
     */
   private def isGrowingHead(arg: MonoArg): Boolean = arg match {
+    // a direct copy, never growth
+    case MonoArg.Param(_, _) => false
+    // set algebra doesn't count as nesting
     case MonoArg.App(MonoArg.Const(Type.Cst(tc, _)), _) => !isSetAlgebraConstructor(tc)
     case _ => true
   }
