@@ -48,25 +48,17 @@ object NonMonomorphizableCheck {
     * [[InternalCompilerException]] if so.
     */
   def checkMonomorphizable(flows: Set[Flow]): Unit = {
-    val edgesBuilder = List.newBuilder[Edge]
-    val seedsBuilder = Set.newBuilder[Vertex]
-    for (Flow(args, dst) <- flows) {
-      for ((arg, i) <- args.zipWithIndex) {
-        val dstV = Vertex(dst, i)
-        arg match {
-          case MonoArg.Param(v, j) =>
-            edgesBuilder += Edge(Vertex(v, j), dstV, growing = false)
-          case _ =>
-            val ps = MonoArg.collectParams(arg).distinct
-            if (ps.isEmpty)
-              seedsBuilder += dstV
-            else {
-              val growing = isGrowingHead(arg)
-              for ((v, j) <- ps)
-                edgesBuilder += Edge(Vertex(v, j), dstV, growing = growing)
-            }
+    val positions = flows.iterator.flatMap {
+      case Flow(args, dst) =>
+        args.iterator.zipWithIndex.map { case (arg, i) =>
+          val dstV = Vertex(dst, i)
+          (arg, dstV, MonoArg.collectParams(arg).distinct)
         }
-      }
+    }.toList
+
+    val seeds = positions.collect { case (_, dstV, ps) if ps.isEmpty => dstV }
+    val edges = positions.flatMap { case (arg, dstV, ps) =>
+      ps.map { case (v, j) => Edge(Vertex(v, j), dstV, growing = isGrowingHead(arg)) }
     }
     val edges = edgesBuilder.result()
 
