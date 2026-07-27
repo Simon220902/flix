@@ -125,22 +125,24 @@ object ConstraintCollection {
   /**
     * Emits flow constraints for enum type applications occurring in `tpe`.
     */
-  private def visitType(tpe0: Type, acc: List[Flow])(implicit ctx: Context): List[Flow] = Type.eraseAliases(tpe0) match {
-    // Deep alias erasure above because .baseType/.typeArguments below don't check for Type.Alias
-    case at @ Type.AssocType(_, arg, _, _) =>
-      // If the associated type is ground, resolve it and continue; otherwise recurse into arg.
-      if (at.typeVars.isEmpty) visitType(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix), acc)
-      else visitType(arg, acc)
-    case _: Type.BaseType
-         | Type.Var(_, _)
-         | Type.Cst(_, _) => acc
-    case app @ Type.Apply(_, _, _) =>
-      val args = app.typeArguments
-      val acc1 = args.foldLeft(acc)((a, t) => visitType(t, a))
-      declMonoVar(app.baseType) match {
-        case Some(mvar) => Flow(args.map(t => typeToMonoArg(t)), mvar) :: acc1
-        case None       => acc1
-      }
+  private def visitType(tpe0: Type, acc: List[Flow])(implicit ctx: Context): List[Flow] = {
+    def dealiasedVisitType(tpe: Type, acc: List[Flow]): List[Flow] = tpe match {
+      case at @ Type.AssocType(_, arg, _, _) =>
+        // If the associated type is ground, resolve it and continue; otherwise recurse into arg.
+        if (at.typeVars.isEmpty) visitType(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix), acc)
+        else dealiasedVisitType(arg, acc)
+      case _: Type.BaseType
+           | Type.Var(_, _)
+           | Type.Cst(_, _) => acc
+      case app @ Type.Apply(_, _, _) =>
+        val args = app.typeArguments
+        val acc1 = args.foldLeft(acc)((a, t) => dealiasedVisitType(t, a))
+        declMonoVar(app.baseType) match {
+          case Some(mvar) => Flow(args.map(t => dealiasedTypeToMonoArg(t)), mvar) :: acc1
+          case None       => acc1
+        }
+    }
+    dealiasedVisitType(Type.eraseAliases(tpe0), acc)
   }
 
   /** The MonoVar of `baseType`'s enum/restrictable-enum/struct constructor, or None if it's neither. */
@@ -190,12 +192,12 @@ object ConstraintCollection {
       val defEffects = MonomorphCanon.evalEffect(defn.spec.eff)
       val requiredHandlers = ctx.root.defaultHandlers.filter(h => defEffects.contains(h.handledSym))
       val (flows, _) = requiredHandlers.foldLeft((acc,defn.spec.eff)) { case ((a, eff), handler) =>
-        // Handler signature is `pub def h(f: Unit -> a \ ef): a \ ...`, but the relative order of
-        // `a`/`ef` in the handler's own tparams isn't guaranteed.
         val handlerDef = ctx.root.defs(handler.handlerSym)
         val handlerTparams = handlerDef.spec.tparams
         val effMonoArg = typeToMonoArg(eff)
         val retTpeMonoArg = typeToMonoArg(defn.spec.retTpe)
+        // Handler signature is `pub def h(f: Unit -> a \ ef): a \ ...`, but the relative order of
+        // `a`/`ef` in `handlerTparams` isn't guaranteed.
         val args = handlerTparams.map(_.sym.kind) match {
           case Kind.Eff  :: Kind.Star :: Nil => effMonoArg :: retTpeMonoArg :: Nil
           case Kind.Star :: Kind.Eff  :: Nil => retTpeMonoArg :: effMonoArg :: Nil
@@ -660,8 +662,11 @@ object ConstraintCollection {
     if (arity <= 1) List(tpe) else tpe.typeArguments
 
   /** Converts `tpe0` to a `MonoArg` relative to the current declaration context. */
-  private def typeToMonoArg(tpe0: Type)(implicit ctx: Context): MonoArg = {
-    val tpe = Type.eraseAliases(tpe0)
+  private def typeToMonoArg(tpe0: Type)(implicit ctx: Context): MonoArg =
+    dealiasedTypeToMonoArg(Type.eraseAliases(tpe0))
+
+  /** Like [[typeToMonoArg]], but `tpe` must already have its aliases erased (deeply). */
+  private def dealiasedTypeToMonoArg(tpe: Type)(implicit ctx: Context): MonoArg =
     tpe match {
       case Type.Var(sym, _) =>
         // A type variable that is not a tparam of the current decl (absent from tparamEnv) — e.g.
@@ -672,7 +677,7 @@ object ConstraintCollection {
       case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
         // Ground: resolve eagerly. Non-ground: record symbolically for the solver.
         if (tpe.typeVars.isEmpty) MonoArg.Const(MonomorphCanon.reduceAssocType(at)(ctx.root, ctx.flix))
-        else MonoArg.Assoc(symUse.sym, typeToMonoArg(arg), kind, assocLoc)
+        else MonoArg.Assoc(symUse.sym, dealiasedTypeToMonoArg(arg), kind, assocLoc)
       case Type.Cst(_, _) | _: Type.BaseType =>
         MonoArg.Const(tpe)
       case Type.Apply(_, _, _) =>
@@ -682,12 +687,11 @@ object ConstraintCollection {
           // evalEffect has no AssocType case.
           MonoArg.Const(MonomorphCanon.simplify(tpe, isGround = true)(ctx.root, ctx.flix))
         else {
-          MonoArg.App(typeToMonoArg(tpe.baseType), tpe.typeArguments.map(arg => typeToMonoArg(arg)))
+          MonoArg.App(dealiasedTypeToMonoArg(tpe.baseType), tpe.typeArguments.map(arg => dealiasedTypeToMonoArg(arg)))
         }
       case other =>
         MonoArg.Const(other)
     }
-  }
 
   /** Returns the enum/restrictable-enum/struct `MonoVar` and type arguments of `tpe0`. */
   private def getMonoVarAndTypeArgs(tpe0: Type): (MonoVar, List[Type]) = {
