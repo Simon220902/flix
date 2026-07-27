@@ -69,11 +69,8 @@ object ConstraintCollection {
       inst.defs.flatMap { instDef =>
         val mvar = MonoVar.Def(instDef.sym)
         val instTparamEnv = inst.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> MonoArg.Param(mvar, i) }.toMap
-        // Derived instances (Deriver.scala) reuse the same tparam symbols for both inst.tparams
-        // and spec.tparams; exclude that overlap here instead of reassigning it a wrong index below.
         val offset = inst.tparams.length
-        val newSpecTparams = instDef.spec.tparams.filterNot(tp => instTparamEnv.contains(tp.sym))
-        val specTparamEnv = newSpecTparams.zipWithIndex.map { case (tp, j) => tp.sym -> MonoArg.Param(mvar, offset + j) }.toMap
+        val specTparamEnv = instDef.spec.tparams.zipWithIndex.map { case (tp, j) => tp.sym -> MonoArg.Param(mvar, offset + j) }.toMap
         flix.profile(instDef.sym, instDef.loc) {
           implicit val ctx: Context = Context(instTparamEnv ++ specTparamEnv, root, flix)
           visitDef(instDef, Nil)
