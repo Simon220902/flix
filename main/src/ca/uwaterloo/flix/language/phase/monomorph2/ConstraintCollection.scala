@@ -664,8 +664,8 @@ object ConstraintCollection {
   }
 
   /**
-    * Mirrors `SolutionLowering.termTypesOfRelation`. Unlike it, a stray `Type.Var` (pre-solve)
-    * is skipped, not defaulted — unsound for Box/Unbox/liftN.
+    * Mirrors `SolutionLowering.termTypesOfRelation`. Unlike it, a `Type.Var` tail — the
+    * relation's own arity trailing off unconstrained, not a term type — is skipped, not an error.
     */
   private def termTypesOfRelation(rel: Type): List[Type] = {
     def flattenApply(rel0: Type): List[Type] = rel0 match {
