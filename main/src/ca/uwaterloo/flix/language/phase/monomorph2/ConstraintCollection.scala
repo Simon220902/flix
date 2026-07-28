@@ -48,7 +48,7 @@ object ConstraintCollection {
   }
 
   /**
-    * Generates specialization constraints for every top-level definition, enum, and trait instance.
+    * Generates specialization constraints for every top-level declaration in `root0`.
     */
   def generate(root0: TypedAst.Root)(implicit flix: Flix): Set[Flow] = flix.phase("ConstraintCollection") {
     implicit val ctx: Context = new Context()
@@ -689,21 +689,18 @@ object ConstraintCollection {
     tpe match {
       case Type.Var(sym, _) =>
         // A type variable that is not a tparam of the current decl (absent from tparamEnv) — e.g.
-        // a region var introduced by `region r { ... }`, which is local to the expression.
-        // Mirroring Specialization.default, such vars do not drive specialization: record them as
-        // an opaque constant so the flow is still emitted but the solver does not propagate them.
+        // a region var introduced by `region r { ... }`. We record it as an opaque constant so the
+        // flow is still emitted but the solver does not propagate it.
         tparamEnv.getOrElse(sym, MonoArg.Const(tpe))
       case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
-        // Ground: resolve eagerly. Non-ground: record symbolically for the solver.
-        if (tpe.typeVars.isEmpty) MonoArg.Const(MonomorphCanon.reduceAssocType(at)(root, flix))
-        else MonoArg.Assoc(symUse.sym, dealiasedTypeToMonoArg(arg), kind, assocLoc)
+        if (tpe.typeVars.isEmpty)
+          MonoArg.Const(MonomorphCanon.reduceAssocType(at)(root, flix))
+        else
+          MonoArg.Assoc(symUse.sym, dealiasedTypeToMonoArg(arg), kind, assocLoc)
       case Type.Cst(_, _) | _: Type.BaseType =>
         MonoArg.Const(tpe)
       case Type.Apply(_, _, _) =>
         if (tpe.kind == Kind.Eff && tpe.typeVars.isEmpty)
-          // simplify reduces any AssocType nested in the formula (e.g. `Foo.Aef[a] + IO`) before
-          // folding it via canonicalEffect — calling canonicalEffect directly would throw, since
-          // evalEffect has no AssocType case.
           MonoArg.Const(MonomorphCanon.simplify(tpe, isGround = true)(root, flix))
         else {
           MonoArg.App(dealiasedTypeToMonoArg(tpe.baseType), tpe.typeArguments.map(arg => dealiasedTypeToMonoArg(arg)))
