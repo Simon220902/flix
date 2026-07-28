@@ -114,8 +114,7 @@ object ConstraintCollection {
       val defnSym = new Symbol.DefnSym(None, op.sym.namespace, op.sym.name, op.sym.loc)
       val mvar = MonoVar.Def(defnSym)
       implicit val tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg] = op.spec.tparams.zipWithIndex.map { case (tp, i) => tp.sym -> MonoArg.Param(mvar, i) }.toMap
-      op.spec.fparams.foreach { case FormalParam(_, tpe, _, _, _) => visitType(tpe) }
-      visitType(op.spec.retTpe)
+      visitOp(op)
     }
 
     sctx.result
@@ -166,6 +165,14 @@ object ConstraintCollection {
     */
   private def visitStruct(structDecl: TypedAst.Struct)(implicit sctx: SharedContext, tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg], root: TypedAst.Root, flix: Flix): Unit =
     structDecl.fields.values.foreach(field => visitType(field.tpe))
+
+  /**
+    * Emits flow constraints for the formal parameter and return types of `op`.
+    */
+  private def visitOp(op: TypedAst.Op)(implicit sctx: SharedContext, tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg], root: TypedAst.Root, flix: Flix): Unit = {
+    op.spec.fparams.foreach { case FormalParam(_, tpe, _, _, _) => visitType(tpe) }
+    visitType(op.spec.retTpe)
+  }
 
   /**
     * Emits flow constraints for the formal parameter types, return type, and body of `defn`.
