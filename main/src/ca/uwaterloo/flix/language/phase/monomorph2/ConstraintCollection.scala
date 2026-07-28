@@ -126,9 +126,10 @@ object ConstraintCollection {
   private def visitType(tpe0: Type)(implicit sctx: SharedContext, tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg], root: TypedAst.Root, flix: Flix): Unit = {
     def dealiasedVisitType(tpe: Type): Unit = tpe match {
       case at @ Type.AssocType(_, arg, _, _) =>
-        // If the associated type is ground, resolve it and continue; otherwise recurse into arg.
-        if (at.typeVars.isEmpty) visitType(MonomorphCanon.reduceAssocType(at)(root, flix))
-        else dealiasedVisitType(arg)
+        if (at.typeVars.isEmpty)
+          visitType(MonomorphCanon.reduceAssocType(at)(root, flix))
+        else
+          dealiasedVisitType(arg)
       case _: Type.BaseType
            | Type.Var(_, _)
            | Type.Cst(_, _) => ()
