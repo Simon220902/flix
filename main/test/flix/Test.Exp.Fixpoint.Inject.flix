@@ -207,4 +207,12 @@ mod Test.Exp.Fixpoint.Inject {
         assertEq(expected = l3, r3)
     }
 
+    @Test
+    def inject23(): Unit \ Assert = {
+        let l = Vector#{(1, 2), (2, 3), (3, 4)};
+        let pr = inject l into A/1;
+        let r = query pr select x from A(x);
+        assertEq(expected = l, r)
+    }
+
 }
