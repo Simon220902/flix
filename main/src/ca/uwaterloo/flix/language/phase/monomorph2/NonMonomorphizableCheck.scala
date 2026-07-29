@@ -95,12 +95,13 @@ object NonMonomorphizableCheck {
     case _ => true
   }
 
-  /** Returns `true` iff `tc` is an effect or case-set algebra constructor. */
+  /** Returns `true` iff `tc` is an effect, case-set, or Boolean formula algebra constructor. */
   private def isSetAlgebraConstructor(tc: TypeConstructor): Boolean = tc match {
     case TypeConstructor.Union | TypeConstructor.Intersection | TypeConstructor.Complement |
          TypeConstructor.Difference | TypeConstructor.SymmetricDiff => true
-    case _: TypeConstructor.CaseUnion | _: TypeConstructor.CaseIntersection |
-         _: TypeConstructor.CaseComplement | _: TypeConstructor.CaseSymmetricDiff => true
+    case TypeConstructor.CaseUnion(_) | TypeConstructor.CaseIntersection(_) |
+         TypeConstructor.CaseComplement(_) | TypeConstructor.CaseSymmetricDiff(_) => true
+    case TypeConstructor.And | TypeConstructor.Or | TypeConstructor.Not => true
     case _ => false
   }
 
