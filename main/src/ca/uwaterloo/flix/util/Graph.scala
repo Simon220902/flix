@@ -93,6 +93,8 @@ object Graph {
     var nextScc  = 0
 
     def strongConnect(v: N): Unit = {
+      // Assign v the next unused index, and seed its lowlink (the smallest index
+      // reachable from v) with its own index.
       index(v) = nextIndex
       lowlink(v) = nextIndex
       nextIndex += 1
@@ -101,14 +103,21 @@ object Graph {
 
       for (w <- getAdj(v)) {
         if (!index.contains(w)) {
+          // Case 1: w is unvisited. Recurse, then pull v's lowlink down to w's.
           strongConnect(w)
           lowlink(v) = math.min(lowlink(v), lowlink(w))
         } else if (onStack(w)) {
+          // Case 2: w is on the stack, so it's in the current SCC (a back edge).
+          // Pull v's lowlink down to w's index.
           lowlink(v) = math.min(lowlink(v), index(w))
         }
+        // Case 3 (implicit): w is visited but not on the stack, i.e. it belongs
+        // to an already-completed SCC. Ignore it.
       }
 
       if (lowlink(v) == index(v)) {
+        // v is the root of its SCC: pop the stack down to and including v,
+        // assigning every popped node the same fresh SCC id.
         var w = stack.removeLast()
         onStack -= w
         sccId(w) = nextScc
