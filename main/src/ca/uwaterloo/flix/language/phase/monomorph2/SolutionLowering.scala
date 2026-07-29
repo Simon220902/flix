@@ -1665,22 +1665,13 @@ object SolutionLowering {
   /** Lowers a Datalog inject-into to Fixpoint solver `projectInto` calls, one per predicate in `predsAndArities`. */
   private def lowerInjectInto(exps: List[TypedAst.Expr], predsAndArities: List[PredicateAndArity], loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val loweredExps = exps.zip(predsAndArities).map {
-      case (exp, PredicateAndArity(pred, _)) =>
+      case (exp, PredicateAndArity(pred, arity)) =>
         // The exp's own type/eff are TypedAst-level reads: substitute before use (fused walk).
         val expTpe = subst(exp.tpe)
-        // The type arguments of the functor F[(a, b, c)] or F[a].
-        val (_, targsLength) = expTpe match {
-          case Type.Apply(tycon, innerType, _) => innerType.typeConstructor match {
-            case Some(TypeConstructor.Tuple(_)) => (tycon, innerType.typeArguments.length)
-            case Some(TypeConstructor.Unit) => (tycon, 0)
-            case _ => (tycon, 1)
-          }
-          case _ => throw InternalCompilerException(s"Unexpected non-foldable type: '$expTpe'.", loc)
-        }
 
         val defTpe = Type.mkPureUncurriedArrow(List(Types.PredSym, lowerType(expTpe)), Types.Datalog, loc)
 
-        val sym = lookupSym(Defs.ProjectInto(targsLength), defTpe)
+        val sym = lookupSym(Defs.ProjectInto(arity), defTpe)
 
         val argExps = mkPredSym(pred) :: visitExp(exp, env0, subst) :: Nil
         MonoAst.Expr.ApplyDef(sym, argExps, SolutionSpecialization.rewriteEnumStructType(defTpe), Types.Datalog, subst(exp.eff), loc)
