@@ -57,7 +57,7 @@ object ConstraintSolver {
     def enqueue(dst: MonoVar, tuple0: List[Type]): Unit = {
       val tuple = dst match {
         case MonoVar.Def(sym) if channelDefs.contains(sym) => tuple0.map(lowerChannelType)
-        case _                                          => tuple0
+        case _                                             => tuple0
       }
       val key = (dst, tuple)
       if (!solution.get(dst).exists(_.contains(tuple)) && !inFlight.contains(key)) {
@@ -214,27 +214,28 @@ object ConstraintSolver {
     instanceMap: Map[(Symbol.TraitSym, TypeConstructor), TypedAst.Instance]
   )(implicit flix: Flix): Option[(Symbol.DefnSym, List[Type])] = {
     val traitType = tuple.head
-    val tyCon     = traitType.typeConstructor.getOrElse(return None)
-    val instance  = instanceMap.getOrElse((sigSym.trt, tyCon), return None)
-    val implDef   = instance.defs.find(_.sym.text == sigSym.name).getOrElse {
-      // Sig has a default impl; synthesise a sym for the trait-level def.
-      val sig = root.sigs(sigSym)
-      sig.exp match {
-        case None => return None
-        case Some(_) =>
-          val ns = sig.sym.trt.namespace :+ sig.sym.trt.name
-          val defnSym = new Symbol.DefnSym(None, ns, sig.sym.name, sig.sym.loc)
-          // The default impl belongs to the trait, not the instance, so it forwards the full sig
-          // tuple as-is rather than the instance's tparam values — but the instantiation still
-          // has to be checked for validity, the same way the non-default path below does.
-          val _ = instanceArgsFor(instance, traitType, root).getOrElse(return None)
-          return Some((defnSym, tuple))
-      }
-    }
+    for {
+      tyCon    <- traitType.typeConstructor
+      instance <- instanceMap.get((sigSym.trt, tyCon))
+      result   <- instance.defs.find(_.sym.text == sigSym.name) match {
+        case Some(implDef) =>
+          val sigOwnArgs = tuple.tail // type args beyond the trait type param
+          instanceArgsFor(instance, traitType, root).map(instanceArgs => (implDef.sym, instanceArgs ++ sigOwnArgs))
 
-    val instanceArgs = instanceArgsFor(instance, traitType, root).getOrElse(return None)
-    val sigOwnArgs   = tuple.tail // type args beyond the trait type param
-    Some((implDef.sym, instanceArgs ++ sigOwnArgs))
+        case None =>
+          // Sig has a default impl; synthesise a sym for the trait-level def. The default impl
+          // belongs to the trait, not the instance, so it forwards the full sig tuple as-is rather
+          // than the instance's tparam values — but the instantiation still has to be checked for
+          // validity, the same way the non-default path above does.
+          for {
+            _ <- root.sigs(sigSym).exp
+            _ <- instanceArgsFor(instance, traitType, root)
+          } yield {
+            val ns = sigSym.trt.namespace :+ sigSym.trt.name
+            (new Symbol.DefnSym(None, ns, sigSym.name, sigSym.loc), tuple)
+          }
+      }
+    } yield result
   }
 
   /**
