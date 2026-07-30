@@ -972,7 +972,7 @@ object SolutionLowering {
     // (handlerArrowType below) must be in that same canonical form, or the (sym, type) lookup
     // that visitExp performs when it later visits this node misses even though the types are
     // semantically equal.
-    val eff = MonomorphCanon.canonicalEffect(Type.mkUnion(effDif, Type.IO, effLoc))
+    val eff = Canonicalization.canonicalEffect(Type.mkUnion(effDif, Type.IO, effLoc))
     val tpe = Type.mkCurriedArrowWithEffect(defn.spec.fparams.map(_.tpe), eff, defn.spec.retTpe, baseTypeLoc)
     val spec = defn.spec.copy(
       declaredScheme = defn.spec.declaredScheme.copy(base = tpe),

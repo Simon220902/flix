@@ -125,7 +125,7 @@ object ConstraintGen {
     def dealiasedVisitType(tpe: Type): Unit = tpe match {
       case at @ Type.AssocType(_, arg, _, _) =>
         if (at.typeVars.isEmpty)
-          visitType(MonomorphCanon.reduceAssocType(at)(root, flix))
+          visitType(Canonicalization.reduceAssocType(at)(root, flix))
         else
           dealiasedVisitType(arg)
       case Type.Var(_, _)
@@ -194,7 +194,7 @@ object ConstraintGen {
   private def entryPointHandlerFlows(defn: TypedAst.Def)(implicit sctx: SharedContext, tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg], root: TypedAst.Root, flix: Flix): Unit =
     if (TypedAstOps.isEntryPoint(defn)(root)) {
       val loc = defn.spec.eff.loc
-      val defEffects = MonomorphCanon.evalEffect(defn.spec.eff)
+      val defEffects = Canonicalization.evalEffect(defn.spec.eff)
       val requiredHandlers = root.defaultHandlers.filter(h => defEffects.contains(h.handledSym))
       requiredHandlers.foldLeft(defn.spec.eff) { case (eff, handler) =>
         val handlerDef = root.defs(handler.handlerSym)
@@ -207,7 +207,7 @@ object ConstraintGen {
           .getOrElse(throw InternalCompilerException(s"Could not unify default handler '${handler.handlerSym}' against its call site.", loc))
         val args = handlerTparams.map(tp => typeToMonoArg(subst(Type.Var(tp.sym, loc))))
         sctx.addFlow(FlowConstraint(args, MonoVar.Def(handler.handlerSym)))
-        MonomorphCanon.canonicalEffect(Type.mkUnion(Type.mkDifference(eff, handler.handledEff, loc), Type.IO, loc))
+        Canonicalization.canonicalEffect(Type.mkUnion(Type.mkDifference(eff, handler.handledEff, loc), Type.IO, loc))
       }
       ()
     }
@@ -699,14 +699,14 @@ object ConstraintGen {
         tparamEnv.getOrElse(sym, MonoArg.Const(tpe))
       case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
         if (tpe.typeVars.isEmpty)
-          MonoArg.Const(MonomorphCanon.reduceAssocType(at)(root, flix))
+          MonoArg.Const(Canonicalization.reduceAssocType(at)(root, flix))
         else
           MonoArg.Assoc(symUse.sym, dealiasedTypeToMonoArg(arg), kind, assocLoc)
       case Type.Cst(_, _) =>
         MonoArg.Const(tpe)
       case Type.Apply(_, _, _) =>
         if (tpe.kind == Kind.Eff && tpe.typeVars.isEmpty)
-          MonoArg.Const(MonomorphCanon.simplify(tpe, isGround = true)(root, flix))
+          MonoArg.Const(Canonicalization.simplify(tpe, isGround = true)(root, flix))
         else {
           MonoArg.App(dealiasedTypeToMonoArg(tpe.baseType), tpe.typeArguments.map(arg => dealiasedTypeToMonoArg(arg)))
         }

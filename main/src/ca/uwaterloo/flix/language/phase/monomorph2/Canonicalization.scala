@@ -34,7 +34,7 @@ import scala.collection.immutable.SortedSet
   * concretely, at an actual call site) must agree on this, or their `(sym, type)` defTable keys
   * diverge for the same instantiation.
   */
-private[monomorph2] object MonomorphCanon {
+private[monomorph2] object Canonicalization {
 
   // Copied from monomorph.Specialization.canonicalEffect
   /** Returns the canonical effect equivalent to `eff`. */

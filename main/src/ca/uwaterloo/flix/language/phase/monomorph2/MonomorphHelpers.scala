@@ -23,7 +23,7 @@ import ca.uwaterloo.flix.util.collection.ListMap
 
 /**
   * Generic helpers shared across the constraint-based monomorphization pipeline. Unlike
-  * [[MonomorphCanon]], nothing here carries a "solver and specializer must agree" contract —
+  * [[Canonicalization]], nothing here carries a "solver and specializer must agree" contract —
   * these are plain, reusable tree-walking utilities.
   */
 private[monomorph2] object MonomorphHelpers {

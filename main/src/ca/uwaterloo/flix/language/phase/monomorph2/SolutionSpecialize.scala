@@ -181,7 +181,7 @@ object SolutionSpecialize {
     /** Returns `s` as a [[StrictSubstitution]], with every type in its image simplified and grounded. */
     def mk(s: Substitution)(implicit root: TypedAst.Root, flix: Flix): StrictSubstitution = {
       val m = s.m.map {
-        case (sym, tpe) => sym -> MonomorphCanon.simplify(tpe.map(MonomorphCanon.default), isGround = true)
+        case (sym, tpe) => sym -> Canonicalization.simplify(tpe.map(Canonicalization.default), isGround = true)
       }
       StrictSubstitution(Substitution(m))
     }
@@ -191,18 +191,18 @@ object SolutionSpecialize {
     /** Applies this substitution to `tpe0`, defaulting any free type variable to its kind's default type. */
     def apply(tpe0: Type)(implicit root: TypedAst.Root, flix: Flix): Type = tpe0 match {
       case v@Type.Var(sym, _) => s.m.get(sym) match {
-        case None    => MonomorphCanon.default(v)
+        case None    => Canonicalization.default(v)
         case Some(t) => t
       }
       case Type.Cst(TypeConstructor.Region(_), loc) => Type.Cst(RegionInstantiation, loc)
       case cst@Type.Cst(_, _)                       => cst
-      case app@Type.Apply(_, _, _)                  => MonomorphCanon.normalizeApply(apply, app, isGround = true)
+      case app@Type.Apply(_, _, _)                  => Canonicalization.normalizeApply(apply, app, isGround = true)
       case Type.Alias(_, _, t, _)                   => apply(t)
       case Type.AssocType(symUse, arg0, kind, loc) =>
         val arg = apply(arg0)
         val assoc = Type.AssocType(symUse, arg, kind, loc)
-        val reducedType = MonomorphCanon.reduceAssocType(assoc)
-        MonomorphCanon.simplify(reducedType, isGround = true)
+        val reducedType = Canonicalization.reduceAssocType(assoc)
+        Canonicalization.simplify(reducedType, isGround = true)
       case Type.JvmToType(_, loc)          => throw InternalCompilerException("unexpected JVM type", loc)
       case Type.JvmToEff(_, loc)           => throw InternalCompilerException("unexpected JVM eff", loc)
       case Type.UnresolvedJvmType(_, loc)  => throw InternalCompilerException("unexpected JVM type", loc)
@@ -218,14 +218,14 @@ object SolutionSpecialize {
   private def visitStructField(field: TypedAst.StructField)(implicit root: TypedAst.Root, flix: Flix): TypedAst.StructField =
     field match {
       case TypedAst.StructField(fieldSym, tpe, loc) =>
-        TypedAst.StructField(fieldSym, MonomorphCanon.simplify(tpe, isGround = false), loc)
+        TypedAst.StructField(fieldSym, Canonicalization.simplify(tpe, isGround = false), loc)
     }
 
   /** Simplifies the types embedded in `caze`. */
   private def visitEnumCase(caze: TypedAst.Case)(implicit root: TypedAst.Root, flix: Flix): TypedAst.Case =
     caze match {
       case TypedAst.Case(sym, tpes, sc, loc) =>
-        TypedAst.Case(sym, tpes.map(MonomorphCanon.simplify(_, isGround = false)), sc, loc)
+        TypedAst.Case(sym, tpes.map(Canonicalization.simplify(_, isGround = false)), sc, loc)
     }
 
   /** Applies `StrictSubstitution.empty` to the types embedded in `op`. */

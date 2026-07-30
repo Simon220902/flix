@@ -185,7 +185,7 @@ object ConstraintSolver {
 
   /**
     * Collapses `arg` to a ground type: assembles it (see [[assembleArg]]), then defaults and
-    * canonicalizes via the shared [[MonomorphCanon]] pipeline, so the solver's collapsed type and
+    * canonicalizes via the shared [[Canonicalization]] pipeline, so the solver's collapsed type and
     * the specializer's instantiated type cannot structurally diverge for the same instantiation.
     * Returns `None` if the result remains non-ground — a solver gap, not an error, so it fails
     * soft. Defaulting a constrained `Star` var to `AnyType` is safe even when no instance exists:
@@ -194,9 +194,9 @@ object ConstraintSolver {
   private def collapseArg(arg: MonoArg, bindings: Map[MonoVar, List[Type]], root: TypedAst.Root)
                           (implicit flix: Flix): Option[Type] =
     assembleArg(arg, bindings).flatMap { raw =>
-      val defaulted = rewriteRegionToIO(raw).map(MonomorphCanon.default)
+      val defaulted = rewriteRegionToIO(raw).map(Canonicalization.default)
       try {
-        val result = MonomorphCanon.simplify(defaulted, isGround = true)(root, flix)
+        val result = Canonicalization.simplify(defaulted, isGround = true)(root, flix)
         if (result.typeVars.nonEmpty) None else Some(result)
       } catch {
         case _: InternalCompilerException => None
