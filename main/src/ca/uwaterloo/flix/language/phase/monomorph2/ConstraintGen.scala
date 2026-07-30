@@ -630,7 +630,7 @@ object ConstraintGen {
   /** Flows for `lattice`/`box`/`Denotation` — mirrors `SolutionLowering.mkDenotation`. */
   private def latticeFlows(den: Denotation, lastTermType: Option[Type], loc: SourceLocation)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = den match {
     case Denotation.Relational =>
-      sctx.addFlow(FlowConstraint(Instantiation(typeToMonoArg(Types.Boxed)), MonoVar.Enum(Enums.Denotation)))
+      sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(Types.Boxed))), MonoVar.Enum(Enums.Denotation)))
     case Denotation.Latticenal =>
       val tpe = lastTermType.getOrElse(throw InternalCompilerException("Unexpected nullary lattice predicate.", loc))
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(tpe))), MonoVar.Def(Defs.Lattice)))
