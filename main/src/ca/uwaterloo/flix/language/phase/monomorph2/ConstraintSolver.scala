@@ -41,7 +41,7 @@ object ConstraintSolver {
     * Callers must run [[NonMonomorphizableCheck.checkMonomorphizable]] first; without it, a
     * non-monomorphizable flow set makes the fixpoint loop grow without bound.
     */
-  def solve(flows: Set[FlowConstraint], root: TypedAst.Root)(implicit flix: Flix): Solution = flix.phase("ConstraintSolver") {
+  def solve(flows: List[FlowConstraint], root: TypedAst.Root)(implicit flix: Flix): Solution = flix.phase("ConstraintSolver") {
     val instanceMap = MonomorphHelpers.mkInstanceMap(root.instances)
     val prepared    = flows.iterator.map(f => prepareFlow(f, root)).toList
     val dependents  = buildDependents(prepared)

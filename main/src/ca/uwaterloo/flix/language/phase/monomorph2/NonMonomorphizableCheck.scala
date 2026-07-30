@@ -50,14 +50,14 @@ object NonMonomorphizableCheck {
     * Checks whether `flows` contains a reachable growing cycle and throws
     * [[InternalCompilerException]] if so.
     */
-  def checkMonomorphizable(flows: Set[FlowConstraint]): Unit = {
-    val positions = flows.iterator.flatMap {
+  def checkMonomorphizable(flows: List[FlowConstraint]): Unit = {
+    val positions = flows.flatMap {
       case FlowConstraint(Instantiation(args), dst) =>
-        args.iterator.zipWithIndex.map { case (arg, i) =>
+        args.zipWithIndex.map { case (arg, i) =>
           val dstV = Vertex(dst, i)
           (arg, dstV, MonoArg.collectParams(arg).distinct)
         }
-    }.toList
+    }
 
     val edges = positions.flatMap { case (arg, dstV, ps) =>
       ps.map { case (v, j) => Edge(Vertex(v, j), dstV, growing = isGrowingHead(arg)) }

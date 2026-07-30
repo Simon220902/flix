@@ -49,13 +49,13 @@ object ConstraintGen {
     def addFlow(flow: FlowConstraint): Unit = flows.add(flow)
 
     /** Returns every flow emitted so far. */
-    def result: Set[FlowConstraint] = flows.asScala.toSet
+    def result: List[FlowConstraint] = flows.asScala.toList
   }
 
   /**
     * Generates specialization constraints for every top-level declaration in `root0`.
     */
-  def generate(root0: TypedAst.Root)(implicit flix: Flix): Set[FlowConstraint] = flix.phase("ConstraintCollection") {
+  def generate(root0: TypedAst.Root)(implicit flix: Flix): List[FlowConstraint] = flix.phase("ConstraintCollection") {
     implicit val sctx: SharedContext = SharedContext.mk()
     implicit val root: TypedAst.Root = root0
 
