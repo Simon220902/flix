@@ -68,7 +68,9 @@ object ConstraintSolver {
 
     // Seed: ground flows (all-Const args) become initial worklist entries.
     for (pf <- prepared) {
-      collapseArgsPrepared(pf, Map.empty, root).foreach(tuple => enqueue(pf.dst, tuple))
+      for (t <- collapseArgsPrepared(pf, Map.empty, root)) {
+        enqueue(pf.dst, t)
+      }
     }
 
     // Fixpoint loop.
@@ -83,15 +85,17 @@ object ConstraintSolver {
         // Sig dispatch: resolve to impl def and forward the tuple.
         dst match {
           case MonoVar.Sig(sigSym) =>
-            resolveSig(sigSym, tuple, root, instanceMap).foreach {
-              case (implSym, implArgs) => enqueue(MonoVar.Def(implSym), implArgs)
+            for (case (implSym, implArgs) <- resolveSig(sigSym, tuple, root, instanceMap)) {
+              enqueue(MonoVar.Def(implSym), implArgs)
             }
           case _ => ()
         }
 
         // Propagate: substitute this MonoVar's new tuple into all dependent flows.
         for (pf <- dependents.getOrElse(dst, Nil)) {
-          collapseArgsPrepared(pf, Map(dst -> tuple), root).foreach(groundTuple => enqueue(pf.dst, groundTuple))
+          for (groundTuple <- collapseArgsPrepared(pf, Map(dst -> tuple), root)) {
+            enqueue(pf.dst, groundTuple)
+          }
         }
       }
     }
