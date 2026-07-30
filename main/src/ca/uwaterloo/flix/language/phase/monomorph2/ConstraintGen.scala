@@ -215,7 +215,7 @@ object ConstraintGen {
   /**
     * Emits flow constraints for all call sites and enum/struct construction sites in `exp`.
     * Datalog and channel nodes additionally emit constraints for the stdlib calls
-    * [[Lowering]] will synthesize for them.
+    * [[SolutionLowering]] will synthesize for them.
     */
   private def visitExp(exp0: Expr)(implicit sctx: SharedContext, tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg], root: TypedAst.Root, flix: Flix): Unit = exp0 match {
     case Expr.Cst(_, _, _) => ()

@@ -34,7 +34,7 @@ import ca.uwaterloo.flix.language.dbg.AstPrinter
   *     recursion) before solving, so the next step cannot loop forever.
   *   - 3. [[ConstraintSolver]] solves the flow constraints to a fixpoint, producing the set of
   *     concrete type-argument tuples each polymorphic symbol must be specialized at.
-  *   - 4. [[Specialize]] specializes (and lowers) every def/enum/struct/
+  *   - 4. [[SolutionSpecialize]] specializes (and lowers) every def/enum/struct/
   *     restrictable-enum accordingly.
   *
   * Caution: step 4's lowering can synthesize references to specific stdlib defs/enums that step 1
@@ -50,6 +50,6 @@ object ConstraintMonomorphization {
       NonMonomorphizableCheck.checkMonomorphizable(constraints)
     }(AstPrinter.DebugNoOp())
     val solution = ConstraintSolver.solve(constraints, root)
-    Specialize.run(root, solution)
+    SolutionSpecialize.run(root, solution)
   }
 }

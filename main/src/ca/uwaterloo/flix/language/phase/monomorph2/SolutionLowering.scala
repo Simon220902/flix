@@ -24,7 +24,7 @@ import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.TypedAst.ApplyPosition
 import ca.uwaterloo.flix.language.ast.shared.{BoundBy, Constant, Decreasing, Denotation, Fixity, Mutability, Polarity, PredicateAndArity, RegionScope, SolveMode, SymUse, TypeSource}
 import ca.uwaterloo.flix.language.ast.{AtomicOp, MonoAst, Name, SemanticOp, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
-import ca.uwaterloo.flix.language.phase.monomorph2.Specialize.{Context, StrictSubstitution, lookupCaseSym, lookupRestrictableCaseSym, lookupStructSym, lookupSym, resolveSigSym, specializeFormalParam, specializeFormalParams}
+import ca.uwaterloo.flix.language.phase.monomorph2.SolutionSpecialize.{Context, StrictSubstitution, lookupCaseSym, lookupRestrictableCaseSym, lookupStructSym, lookupSym, resolveSigSym, specializeFormalParam, specializeFormalParams}
 import ca.uwaterloo.flix.language.phase.monomorph2.Symbols.{Defs, Enums, Types}
 import ca.uwaterloo.flix.util.{InternalCompilerException, JvmUtils, Result}
 import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
@@ -50,7 +50,7 @@ import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
   * synthesized calls (channels, `par`/`select`, Datalog) resolve against; changes to what is
   * synthesized here must stay in sync with what is collected there.
   */
-object Lowering {
+object SolutionLowering {
 
   /** Lowers `tpe0`, replacing Schema types with the Datalog enum type and channel types with the channel enum type. */
   private def lowerType(tpe0: Type): Type = tpe0.typeConstructor match {
@@ -97,13 +97,13 @@ object Lowering {
 
   }
 
-  /** Composes `subst`, lowering, and [[Specialize.rewriteEnumStructType]] — the single call every type in the fused walk goes through. */
+  /** Composes `subst`, lowering, and [[SolutionSpecialize.rewriteEnumStructType]] — the single call every type in the fused walk goes through. */
   private def visitType(t: Type, subst: StrictSubstitution)(implicit ctx: Context, root: TypedAst.Root, flix: Flix): Type =
-    Specialize.rewriteEnumStructType(lowerType(subst(t)))
+    SolutionSpecialize.rewriteEnumStructType(lowerType(subst(t)))
 
   /** Same as [[visitType]], for call sites where `t` has already been substituted (only lowering + the rewrite remain). */
   private def visitTypeSubstituted(t: Type)(implicit ctx: Context): Type =
-    Specialize.rewriteEnumStructType(lowerType(t))
+    SolutionSpecialize.rewriteEnumStructType(lowerType(t))
 
   /** Specializes and lowers `defn0` under `subst` into the `MonoAst.Def` for the specialized symbol `freshSym`. */
   protected[monomorph2] def visitDef(freshSym: Symbol.DefnSym, defn0: TypedAst.Def, subst: StrictSubstitution)(implicit ctx: Context, root: TypedAst.Root, flix: Flix): MonoAst.Def = {
@@ -129,7 +129,7 @@ object Lowering {
       defn match {
         case TypedAst.Def(_, spec0, exp, loc) =>
           val (fparams, env0) = specializeFormalParams(spec0.fparams, subst)
-          val fs = fparams.map(lowerFormalParam).map(Specialize.rewriteFormalParam)
+          val fs = fparams.map(lowerFormalParam).map(SolutionSpecialize.rewriteFormalParam)
           val spec = spec0 match {
             case TypedAst.Spec(doc, ann, mod, _, _, declaredScheme, retTpe, eff, _, _) =>
               // `eff` is substituted but deliberately not lowered: this phase does not lower effects.
@@ -236,7 +236,7 @@ object Lowering {
 
     case TypedAst.Expr.Lambda(fparam, exp, tpe, loc) =>
       val (fp, env1) = specializeFormalParam(fparam, subst)
-      val p = Specialize.rewriteFormalParam(lowerFormalParam(fp))
+      val p = SolutionSpecialize.rewriteFormalParam(lowerFormalParam(fp))
       val e = visitExp(exp, env0 ++ env1, subst)
       val t = visitType(tpe, subst)
       MonoAst.Expr.Lambda(p, e, t, loc)
@@ -325,7 +325,7 @@ object Lowering {
       val freshSym = Symbol.freshVarSym(bnd.sym)
       val env1 = env0 + (bnd.sym -> freshSym)
       val (fparams1, env2) = specializeFormalParams(fparams, subst)
-      val fps = fparams1.map(lowerFormalParam).map(Specialize.rewriteFormalParam)
+      val fps = fparams1.map(lowerFormalParam).map(SolutionSpecialize.rewriteFormalParam)
       val e1 = visitExp(exp1, env1 ++ env2, subst)
       val e2 = visitExp(exp2, env1, subst)
       val t = visitType(tpe, subst)
@@ -646,7 +646,7 @@ object Lowering {
       val ms = methods.map {
         case TypedAst.JvmMethod(mAnn, mIdent, mFparams0, mExp, mRetTpe, mEff, mLoc) =>
           val (mFparams, env1) = specializeFormalParams(mFparams0, subst)
-          val fs = mFparams.map(lowerFormalParam).map(Specialize.rewriteFormalParam)
+          val fs = mFparams.map(lowerFormalParam).map(SolutionSpecialize.rewriteFormalParam)
           val thisParam = fs.head
           val thisRef = MonoAst.Expr.Var(thisParam.sym, thisParam.tpe, loc)
           implicit val lctx: LocalContext = LocalContext(Some(freshSym), Some(thisRef))
@@ -683,7 +683,7 @@ object Lowering {
       // NB: same raw-type-threading reasoning as GetChannel above.
       val exp1 = visitExp(innerExp1, env0, subst)
       val exp2 = visitExp(innerExp2, env0, subst)
-      Lowering.mkPutChannel(exp1, exp2, subst(innerExp1.tpe), subst(innerExp2.tpe), subst(eff), loc)
+      SolutionLowering.mkPutChannel(exp1, exp2, subst(innerExp1.tpe), subst(innerExp2.tpe), subst(eff), loc)
 
     case TypedAst.Expr.SelectChannel(rules0, default0, tpe, eff, loc) =>
       // Synthesizes Concurrent.Channel admin/select calls (mkSelectChannel).
@@ -700,7 +700,7 @@ object Lowering {
       }
       val default = default0.map(visitExp(_, env0, subst))
       val t = visitType(tpe, subst)
-      Lowering.mkSelectChannel(rules, default, t, subst(eff), loc)
+      SolutionLowering.mkSelectChannel(rules, default, t, subst(eff), loc)
 
     case TypedAst.Expr.Spawn(exp1, exp2, tpe, eff, loc) =>
       val e1 = visitExp(exp1, env0, subst)
@@ -722,7 +722,7 @@ object Lowering {
       }
       val e = visitExp(exp, curEnv, subst)
       val t = visitType(tpe, subst)
-      Lowering.mkParYield(fs, e, t, subst(eff), loc)
+      SolutionLowering.mkParYield(fs, e, t, subst(eff), loc)
 
     case TypedAst.Expr.Lazy(exp, tpe, loc) =>
       val e = visitExp(exp, env0, subst)
@@ -799,7 +799,7 @@ object Lowering {
   private def visitHandlerRule(rule0: TypedAst.HandlerRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit ctx: Context, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.HandlerRule = rule0 match {
     case TypedAst.HandlerRule(opSymUse, fparams0, body0, _) =>
       val (fparams1, env1) = specializeFormalParams(fparams0, subst)
-      val fparams = fparams1.map(lowerFormalParam).map(Specialize.rewriteFormalParam)
+      val fparams = fparams1.map(lowerFormalParam).map(SolutionSpecialize.rewriteFormalParam)
       val body = visitExp(body0, env0 ++ env1, subst)
       MonoAst.HandlerRule(opSymUse, fparams, body)
   }
@@ -1215,7 +1215,7 @@ object Lowering {
     // lookup-key position in the fused walk — only the node's own field positions get rewritten.
     val itpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
     val defnSym = lookupSym(Defs.ChannelNewTuple, itpe)
-    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(itpe), visitTypeSubstituted(tpe), eff, loc)
+    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, SolutionSpecialize.rewriteEnumStructType(itpe), visitTypeSubstituted(tpe), eff, loc)
   }
 
   /** Returns a channel get expression: `<- c` becomes a call to `Concurrent/Channel.get(c)`. */
@@ -1226,7 +1226,7 @@ object Lowering {
     // get the rewrite.
     val itpe = lowerType(Type.mkIoArrow(chanTpe, tpe, loc))
     val defnSym = lookupSym(Defs.ChannelGet, itpe)
-    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(itpe), visitTypeSubstituted(tpe), eff, loc)
+    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, SolutionSpecialize.rewriteEnumStructType(itpe), visitTypeSubstituted(tpe), eff, loc)
   }
 
   /**
@@ -1248,7 +1248,7 @@ object Lowering {
     val valueSym = mkLetSym("value", loc)
     val chanVar = MonoAst.Expr.Var(chanSym, exp1.tpe, loc)
     val valueVar = MonoAst.Expr.Var(valueSym, exp2.tpe, loc)
-    val putExp = MonoAst.Expr.ApplyDef(defnSym, List(valueVar, chanVar), Specialize.rewriteEnumStructType(itpe), Type.Unit, eff, loc)
+    val putExp = MonoAst.Expr.ApplyDef(defnSym, List(valueVar, chanVar), SolutionSpecialize.rewriteEnumStructType(itpe), Type.Unit, eff, loc)
     // The channel binding is the outermost let, so the channel is evaluated before the value.
     val valueLet = MonoAst.Expr.Let(valueSym, exp2, putExp, Type.Unit, eff, Occur.Unknown, loc)
     MonoAst.Expr.Let(chanSym, exp1, valueLet, Type.Unit, eff, Occur.Unknown, loc)
@@ -1306,7 +1306,7 @@ object Lowering {
         // itpe/lookup key built from the RAW channel type — see SelectChannel case's doc comment.
         val itpe = lowerType(Type.mkPureArrow(rawChanTpe, Types.ChannelMpmcAdmin, loc))
         val defnSym = lookupSym(Defs.ChannelMpmcAdmin, itpe)
-        MonoAst.Expr.ApplyDef(defnSym, List(MonoAst.Expr.Var(chanSym, visitTypeSubstituted(rawChanTpe), loc)), Specialize.rewriteEnumStructType(itpe), Types.ChannelMpmcAdmin, Type.Pure, loc)
+        MonoAst.Expr.ApplyDef(defnSym, List(MonoAst.Expr.Var(chanSym, visitTypeSubstituted(rawChanTpe), loc)), SolutionSpecialize.rewriteEnumStructType(itpe), Types.ChannelMpmcAdmin, Type.Pure, loc)
     }
     mkList(admins, Types.ChannelMpmcAdmin, loc)
   }
@@ -1328,7 +1328,7 @@ object Lowering {
       case None => MonoAst.Expr.Cst(Constant.Bool(true), Type.Bool, loc)
     }
     val defnSym = lookupSym(Defs.ChannelSelectFrom, itpe)
-    MonoAst.Expr.ApplyDef(defnSym, List(admins, blocking), Specialize.rewriteEnumStructType(lowerType(itpe)), Specialize.rewriteEnumStructType(selectRetTpe), Type.IO, loc)
+    MonoAst.Expr.ApplyDef(defnSym, List(admins, blocking), SolutionSpecialize.rewriteEnumStructType(lowerType(itpe)), SolutionSpecialize.rewriteEnumStructType(selectRetTpe), Type.IO, loc)
   }
 
   /**
@@ -1344,7 +1344,7 @@ object Lowering {
   private def mkChannelCases(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], eff: Type, loc: SourceLocation)(implicit ctx: Context, flix: Flix): List[MonoAst.MatchRule] = {
     // RAW (lookup-key form) and rewritten (node-field form) both needed — see doc comment above.
     val locksTypeRaw = Types.mkList(Types.ConcurrentReentrantLock, loc)
-    val locksType = Specialize.rewriteEnumStructType(locksTypeRaw)
+    val locksType = SolutionSpecialize.rewriteEnumStructType(locksTypeRaw)
 
     ListOps.zip(rs, channels).zipWithIndex map {
       case (((sym, _, exp, rawChanTpe), (chSym, _)), i) =>
@@ -1355,7 +1355,7 @@ object Lowering {
         val itpe = lowerType(Type.mkIoUncurriedArrow(List(rawChanTpe, locksTypeRaw), getTpe, loc))
         val args = List(MonoAst.Expr.Var(chSym, visitTypeSubstituted(rawChanTpe), loc), MonoAst.Expr.Var(locksSym, locksType, loc))
         val defnSym = lookupSym(Defs.ChannelUnsafeGetAndUnlock, itpe)
-        val getExp = MonoAst.Expr.ApplyDef(defnSym, args, Specialize.rewriteEnumStructType(itpe), visitTypeSubstituted(getTpe), eff, loc)
+        val getExp = MonoAst.Expr.ApplyDef(defnSym, args, SolutionSpecialize.rewriteEnumStructType(itpe), visitTypeSubstituted(getTpe), eff, loc)
         val e = MonoAst.Expr.Let(sym, getExp, exp, exp.tpe, eff, Occur.Unknown, loc)
         MonoAst.MatchRule(pat, None, e)
     }
@@ -1369,7 +1369,7 @@ object Lowering {
   private def mkSelectDefaultCase(default: Option[MonoAst.Expr], loc: SourceLocation)(implicit ctx: Context): List[MonoAst.MatchRule] = {
     default match {
       case Some(defaultExp) =>
-        val locksType = Specialize.rewriteEnumStructType(Types.mkList(Types.ConcurrentReentrantLock, loc))
+        val locksType = SolutionSpecialize.rewriteEnumStructType(Types.mkList(Types.ConcurrentReentrantLock, loc))
         val pat = mkTuplePattern(Nel(MonoAst.Pattern.Cst(Constant.Int32(-1), Type.Int32, loc), List(MonoAst.Pattern.Wild(locksType, loc))), loc)
         val defaultMatch = MonoAst.MatchRule(pat, None, defaultExp)
         List(defaultMatch)
@@ -1429,7 +1429,7 @@ object Lowering {
   private def mkNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit ctx: Context): MonoAst.Expr = {
     val itpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
     val defnSym = lookupSym(Defs.ChannelNew, itpe)
-    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(itpe), Specialize.rewriteEnumStructType(tpe), eff, loc)
+    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, SolutionSpecialize.rewriteEnumStructType(itpe), SolutionSpecialize.rewriteEnumStructType(tpe), eff, loc)
   }
 
   /**
@@ -1484,7 +1484,7 @@ object Lowering {
     * reference to `sym` disagree on the channel's type (fresh sym vs. original).
     */
   private def mkChannelExp(sym: Symbol.VarSym, tpe: Type, loc: SourceLocation)(implicit ctx: Context): MonoAst.Expr = {
-    MonoAst.Expr.Var(sym, Specialize.rewriteEnumStructType(mkChannelTpe(tpe, loc)), loc)
+    MonoAst.Expr.Var(sym, SolutionSpecialize.rewriteEnumStructType(mkChannelTpe(tpe, loc)), loc)
   }
 
   /** Returns a list expression constructed from `exps` with type list of `elmType` (assumed specialized and lowered). */
@@ -1527,8 +1527,8 @@ object Lowering {
     */
   private def mkTag(sym: Symbol.EnumSym, tag: String, exps: List[MonoAst.Expr], tpe: Type, loc: SourceLocation)(implicit ctx: Context, root: TypedAst.Root): MonoAst.Expr = {
     val caseSym0 = findCaseSym(sym, tag)
-    val caseSym = Specialize.lookupCaseSym(caseSym0, tpe)
-    val t = Specialize.rewriteEnumStructType(tpe)
+    val caseSym = SolutionSpecialize.lookupCaseSym(caseSym0, tpe)
+    val t = SolutionSpecialize.rewriteEnumStructType(tpe)
     MonoAst.Expr.ApplyAtomic(AtomicOp.Tag(caseSym), exps, t, Type.Pure, loc)
   }
 
@@ -1603,7 +1603,7 @@ object Lowering {
     val argExps = goalPredSym :: goalTerms :: withPredSyms :: lambdaExp :: mergedExp :: Nil
     val itpe = Types.mkProvenanceOf(extVarType, loc)
     val defn = lookupSym(Defs.ProvenanceOf, itpe)
-    MonoAst.Expr.ApplyDef(defn, argExps, Specialize.rewriteEnumStructType(itpe), Specialize.rewriteEnumStructType(tpe), eff, loc)
+    MonoAst.Expr.ApplyDef(defn, argExps, SolutionSpecialize.rewriteEnumStructType(itpe), SolutionSpecialize.rewriteEnumStructType(tpe), eff, loc)
   }
 
   /** Lowers a Datalog query-with-select to Fixpoint solver solve+facts calls. `tpe`/`eff` must arrive already substituted from the caller (fused walk). */
@@ -1624,7 +1624,7 @@ object Lowering {
 
     // Put everything together
     val argExps = mkPredSym(pred) :: solvedExp :: Nil
-    MonoAst.Expr.ApplyDef(sym, argExps, Specialize.rewriteEnumStructType(defTpe), Specialize.rewriteEnumStructType(tpe), eff, loc)
+    MonoAst.Expr.ApplyDef(sym, argExps, SolutionSpecialize.rewriteEnumStructType(defTpe), SolutionSpecialize.rewriteEnumStructType(tpe), eff, loc)
 
   }
 
@@ -1674,7 +1674,7 @@ object Lowering {
         val sym = lookupSym(Defs.ProjectInto(arity), defTpe)
 
         val argExps = mkPredSym(pred) :: visitExp(exp, env0, subst) :: Nil
-        MonoAst.Expr.ApplyDef(sym, argExps, Specialize.rewriteEnumStructType(defTpe), Types.Datalog, subst(exp.eff), loc)
+        MonoAst.Expr.ApplyDef(sym, argExps, SolutionSpecialize.rewriteEnumStructType(defTpe), Types.Datalog, subst(exp.eff), loc)
     }
     mergeExps(loweredExps, loc)
 
@@ -1842,7 +1842,7 @@ object Lowering {
 
     val sym = lookupSym(Defs.Lift(argTypes.length), liftType)
 
-    MonoAst.Expr.ApplyDef(sym, List(exp0), Specialize.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
+    MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialize.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
   }
 
   /** Lifts `exp0: a -> b -> c -> Bool` (curried) to a call `liftNb(exp0): Boxed -> ... -> Bool` (curried). */
@@ -1856,7 +1856,7 @@ object Lowering {
 
     val sym = lookupSym(Defs.LiftB(argTypes.length), liftType)
 
-    MonoAst.Expr.ApplyDef(sym, List(exp0), Specialize.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
+    MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialize.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
   }
 
   /**
@@ -1877,7 +1877,7 @@ object Lowering {
 
     val sym = lookupSym(Defs.LiftXM(numberOfInVars, numberOfOutVars), liftType)
 
-    MonoAst.Expr.ApplyDef(sym, List(exp0), Specialize.rewriteEnumStructType(liftType), returnType, Type.Pure, loc)
+    MonoAst.Expr.ApplyDef(sym, List(exp0), SolutionSpecialize.rewriteEnumStructType(liftType), returnType, Type.Pure, loc)
   }
 
   /**
@@ -1950,8 +1950,8 @@ object Lowering {
           val boxType: Type = Type.mkPureArrow(unboxedDenotationType, boxedDenotationType, loc)
           val boxSym: Symbol.DefnSym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Ast.Shared.box"), boxType)
 
-          val innerApply = MonoAst.Expr.ApplyDef(latticeSym, List(MonoAst.Expr.Cst(Constant.Unit, Type.Unit, loc)), Specialize.rewriteEnumStructType(latticeType), Specialize.rewriteEnumStructType(unboxedDenotationType), Type.Pure, loc)
-          MonoAst.Expr.ApplyDef(boxSym, List(innerApply), Specialize.rewriteEnumStructType(boxType), Specialize.rewriteEnumStructType(boxedDenotationType), Type.Pure, loc)
+          val innerApply = MonoAst.Expr.ApplyDef(latticeSym, List(MonoAst.Expr.Cst(Constant.Unit, Type.Unit, loc)), SolutionSpecialize.rewriteEnumStructType(latticeType), SolutionSpecialize.rewriteEnumStructType(unboxedDenotationType), Type.Pure, loc)
+          MonoAst.Expr.ApplyDef(boxSym, List(innerApply), SolutionSpecialize.rewriteEnumStructType(boxType), SolutionSpecialize.rewriteEnumStructType(boxedDenotationType), Type.Pure, loc)
       }
   }
 
@@ -2013,7 +2013,7 @@ object Lowering {
         val freshSym = freshVars(oldSym)
         // tpe is RAW (correct as the liftX/liftXY lookup-key component below) but this
         // FormalParam/Lambda's own type fields need the enum/struct rewrite for consistency.
-        val rewrittenTpe = Specialize.rewriteEnumStructType(tpe)
+        val rewrittenTpe = SolutionSpecialize.rewriteEnumStructType(tpe)
         val fparam = MonoAst.FormalParam(freshSym, rewrittenTpe, Occur.Unknown, loc)
         val lambdaType = Type.mkPureArrow(rewrittenTpe, acc.tpe, loc)
         MonoAst.Expr.Lambda(fparam, acc, lambdaType, loc)
@@ -2060,7 +2060,7 @@ object Lowering {
         val freshSym = freshVars(oldSym)
         // tpe is RAW (correct as the liftX/liftXY lookup-key component below) but this
         // FormalParam/Lambda's own type fields need the enum/struct rewrite for consistency.
-        val rewrittenTpe = Specialize.rewriteEnumStructType(tpe)
+        val rewrittenTpe = SolutionSpecialize.rewriteEnumStructType(tpe)
         val fparam = MonoAst.FormalParam(freshSym, rewrittenTpe, Occur.Unknown, loc)
         val lambdaType = Type.mkPureArrow(rewrittenTpe, acc.tpe, loc)
         MonoAst.Expr.Lambda(fparam, acc, lambdaType, loc)
@@ -2103,7 +2103,7 @@ object Lowering {
         val freshSym = freshVars(oldSym)
         // tpe is RAW (correct as the liftX/liftXY lookup-key component below) but this
         // FormalParam/Lambda's own type fields need the enum/struct rewrite for consistency.
-        val rewrittenTpe = Specialize.rewriteEnumStructType(tpe)
+        val rewrittenTpe = SolutionSpecialize.rewriteEnumStructType(tpe)
         val fparam = MonoAst.FormalParam(freshSym, rewrittenTpe, Occur.Unknown, loc)
         val lambdaType = Type.mkPureArrow(rewrittenTpe, acc.tpe, loc)
         MonoAst.Expr.Lambda(fparam, acc, lambdaType, loc)
@@ -2139,7 +2139,7 @@ object Lowering {
   private def box(exp: MonoAst.Expr, rawTpe: Type)(implicit ctx: Context): MonoAst.Expr = {
     val loc = exp.loc
     val tpe = Type.mkPureArrow(rawTpe, Types.Boxed, loc)
-    MonoAst.Expr.ApplyDef(lookupSym(Defs.Box, tpe), List(exp), Specialize.rewriteEnumStructType(tpe), Types.Boxed, Type.Pure, loc)
+    MonoAst.Expr.ApplyDef(lookupSym(Defs.Box, tpe), List(exp), SolutionSpecialize.rewriteEnumStructType(tpe), Types.Boxed, Type.Pure, loc)
   }
 
   /**
@@ -2526,8 +2526,8 @@ object Lowering {
           tpe = Types.Boxed, eff = Type.Pure, loc = loc
         )
       ),
-      itpe = Specialize.rewriteEnumStructType(outerItpe),
-      tpe = Specialize.rewriteEnumStructType(tpe), eff = Type.Pure, loc = loc
+      itpe = SolutionSpecialize.rewriteEnumStructType(outerItpe),
+      tpe = SolutionSpecialize.rewriteEnumStructType(tpe), eff = Type.Pure, loc = loc
     )
   }
 
