@@ -31,7 +31,7 @@ import scala.collection.mutable
   * Constraint generation for constraint-based monomorphization: emits `Flow` constraints
   * describing how concrete types propagate through the program, for [[ConstraintSolver]] to solve.
   */
-object ConstraintCollection {
+object ConstraintGen {
 
   /**
     * The mutable data used throughout constraint generation.
@@ -215,7 +215,7 @@ object ConstraintCollection {
   /**
     * Emits flow constraints for all call sites and enum/struct construction sites in `exp`.
     * Datalog and channel nodes additionally emit constraints for the stdlib calls
-    * [[SolutionLowering]] will synthesize for them.
+    * [[Lowering]] will synthesize for them.
     */
   private def visitExp(exp0: Expr)(implicit sctx: SharedContext, tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg], root: TypedAst.Root, flix: Flix): Unit = exp0 match {
     case Expr.Cst(_, _, _) => ()

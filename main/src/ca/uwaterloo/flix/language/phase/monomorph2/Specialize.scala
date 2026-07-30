@@ -37,7 +37,7 @@ import scala.collection.mutable
   * which calls back into `lookupSym`/`lookupCaseSym`/`lookupStructSym`/`resolveSigSym` here to
   * resolve each call/tag/struct site.
   */
-object SolutionSpecialization {
+object Specialize {
 
   /**
     * Accumulates specialized defs; unlike `Specialization.Context` there is no work queue, since
@@ -476,7 +476,7 @@ object SolutionSpecialization {
         enm           <- root.restrictableEnums.get(sym).toList
         tuple         <- tuples.toList
         substMap       = (enm.index :: enm.tparams).zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
-        freshSym       = Symbol.freshEnumSym(SolutionLowering.lowerRestrictableEnumSym(sym))
+        freshSym       = Symbol.freshEnumSym(Lowering.lowerRestrictableEnumSym(sym))
         subst         <- try {
                            List(StrictSubstitution.mk(Substitution(substMap)))
                          } catch {
@@ -534,7 +534,7 @@ object SolutionSpecialization {
     }, sortBy = (p: (Symbol.DefnSym, TypedAst.Def)) => sortBySize(p._2)) {
       case (sym, defn) => flix.profile(defn.sym, defn.loc) {
         ctx.incrementDefCategory(if (defToInst.contains(sym)) "instanceDefs" else "regularDefs")
-        ctx.addSpecializedDef(sym, SolutionLowering.visitDef(sym, defn, StrictSubstitution.empty))
+        ctx.addSpecializedDef(sym, Lowering.visitDef(sym, defn, StrictSubstitution.empty))
       }
     }
 
@@ -546,14 +546,14 @@ object SolutionSpecialization {
           else if (defaultSigDefs.contains(defn.sym)) "defaultSigImpls"
           else "regularDefs"
         ctx.incrementDefCategory(category)
-        ctx.addSpecializedDef(freshSym, SolutionLowering.visitDef(freshSym, defn, subst))
+        ctx.addSpecializedDef(freshSym, Lowering.visitDef(freshSym, defn, subst))
       }
     }
 
     val effects = ParOps.parMapValues(root.effects) {
       case TypedAst.Effect(doc, ann, mod, sym, targs, ops0, loc) =>
         val ops = ops0.map(visitEffectOp)
-        rewriteEffect(SolutionLowering.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc)))
+        rewriteEffect(Lowering.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc)))
     }
 
     // Generic originals (tparams.nonEmpty) are dropped: every reachable instantiation already has
@@ -567,27 +567,27 @@ object SolutionSpecialization {
     // replaces them the same way.
     val enums = ParOps.parMapValues(root.enums.filter { case (_, e) => e.tparams.isEmpty }) {
       case TypedAst.Enum(doc, ann, mod, sym, tparams, derives, cases, loc) =>
-        SolutionLowering.lowerEnum(TypedAst.Enum(doc, ann, mod, sym, tparams, derives, MapOps.mapValues(cases)(visitEnumCase), loc))
+        Lowering.lowerEnum(TypedAst.Enum(doc, ann, mod, sym, tparams, derives, MapOps.mapValues(cases)(visitEnumCase), loc))
     }
 
     // One specialized declaration (fresh sym, renamed cases, ground field types, tparams = Nil)
     // per (sym, tuple) the solver actually found reachable — see enumEntries above and
     // lookupCaseSym, which is what makes expressions actually reference these fresh syms.
     val specializedEnums: Map[Symbol.EnumSym, MonoAst.Enum] =
-      ParOps.parMap(enumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SolutionLowering.lowerEnum(newEnum) }.toMap
+      ParOps.parMap(enumEntries) { case (_, _, freshSym, newEnum) => freshSym -> Lowering.lowerEnum(newEnum) }.toMap
 
     // Same shape as specializedEnums, per restrictableEnumEntries — see lookupRestrictableCaseSym,
     // which is what makes Expr.RestrictableTag/RestrictableChoosePattern reference these fresh syms.
     val specializedRestrictableEnums: Map[Symbol.EnumSym, MonoAst.Enum] =
-      ParOps.parMap(restrictableEnumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SolutionLowering.lowerEnum(newEnum) }.toMap
+      ParOps.parMap(restrictableEnumEntries) { case (_, _, freshSym, newEnum) => freshSym -> Lowering.lowerEnum(newEnum) }.toMap
 
     val structs = ParOps.parMapValues(root.structs.filter { case (_, s) => s.tparams.isEmpty }) {
       case TypedAst.Struct(doc, ann, mod, sym, tparams, sc, fields, loc) =>
-        SolutionLowering.lowerStruct(TypedAst.Struct(doc, ann, mod, sym, tparams, sc, MapOps.mapValues(fields)(visitStructField), loc))
+        Lowering.lowerStruct(TypedAst.Struct(doc, ann, mod, sym, tparams, sc, MapOps.mapValues(fields)(visitStructField), loc))
     }
 
     val specializedStructs: Map[Symbol.StructSym, MonoAst.Struct] =
-      ParOps.parMap(structEntries) { case (_, _, freshSym, newStruct) => freshSym -> SolutionLowering.lowerStruct(newStruct) }.toMap
+      ParOps.parMap(structEntries) { case (_, _, freshSym, newStruct) => freshSym -> Lowering.lowerStruct(newStruct) }.toMap
 
     // Diagnostic only (see Context.defCategoryCounts) — no equivalent exists for the
     // demand-driven baseline (Specialization.scala), so MonomorphBench must treat this as
