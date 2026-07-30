@@ -32,8 +32,8 @@ import ca.uwaterloo.flix.util.tc.Debug
 private[monomorph2] object MonomorphDebug {
 
   /** Writes `flows` as a Graphviz graph and a plain-text listing, both prefixed with stats. */
-  object DebugFlows extends Debug[Set[Flow]] {
-    override def emit(name: String, flows: Set[Flow])(implicit flix: Flix): Unit = {
+  object DebugFlows extends Debug[Set[FlowConstraint]] {
+    override def emit(name: String, flows: Set[FlowConstraint])(implicit flix: Flix): Unit = {
       val dir = AstPrinter.astFolderPath.resolve("monomorph2")
       val statLines = stats(flows)
       FileOps.writeString(dir.resolve("ConstraintCollection.dot"), statLines.map("// " + _).mkString("\n") + "\n\n" + toDot(flows))
@@ -62,7 +62,7 @@ private[monomorph2] object MonomorphDebug {
     * Renders `flows` as a Graphviz DOT string: one node per MonoVar (boxes=defs, ellipses=enums,
     * diamonds=sigs), seed edges from plaintext constant nodes, propagation edges between MonoVars.
     */
-  def toDot(flows: Set[Flow]): String = {
+  def toDot(flows: Set[FlowConstraint]): String = {
     val sb = new StringBuilder
     sb.append("digraph constraints {\n")
     sb.append("  rankdir=LR;\n")
@@ -83,7 +83,7 @@ private[monomorph2] object MonomorphDebug {
     sb.append("\n")
 
     var seedCount = 0
-    flows.foreach { case Flow(args, dst) =>
+    flows.foreach { case FlowConstraint(args, dst) =>
       val srcMVars = args.flatMap(collectMonoVars)
       val label = args.map(monoArgLabel).mkString(", ")
       if (srcMVars.isEmpty) {
@@ -103,15 +103,15 @@ private[monomorph2] object MonomorphDebug {
   }
 
   /** Returns every `MonoVar` appearing in `flows`, as either a destination or a source argument. */
-  private def allMonoVarsOf(flows: Set[Flow]): Set[MonoVar] =
-    flows.flatMap { case Flow(args, dst) => Set(dst) ++ args.flatMap(collectMonoVars) }
+  private def allMonoVarsOf(flows: Set[FlowConstraint]): Set[MonoVar] =
+    flows.flatMap { case FlowConstraint(args, dst) => Set(dst) ++ args.flatMap(collectMonoVars) }
 
   /** Returns every `MonoVar` referenced by a `Param` inside `arg`. */
   private def collectMonoVars(arg: MonoArg): List[MonoVar] =
     MonoArg.collectParams(arg).map(_._1)
 
   /** Returns summary stats for `flows`: total flow/MonoVar counts plus a per-kind breakdown. */
-  private def stats(flows: Set[Flow]): List[String] = {
+  private def stats(flows: Set[FlowConstraint]): List[String] = {
     val allMVars = allMonoVarsOf(flows)
     val byKind = allMVars.groupBy {
       case _: MonoVar.Def              => "Def"
@@ -124,8 +124,8 @@ private[monomorph2] object MonomorphDebug {
   }
 
   /** Returns a plain-text listing of `flows`, one line per flow: `<args> -> <destination>`. */
-  private def flowsToText(flows: Set[Flow]): String =
-    flows.toList.map { case Flow(args, dst) =>
+  private def flowsToText(flows: Set[FlowConstraint]): String =
+    flows.toList.map { case FlowConstraint(args, dst) =>
       s"${args.map(monoArgLabel).mkString(", ")} -> ${monoVarLabel(dst)}"
     }.sorted.mkString("\n")
 
