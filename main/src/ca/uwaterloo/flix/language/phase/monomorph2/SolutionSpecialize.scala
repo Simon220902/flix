@@ -26,7 +26,8 @@ import ca.uwaterloo.flix.language.phase.unification.Substitution
 import ca.uwaterloo.flix.util.collection.MapOps
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
-import scala.collection.mutable
+import java.util.concurrent.ConcurrentLinkedQueue
+import scala.jdk.CollectionConverters.*
 
 /**
   * Solution-driven specialization: uses the solver's solution to specialize all def/enum/struct/
@@ -63,26 +64,27 @@ object SolutionSpecialize {
     // helper) solely for the fused walk's ApplySig case, which calls resolveSigSym.
     val instances: Map[(Symbol.TraitSym, TypeConstructor), Instance]
   ) {
-    private val specializedDefs: mutable.Map[Symbol.DefnSym, MonoAst.Def] = mutable.Map.empty
+    private val specializedDefs: ConcurrentLinkedQueue[(Symbol.DefnSym, MonoAst.Def)] = new ConcurrentLinkedQueue()
 
     /** Records `defn` under its fresh specialized `sym`. */
     def addSpecializedDef(sym: Symbol.DefnSym, defn: MonoAst.Def): Unit =
-      synchronized { specializedDefs.put(sym, defn) }
+      specializedDefs.add((sym, defn))
 
     /** Returns all specialized defs recorded so far. */
     def getSpecializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
-      synchronized { specializedDefs.toMap }
+      specializedDefs.asScala.toMap
 
     // Diagnostic only, for `MonomorphBench`'s `Xmonobench` table: which of "regularDefs"/
     // "instanceDefs"/"defaultSigImpls" each specialized def came from.
-    private val defCategoryCounts: mutable.Map[String, Int] = mutable.Map.empty.withDefaultValue(0)
+    private val defCategoryCounts: ConcurrentLinkedQueue[String] = new ConcurrentLinkedQueue()
 
     /** Increments the count for `category` (one of "regularDefs"/"instanceDefs"/"defaultSigImpls"). */
     def incrementDefCategory(category: String): Unit =
-      synchronized { defCategoryCounts(category) = defCategoryCounts(category) + 1 }
+      defCategoryCounts.add(category)
 
     /** Returns the per-category specialized-def counts. */
-    def getDefCategoryCounts: Map[String, Int] = synchronized { defCategoryCounts.toMap }
+    def getDefCategoryCounts: Map[String, Int] =
+      defCategoryCounts.asScala.groupMapReduce(identity)(_ => 1)(_ + _)
   }
 
   /**
