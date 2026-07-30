@@ -19,6 +19,9 @@ package ca.uwaterloo.flix.language.phase.monomorph2
 import ca.uwaterloo.flix.language.ast.{SourceLocation, Type, TypeConstructor}
 import ca.uwaterloo.flix.util.{Graph, InternalCompilerException}
 
+// TODO Explain that the purpose of this phase, is to ensure that the subsequent phase/solver phase does not crash due to cylces. It is not to catch all instances of polymorphic recursion since some might be hidden by TreeShaker1 (though unreachable enums will be caught)
+
+
 /**
   * Rejects non-monomorphizable programs (flow sets with no finite solution) before
   * [[ConstraintSolver.solve]]'s fixpoint loop, which would otherwise grow without bound.
