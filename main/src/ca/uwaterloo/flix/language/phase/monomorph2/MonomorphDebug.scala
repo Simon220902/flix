@@ -83,7 +83,7 @@ private[monomorph2] object MonomorphDebug {
     sb.append("\n")
 
     var seedCount = 0
-    flows.foreach { case FlowConstraint(args, dst) =>
+    flows.foreach { case FlowConstraint(Instantiation(args), dst) =>
       val srcMVars = args.flatMap(collectMonoVars)
       val label = args.map(monoArgLabel).mkString(", ")
       if (srcMVars.isEmpty) {
@@ -104,7 +104,7 @@ private[monomorph2] object MonomorphDebug {
 
   /** Returns every `MonoVar` appearing in `flows`, as either a destination or a source argument. */
   private def allMonoVarsOf(flows: Set[FlowConstraint]): Set[MonoVar] =
-    flows.flatMap { case FlowConstraint(args, dst) => Set(dst) ++ args.flatMap(collectMonoVars) }
+    flows.flatMap { case FlowConstraint(Instantiation(args), dst) => Set(dst) ++ args.flatMap(collectMonoVars) }
 
   /** Returns every `MonoVar` referenced by a `Param` inside `arg`. */
   private def collectMonoVars(arg: MonoArg): List[MonoVar] =
@@ -125,7 +125,7 @@ private[monomorph2] object MonomorphDebug {
 
   /** Returns a plain-text listing of `flows`, one line per flow: `<args> -> <destination>`. */
   private def flowsToText(flows: Set[FlowConstraint]): String =
-    flows.toList.map { case FlowConstraint(args, dst) =>
+    flows.toList.map { case FlowConstraint(Instantiation(args), dst) =>
       s"${args.map(monoArgLabel).mkString(", ")} -> ${monoVarLabel(dst)}"
     }.sorted.mkString("\n")
 

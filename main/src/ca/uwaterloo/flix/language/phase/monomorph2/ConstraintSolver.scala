@@ -165,7 +165,7 @@ object ConstraintSolver {
 
   /** Returns `flow` with its Param-free positions pre-collapsed. */
   private def prepareFlow(flow: FlowConstraint, root: TypedAst.Root)(implicit flix: Flix): PreparedFlow = flow match {
-    case FlowConstraint(args, dst) =>
+    case FlowConstraint(Instantiation(args), dst) =>
       val preCollapsed = args.map { arg =>
         if (MonoArg.collectParams(arg).isEmpty) Some(collapseArg(arg, Map.empty, root))
         else None

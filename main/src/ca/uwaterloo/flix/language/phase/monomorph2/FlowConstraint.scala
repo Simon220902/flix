@@ -16,8 +16,12 @@
 
 package ca.uwaterloo.flix.language.phase.monomorph2
 
+// TODO Write Instantiation comment here and replace the "type-argument tuple" mentions into mentions about that...
+case class Instantiation(args: List[MonoArg])
+
+
 /**
   * A component-wise flow constraint.
   * Read as: "The type-argument tuple `args` flows into the parameter slots of `dst`."
   */
-case class FlowConstraint(args: List[MonoArg], dst: MonoVar)
+case class FlowConstraint(args: Instantiation, dst: MonoVar)

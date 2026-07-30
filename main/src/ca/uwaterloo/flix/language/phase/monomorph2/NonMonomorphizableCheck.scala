@@ -52,7 +52,7 @@ object NonMonomorphizableCheck {
     */
   def checkMonomorphizable(flows: Set[FlowConstraint]): Unit = {
     val positions = flows.iterator.flatMap {
-      case FlowConstraint(args, dst) =>
+      case FlowConstraint(Instantiation(args), dst) =>
         args.iterator.zipWithIndex.map { case (arg, i) =>
           val dstV = Vertex(dst, i)
           (arg, dstV, MonoArg.collectParams(arg).distinct)
