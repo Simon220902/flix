@@ -62,14 +62,14 @@ object ConstraintGen {
     ParOps.parMap(root.defs.values) { defn =>
       flix.profile(defn.sym, defn.loc) {
         val mvar = MonoVar.Def(defn.sym)
-        implicit val tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg] = mkTparamEnv(mvar, defn.spec.tparams)
+        implicit val tparamEnv: TparamEnv = mkTparamEnv(mvar, defn.spec.tparams)
         visitDef(defn)
       }
     }
 
     ParOps.parMap(root.enums.values) { enm =>
       val mvar = MonoVar.Enum(enm.sym)
-      implicit val tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg] = mkTparamEnv(mvar, enm.tparams)
+      implicit val tparamEnv: TparamEnv = mkTparamEnv(mvar, enm.tparams)
       visitEnum(enm)
     }
 
@@ -77,7 +77,7 @@ object ConstraintGen {
       for (instDef <- inst.defs) {
         val mvar = MonoVar.Def(instDef.sym)
         val allTparams = inst.tparams ++ instDef.spec.tparams
-        implicit val tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg] = mkTparamEnv(mvar, allTparams)
+        implicit val tparamEnv: TparamEnv = mkTparamEnv(mvar, allTparams)
         flix.profile(instDef.sym, instDef.loc) {
           visitDef(instDef)
         }
@@ -86,13 +86,13 @@ object ConstraintGen {
 
     ParOps.parMap(root.restrictableEnums.values) { enm =>
       val mvar = MonoVar.RestrictableEnum(enm.sym)
-      implicit val tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg] = mkTparamEnv(mvar, enm.index :: enm.tparams)
+      implicit val tparamEnv: TparamEnv = mkTparamEnv(mvar, enm.index :: enm.tparams)
       visitRestrictableEnum(enm)
     }
 
     ParOps.parMap(root.structs.values) { struct =>
       val mvar = MonoVar.Struct(struct.sym)
-      implicit val tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg] = mkTparamEnv(mvar, struct.tparams)
+      implicit val tparamEnv: TparamEnv = mkTparamEnv(mvar, struct.tparams)
       visitStruct(struct)
     }
 
@@ -106,7 +106,7 @@ object ConstraintGen {
       val ns = sig.sym.trt.namespace :+ sig.sym.trt.name
       val defnSym = new Symbol.DefnSym(None, ns, sig.sym.name, sig.sym.loc)
       val mvar = MonoVar.Def(defnSym)
-      implicit val tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg] = mkTparamEnv(mvar, allTparams)
+      implicit val tparamEnv: TparamEnv = mkTparamEnv(mvar, allTparams)
       flix.profile(defnSym, sig.sym.loc) {
         for (exp <- sig.exp) {
           visitExp(exp)
@@ -117,21 +117,26 @@ object ConstraintGen {
     ParOps.parMap(root.effects.values.flatMap(_.ops)) { op =>
       val defnSym = new Symbol.DefnSym(None, op.sym.namespace, op.sym.name, op.sym.loc)
       val mvar = MonoVar.Def(defnSym)
-      implicit val tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg] = mkTparamEnv(mvar, op.spec.tparams)
+      implicit val tparamEnv: TparamEnv = mkTparamEnv(mvar, op.spec.tparams)
       visitOp(op)
     }
 
     sctx.result
   }(MonomorphDebug.DebugFlows)
 
+  /** Maps the current declaration's own type parameters to their `MonoArg.Param` binding. */
+  private case class TparamEnv(m: Map[Symbol.KindedTypeVarSym, MonoArg]) {
+    def get(sym: Symbol.KindedTypeVarSym): Option[MonoArg] = m.get(sym)
+  }
+
   /** Returns the `MonoArg.Param` bindings for `mvar`'s type parameters, in declared order. */
-  private def mkTparamEnv(mvar: MonoVar, tparams: List[TypeParam]): Map[Symbol.KindedTypeVarSym, MonoArg] =
-    tparams.zipWithIndex.map { case (tp, i) => tp.sym -> MonoArg.Param(mvar, i) }.toMap
+  private def mkTparamEnv(mvar: MonoVar, tparams: List[TypeParam]): TparamEnv =
+    TparamEnv(tparams.zipWithIndex.map { case (tp, i) => tp.sym -> MonoArg.Param(mvar, i) }.toMap)
 
   /**
     * Emits flow constraints for enum type applications occurring in `tpe`.
     */
-  private def visitType(tpe0: Type)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
+  private def visitType(tpe0: Type)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     def dealiasedVisitType(tpe: Type): Unit = tpe match {
       case at @ Type.AssocType(_, arg, _, _) =>
         if (at.typeVars.isEmpty)
@@ -168,7 +173,7 @@ object ConstraintGen {
   /**
     * Emits flow constraints for all case field types in `enumDecl`.
     */
-  private def visitEnum(enumDecl: TypedAst.Enum)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
+  private def visitEnum(enumDecl: TypedAst.Enum)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     for (cas <- enumDecl.cases.values) {
       for (tpe <- cas.tpes) {
         visitType(tpe)
@@ -179,7 +184,7 @@ object ConstraintGen {
   /**
     * Emits flow constraints for all case field types in `restrictableEnumDecl`.
     */
-  private def visitRestrictableEnum(restrictableEnumDecl: TypedAst.RestrictableEnum)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
+  private def visitRestrictableEnum(restrictableEnumDecl: TypedAst.RestrictableEnum)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     for (cas <- restrictableEnumDecl.cases.values) {
       for (tpe <- cas.tpes) {
         visitType(tpe)
@@ -190,7 +195,7 @@ object ConstraintGen {
   /**
     * Emits flow constraints for all field types in `structDecl`.
     */
-  private def visitStruct(structDecl: TypedAst.Struct)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
+  private def visitStruct(structDecl: TypedAst.Struct)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     for (field <- structDecl.fields.values) {
       visitType(field.tpe)
     }
@@ -199,7 +204,7 @@ object ConstraintGen {
   /**
     * Emits flow constraints for the formal parameter and return types of `op`.
     */
-  private def visitOp(op: TypedAst.Op)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
+  private def visitOp(op: TypedAst.Op)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     for (case FormalParam(_, tpe, _, _, _) <- op.spec.fparams) {
       visitType(tpe)
     }
@@ -209,7 +214,7 @@ object ConstraintGen {
   /**
     * Emits flow constraints for the formal parameter types, return type, and body of `defn`.
     */
-  private def visitDef(defn: TypedAst.Def)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
+  private def visitDef(defn: TypedAst.Def)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     for (case FormalParam(_, tpe, _, _, _) <- defn.spec.fparams) {
       visitType(tpe)
     }
@@ -222,7 +227,7 @@ object ConstraintGen {
     * Emits flow constraints for the default-handler calls that
     * `SolutionLowering.wrapDefWithDefaultHandlers` synthesizes around entry points.
     */
-  private def entryPointHandlerFlows(defn: TypedAst.Def)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit =
+  private def entryPointHandlerFlows(defn: TypedAst.Def)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit =
     if (TypedAstOps.isEntryPoint(defn)(root)) {
       val loc = defn.spec.eff.loc
       val defEffects = Canonicalization.evalEffect(defn.spec.eff)
@@ -248,7 +253,7 @@ object ConstraintGen {
     * Datalog and channel nodes additionally emit constraints for the stdlib calls
     * [[SolutionLowering]] will synthesize for them.
     */
-  private def visitExp(exp0: Expr)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = exp0 match {
+  private def visitExp(exp0: Expr)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = exp0 match {
     case Expr.Cst(_, _, _) => ()
     case Expr.Var(_, _, _) => ()
     case Expr.Hole(_, _, _, _, _) => ()
@@ -667,7 +672,7 @@ object ConstraintGen {
     * `AnyType` reach `Fixpoint.Boxable`'s box/unbox, whose unchecked casts would turn it into a
     * silently wrong runtime value instead.
     */
-  private def visitPat(pat0: TypedAst.Pattern)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = pat0 match {
+  private def visitPat(pat0: TypedAst.Pattern)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = pat0 match {
     case TypedAst.Pattern.Tag(_, pats, tpe, _) =>
       val (mvar, tpArgs) = getMonoVarAndTypeArgs(tpe)
       for (pat <- pats) {
@@ -688,11 +693,11 @@ object ConstraintGen {
   }
 
   /** A flow for `Fixpoint3.Boxable.box` at type `tpe` — mirrors `SolutionLowering.box`. */
-  private def boxFlow(tpe: Type)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit =
+  private def boxFlow(tpe: Type)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit =
     sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(tpe))), MonoVar.Def(Defs.Box)))
 
   /** Flows for a head term — mirrors `SolutionLowering.lowerHeadTerm`. */
-  private def headTermFlows(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = exp0 match {
+  private def headTermFlows(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = exp0 match {
     case Expr.Var(sym, tpe, _) =>
       if (!MonomorphHelpers.isQuantifiedVar(sym, cparams0)) boxFlow(tpe)
     case _ =>
@@ -702,7 +707,7 @@ object ConstraintGen {
   }
 
   /** Flows for a body atom's terms — mirrors `SolutionLowering.lowerBodyTerm`. */
-  private def bodyAtomTermFlows(cparams0: List[TypedAst.ConstraintParam], terms: List[TypedAst.Pattern])(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
+  private def bodyAtomTermFlows(cparams0: List[TypedAst.ConstraintParam], terms: List[TypedAst.Pattern])(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     for (term <- terms) {
       term match {
         case TypedAst.Pattern.Wild(_, _) => ()
@@ -718,7 +723,7 @@ object ConstraintGen {
     * A flow for `lift{arity}b` — mirrors `SolutionLowering.mkGuard`. Arity 0 emits nothing:
     * there is no `lift0b`.
     */
-  private def guardLiftFlow(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
+  private def guardLiftFlow(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     val fvs = MonomorphHelpers.quantifiedVars(cparams0, exp0)
     if (fvs.nonEmpty) sctx.addFlow(FlowConstraint(Instantiation(fvs.map(kv => typeToMonoArg(kv._2))), MonoVar.Def(Defs.LiftB(fvs.length))))
   }
@@ -726,7 +731,7 @@ object ConstraintGen {
   /**
     * A flow for `lift{inArity}X{outArity}` — mirrors `SolutionLowering.mkFunctional`.
     */
-  private def functionalLiftFlow(cparams0: List[TypedAst.ConstraintParam], outArity: Int, exp0: TypedAst.Expr)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
+  private def functionalLiftFlow(cparams0: List[TypedAst.ConstraintParam], outArity: Int, exp0: TypedAst.Expr)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     val inVars = MonomorphHelpers.quantifiedVars(cparams0, exp0)
     val inner = Type.eraseAliases(exp0.tpe) match {
       case Type.Apply(Type.Cst(TypeConstructor.Vector, _), t, _) => t
@@ -737,7 +742,7 @@ object ConstraintGen {
   }
 
   /** Flows for `lattice`/`box`/`Denotation` — mirrors `SolutionLowering.mkDenotation`. */
-  private def latticeFlows(den: Denotation, lastTermType: Option[Type], loc: SourceLocation)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg],  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = den match {
+  private def latticeFlows(den: Denotation, lastTermType: Option[Type], loc: SourceLocation)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = den match {
     case Denotation.Relational =>
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(Types.Boxed))), MonoVar.Enum(Enums.Denotation)))
     case Denotation.Latticenal =>
@@ -795,17 +800,17 @@ object ConstraintGen {
     if (arity <= 1) List(tpe) else tpe.typeArguments
 
   /** Converts `tpe0` to a `MonoArg` relative to the current declaration context. */
-  private def typeToMonoArg(tpe0: Type)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg], root: TypedAst.Root, flix: Flix): MonoArg =
+  private def typeToMonoArg(tpe0: Type)(implicit tparamEnv: TparamEnv, root: TypedAst.Root, flix: Flix): MonoArg =
     dealiasedTypeToMonoArg(Type.eraseAliases(tpe0))
 
   /** Like [[typeToMonoArg]], but `tpe` must already have its aliases erased (deeply). */
-  private def dealiasedTypeToMonoArg(tpe: Type)(implicit tparamEnv: Map[Symbol.KindedTypeVarSym, MonoArg], root: TypedAst.Root, flix: Flix): MonoArg =
+  private def dealiasedTypeToMonoArg(tpe: Type)(implicit tparamEnv: TparamEnv, root: TypedAst.Root, flix: Flix): MonoArg =
     tpe match {
       case Type.Var(sym, _) =>
         // A type variable that is not a tparam of the current decl (absent from tparamEnv) — e.g.
         // a region var introduced by `region r { ... }`. We record it as an opaque constant so the
         // flow is still emitted but the solver does not propagate it.
-        tparamEnv.getOrElse(sym, MonoArg.Const(tpe))
+        tparamEnv.get(sym).getOrElse(MonoArg.Const(tpe))
       case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
         if (tpe.typeVars.isEmpty)
           MonoArg.Const(Canonicalization.reduceAssocType(at)(root, flix))
