@@ -143,14 +143,7 @@ object ConstraintGen {
           visitType(Canonicalization.reduceAssocType(at)(root, flix))
         else
           dealiasedVisitType(arg)
-      case Type.Var(_, _)
-           | Type.Cst(_, _)
-           | Type.JvmToEff(_, _)
-           | Type.JvmToType(_, _)
-           | Type.UnresolvedJvmType(_, _)=> ()
-      case Type.Alias(_, _, _, _) =>
-        throw InternalCompilerException(s"Unexpected type alias (should have been erased): $tpe", tpe.loc)
-      case app @ Type.Apply(_, _, _) =>
+      case app @ Type.Apply(_, _, _)    =>
         val args = app.typeArguments
         for (arg <- args) {
           dealiasedVisitType(arg)
@@ -158,6 +151,13 @@ object ConstraintGen {
         for (mvar <- declMonoVar(app.baseType)) {
           sctx.addFlow(FlowConstraint(Instantiation(args.map(t => dealiasedTypeToMonoArg(t))), mvar))
         }
+      case Type.Var(_, _)               => ()
+      case Type.Cst(_, _)               => ()
+      case Type.JvmToEff(_, _)          => ()
+      case Type.JvmToType(_, _)         => ()
+      case Type.UnresolvedJvmType(_, _) => ()
+      case Type.Alias(_, _, _, _)       =>
+        throw InternalCompilerException(s"Unexpected type alias (should have been erased): $tpe", tpe.loc)
     }
     dealiasedVisitType(Type.eraseAliases(tpe0))
   }
@@ -254,60 +254,46 @@ object ConstraintGen {
     * [[SolutionLowering]] will synthesize for them.
     */
   private def visitExp(exp0: Expr)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = exp0 match {
-    case Expr.Cst(_, _, _) => ()
-    case Expr.Var(_, _, _) => ()
+    case Expr.Cst(_, _, _)        => ()
+    case Expr.Var(_, _, _)        => ()
     case Expr.Hole(_, _, _, _, _) => ()
-
     case Expr.ApplyDef(symUse, exps, targs, _, _, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
       sctx.addFlow(FlowConstraint(Instantiation(targs.map(typeToMonoArg)), MonoVar.Def(symUse.sym)))
-
     case Expr.ApplySig(symUse, exps, targ, targs, _, _, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
       sctx.addFlow(FlowConstraint(Instantiation((targ :: targs).map(typeToMonoArg)), MonoVar.Sig(symUse.sym)))
-
     case Expr.ApplyOp(_, exps, _, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
-
     case Expr.ApplyClo(exp1, exp2, _, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-
     case Expr.Unary(_, exp, _, _, _) => visitExp(exp)
-
     case Expr.Binary(_, exp1, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-
     case Expr.Let(_, exp1, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-
     case Expr.Lambda(_, exp, _, _) => visitExp(exp)
-
     case Expr.IfThenElse(exp1, exp2, exp3, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
       visitExp(exp3)
-
     case Expr.Stm(exps, exp, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
       visitExp(exp)
-
     case Expr.Discard(exp, _, _) => visitExp(exp)
-
     case Expr.Region(_, _, exp, _, _, _) => visitExp(exp)
-
     case Expr.Use(_, _, exp, _) => visitExp(exp)
-
     case Expr.Match(exp, rules, _, _, _) =>
       visitExp(exp)
       for (case MatchRule(pat, guardOpt, body, _) <- rules) {
@@ -317,98 +303,76 @@ object ConstraintGen {
         }
         visitExp(body)
       }
-
     case Expr.Tag(_, exps, tpe, _, _) =>
       val (mvar, tpArgs) = getMonoVarAndTypeArgs(tpe)
       for (exp <- exps) {
         visitExp(exp)
       }
       sctx.addFlow(FlowConstraint(Instantiation(tpArgs.map(typeToMonoArg)), mvar))
-
     case Expr.RestrictableTag(_, exps, tpe, _, _) =>
       val (mvar, tpArgs) = getMonoVarAndTypeArgs(tpe)
       for (exp <- exps) {
         visitExp(exp)
       }
       sctx.addFlow(FlowConstraint(Instantiation(tpArgs.map(typeToMonoArg)), mvar))
-
     case Expr.RestrictableChoose(_, exp, rules, _, _, _) =>
       visitExp(exp)
       for (rule <- rules) {
         visitExp(rule.exp)
       }
-
     case Expr.ExtMatch(exp, rules, _, _, _) =>
       visitExp(exp)
       for (rule <- rules) {
         visitExp(rule.exp)
       }
-
     case Expr.ExtTag(_, exps, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
-
     case Expr.OpenAs(_, exp, _, _) => visitExp(exp)
-
     case Expr.Tuple(exps, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
-
     case Expr.LocalDef(_, bnd, _, exp1, exp2, _, _, _) =>
       visitType(bnd.tpe)
       visitExp(exp1)
       visitExp(exp2)
-
     case Expr.ApplyLocalDef(_, exps, _, _, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
-
     case Expr.HoleWithExp(exp, _, _, _, _) => visitExp(exp)
-
     case Expr.RecordSelect(exp, _, _, _, _) => visitExp(exp)
-
     case Expr.RecordExtend(_, exp1, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-
     case Expr.RecordRestrict(_, exp, _, _, _) => visitExp(exp)
-
     case Expr.ArrayLit(exps, exp, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
       visitExp(exp)
-
     case Expr.ArrayNew(exp1, exp2, exp3, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
       visitExp(exp3)
-
     case Expr.ArrayLoad(exp1, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-
     case Expr.ArrayLength(exp, _, _) => visitExp(exp)
-
     case Expr.ArrayStore(exp1, exp2, exp3, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
       visitExp(exp3)
-
     case Expr.VectorLit(exps, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
-
     case Expr.VectorLoad(exp1, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-
     case Expr.VectorLength(exp, _) => visitExp(exp)
-
     case Expr.StructNew(_, fields, region, tpe, _, _) =>
       val (mvar, tpArgs) = getMonoVarAndTypeArgs(tpe)
       for (case (_, exp) <- fields) {
@@ -418,48 +382,33 @@ object ConstraintGen {
         visitExp(exp)
       }
       sctx.addFlow(FlowConstraint(Instantiation(tpArgs.map(typeToMonoArg)), mvar))
-
     case Expr.StructGet(exp, _, _, _, _) => visitExp(exp)
-
     case Expr.StructPut(exp1, _, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-
     case Expr.Lazy(exp, _, _) => visitExp(exp)
-
     case Expr.Force(exp, _, _, _) => visitExp(exp)
-
     case Expr.Ascribe(exp, _, _, _, _, _) => visitExp(exp)
-
     case Expr.InstanceOf(exp, _, _) => visitExp(exp)
-
     case Expr.CheckedCast(_, exp, _, _, _) => visitExp(exp)
-
     case Expr.UncheckedCast(exp, _, _, _, _, _) => visitExp(exp)
-
     case Expr.Unsafe(exp, _, _, _, _, _) => visitExp(exp)
-
     case Expr.TryCatch(exp, rules, _, _, _) =>
       visitExp(exp)
       for (rule <- rules) {
         visitExp(rule.exp)
       }
-
     case Expr.Throw(exp, _, _, _) => visitExp(exp)
-
     case Expr.Handler(_, rules, _, _, _, _, _) =>
       for (rule <- rules) {
         visitExp(rule.exp)
       }
-
     case Expr.RunWith(exp1, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-
     case Expr.Spawn(exp1, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-
     // Lowering synthesizes Channel.get/put/newChannel calls for each non-last fragment.
     case Expr.ParYield(frags, exp, _, _, _) =>
       for (f <- frags) {
@@ -474,43 +423,33 @@ object ConstraintGen {
         sctx.addFlow(FlowConstraint(Instantiation(List(elmArg)), MonoVar.Def(Defs.ChannelPut)))
         sctx.addFlow(FlowConstraint(Instantiation(List(elmArg)), MonoVar.Def(Defs.ChannelGet)))
       }
-
     case Expr.InvokeConstructor(_, exps, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
-
     case Expr.InvokeSuperConstructor(_, exps, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
-
     case Expr.InvokeMethod(_, exp, exps, _, _, _) =>
       visitExp(exp)
       for (exp <- exps) {
         visitExp(exp)
       }
-
     case Expr.InvokeSuperMethod(_, exps, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
-
     case Expr.InvokeStaticMethod(_, exps, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
-
     case Expr.GetField(_, exp, _, _, _) => visitExp(exp)
-
     case Expr.PutField(_, exp1, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-
     case Expr.GetStaticField(_, _, _, _) => ()
-
     case Expr.PutStaticField(_, exp, _, _, _) => visitExp(exp)
-
     case Expr.NewObject(_, _, _, _, constructors, methods, _) =>
       for (c <- constructors) {
         visitExp(c.exp)
@@ -518,24 +457,20 @@ object ConstraintGen {
       for (m <- methods) {
         visitExp(m.exp)
       }
-
     // Lowering synthesizes a Channel.get call, generic over the channel's element type.
     case Expr.GetChannel(exp, tpe, _, _) =>
       visitExp(exp)
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(MonomorphHelpers.lowerChannelType(tpe)))), MonoVar.Def(Defs.ChannelGet)))
-
     // Lowering synthesizes a Channel.put call, generic over the element type.
     case Expr.PutChannel(exp1, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(MonomorphHelpers.lowerChannelType(exp2.tpe)))), MonoVar.Def(Defs.ChannelPut)))
-
     // Lowering synthesizes a Channel.newChannelTuple call, generic over the element type.
     case Expr.NewChannel(exp, tpe, _, _) =>
       val elmType = extractChannelElm(tpe)
       visitExp(exp)
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(MonomorphHelpers.lowerChannelType(elmType)))), MonoVar.Def(Defs.ChannelNewTuple)))
-
     // Lowering synthesizes Channel.mpmcAdmin/unsafeGetAndUnlock calls per rule (not Channel.get),
     // plus one fixed List[ChannelMpmcAdmin] built via mkTag/mkList.
     case Expr.SelectChannel(rules, default, _, _, _) =>
@@ -555,7 +490,6 @@ object ConstraintGen {
         visitExp(exp)
       }
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(Types.ChannelMpmcAdmin))), MonoVar.Enum(Enums.FList)))
-
     // Lowering synthesizes every Box/Unbox/liftN/lattice/Facts/ProjectInto/ProvenanceOf call for
     // Datalog fixpoint nodes, mirroring the TypedAst structure lowering itself inspects.
     case Expr.FixpointConstraintSet(cs, _, _) =>
@@ -583,22 +517,18 @@ object ConstraintGen {
           }
         }
       }
-
     // Lowering synthesizes a List[PredSym] directly via mkTag/mkList (bypassing the ordinary
     // rewrite path), so its instantiation must be predicted here.
     case Expr.FixpointLambda(_, exp, _, _, _) =>
       visitExp(exp)
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(Types.PredSym))), MonoVar.Enum(Enums.FList)))
-
     case Expr.FixpointMerge(exp1, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-
     case Expr.FixpointSolveWithProject(exps, _, _, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
       }
-
     // Lowering synthesizes Fixpoint3.Solver.injectIntoN(p, ts), generic over the container
     // constructor and the tuple's component types.
     case Expr.FixpointInjectInto(exps, predsAndArities, _, _, loc) =>
@@ -612,7 +542,6 @@ object ConstraintGen {
           case t => throw InternalCompilerException(s"Unexpected non-foldable type: '$t'.", loc)
         }
       }
-
     // Lowering synthesizes Fixpoint3.Solver.factsN(p, d), generic over the N selected terms'
     // types. Facts(arity)'s flow args must come from the resolved result type `tpe0`, NOT from
     // `selects`' own term types, which may still carry locally-scoped type vars.
@@ -629,16 +558,15 @@ object ConstraintGen {
       }
       for (p <- from) {
         p match {
-          case Predicate.Body.Guard(e, _)         => visitExp(e)
-          case Predicate.Body.Functional(_, e, _) => visitExp(e)
-          case _: Predicate.Body.Atom             => ()
+          case Predicate.Body.Guard(e, _)               => visitExp(e)
+          case Predicate.Body.Functional(_, e, _)       => visitExp(e)
+          case Predicate.Body.Atom(_, _, _, _, _, _, _) => ()
         }
       }
       for (exp <- where) {
         visitExp(exp)
       }
       sctx.addFlow(FlowConstraint(Instantiation(argTypes.map(typeToMonoArg)), MonoVar.Def(Defs.Facts(arity))))
-
     // Lowering synthesizes a box call per goal term, an unbox call per term type the
     // extensible-variant result can carry, and Solver.provenanceOf/Vector.get calls at a fixed
     // Boxed type.
@@ -659,7 +587,6 @@ object ConstraintGen {
       }
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(Types.Boxed))), MonoVar.Def(Defs.VectorGet)))
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(extVarType))), MonoVar.Def(Defs.ProvenanceOf)))
-
     case Expr.Error(_, _, _) => ()
   }
 
@@ -688,8 +615,10 @@ object ConstraintGen {
         visitPat(lp.pat)
       }
       visitPat(pat)
-    case TypedAst.Pattern.Wild(_, _) | TypedAst.Pattern.Var(_, _, _) | TypedAst.Pattern.Cst(_, _, _) | TypedAst.Pattern.Error(_, _) =>
-      ()
+    case TypedAst.Pattern.Wild(_, _)   => ()
+    case TypedAst.Pattern.Var(_, _, _) => ()
+    case TypedAst.Pattern.Cst(_, _, _) => ()
+    case TypedAst.Pattern.Error(_, _)  => ()
   }
 
   /** A flow for `Fixpoint3.Boxable.box` at type `tpe` — mirrors `SolutionLowering.box`. */
@@ -710,11 +639,15 @@ object ConstraintGen {
   private def bodyAtomTermFlows(cparams0: List[TypedAst.ConstraintParam], terms: List[TypedAst.Pattern])(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     for (term <- terms) {
       term match {
-        case TypedAst.Pattern.Wild(_, _) => ()
-        case TypedAst.Pattern.Var(bnd, tpe, _) =>
+        case TypedAst.Pattern.Wild(_, _)         => ()
+        case TypedAst.Pattern.Var(bnd, tpe, _)   =>
           if (!MonomorphHelpers.isQuantifiedVar(bnd.sym, cparams0)) boxFlow(tpe)
-        case TypedAst.Pattern.Cst(_, tpe, _) => boxFlow(tpe)
-        case _ => ()
+          else ()
+        case TypedAst.Pattern.Cst(_, tpe, _)     => boxFlow(tpe)
+        case TypedAst.Pattern.Tag(_, _, _, _)    => ()
+        case TypedAst.Pattern.Tuple(_, _, _)     => ()
+        case TypedAst.Pattern.Error(_, _)        => ()
+        case TypedAst.Pattern.Record(_, _, _, _) => ()
       }
     }
   }
@@ -767,7 +700,8 @@ object ConstraintGen {
   private def predicatesOfSchemaRow(row: Type): List[(Name.Pred, List[Type])] = row match {
     case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SchemaRowExtend(pred), _), rel, _), tpe2, _) =>
       (pred, termTypesOfRelation(rel)) :: predicatesOfSchemaRow(tpe2)
-    case Type.Var(_, _) | Type.SchemaRowEmpty => Nil
+    case Type.Var(_, _) => Nil
+    case Type.SchemaRowEmpty => Nil
     case t => throw InternalCompilerException(s"Got unexpected $t", t.loc)
   }
 
@@ -779,7 +713,6 @@ object ConstraintGen {
     def flattenApply(rel0: Type): List[Type] = rel0 match {
       case Type.Cst(TypeConstructor.Relation(_), _) => Nil
       case Type.Apply(rest, t, _) => t :: flattenApply(rest)
-      case _ if rel0.typeConstructor.contains(TypeConstructor.AnyType) => Nil
       case Type.Var(_, _) => Nil
       case t => throw InternalCompilerException(s"Expected Type.Apply(_, _, _), but got $t", rel0.loc)
     }
@@ -788,7 +721,8 @@ object ConstraintGen {
 
   /** Extracts T from NewChannel's `(Sender[T], Receiver[T])` type — see ConstraintGen's NewChannel rule. */
   private def extractChannelElm(tpe: Type): Type = tpe.typeArguments match {
-    case List(Type.Apply(Type.Cst(TypeConstructor.Sender | TypeConstructor.Receiver, _), elm, _), _) => elm
+    case List(Type.Apply(Type.Cst(TypeConstructor.Sender, _), elm, _), _) => elm
+    case List(Type.Apply(Type.Cst(TypeConstructor.Receiver, _), elm, _), _) => elm
     case _ => throw InternalCompilerException(s"Expected (Sender[_], Receiver[_]), but got $tpe", tpe.loc)
   }
 
@@ -804,35 +738,34 @@ object ConstraintGen {
     dealiasedTypeToMonoArg(Type.eraseAliases(tpe0))
 
   /** Like [[typeToMonoArg]], but `tpe` must already have its aliases erased (deeply). */
-  private def dealiasedTypeToMonoArg(tpe: Type)(implicit tparamEnv: TparamEnv, root: TypedAst.Root, flix: Flix): MonoArg =
-    tpe match {
-      case Type.Var(sym, _) =>
-        // A type variable that is not a tparam of the current decl (absent from tparamEnv) — e.g.
-        // a region var introduced by `region r { ... }`. We record it as an opaque constant so the
-        // flow is still emitted but the solver does not propagate it.
-        tparamEnv.get(sym).getOrElse(MonoArg.Const(tpe))
-      case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
-        if (tpe.typeVars.isEmpty)
-          MonoArg.Const(Canonicalization.reduceAssocType(at)(root, flix))
-        else
-          MonoArg.Assoc(symUse.sym, dealiasedTypeToMonoArg(arg), kind, assocLoc)
-      case Type.Cst(_, _) =>
-        MonoArg.Const(tpe)
-      case Type.Apply(_, _, _) =>
-        if (tpe.kind == Kind.Eff && tpe.typeVars.isEmpty)
-          MonoArg.Const(Canonicalization.simplify(tpe, isGround = true)(root, flix))
-        else {
-          MonoArg.App(dealiasedTypeToMonoArg(tpe.baseType), tpe.typeArguments.map(arg => dealiasedTypeToMonoArg(arg)))
-        }
-      case Type.Alias(_, _, _, _) =>
-        throw InternalCompilerException(s"Unexpected type alias (should have been erased): $tpe", tpe.loc)
-      case Type.JvmToType(_, loc) =>
-        throw InternalCompilerException("Unexpected JVM type", loc)
-      case Type.JvmToEff(_, loc) =>
-        throw InternalCompilerException("Unexpected JVM eff", loc)
-      case Type.UnresolvedJvmType(_, loc) =>
-        throw InternalCompilerException("Unexpected JVM type", loc)
-    }
+  private def dealiasedTypeToMonoArg(tpe: Type)(implicit tparamEnv: TparamEnv, root: TypedAst.Root, flix: Flix): MonoArg = tpe match {
+    case Type.Var(sym, _) =>
+      // A type variable that is not a tparam of the current decl (absent from tparamEnv) — e.g.
+      // a region var introduced by `region r { ... }`. We record it as an opaque constant so the
+      // flow is still emitted but the solver does not propagate it.
+      tparamEnv.get(sym).getOrElse(MonoArg.Const(tpe))
+    case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
+      if (tpe.typeVars.isEmpty)
+        MonoArg.Const(Canonicalization.reduceAssocType(at)(root, flix))
+      else
+        MonoArg.Assoc(symUse.sym, dealiasedTypeToMonoArg(arg), kind, assocLoc)
+    case Type.Cst(_, _) =>
+      MonoArg.Const(tpe)
+    case Type.Apply(_, _, _) =>
+      if (tpe.kind == Kind.Eff && tpe.typeVars.isEmpty)
+        MonoArg.Const(Canonicalization.simplify(tpe, isGround = true)(root, flix))
+      else {
+        MonoArg.App(dealiasedTypeToMonoArg(tpe.baseType), tpe.typeArguments.map(arg => dealiasedTypeToMonoArg(arg)))
+      }
+    case Type.Alias(_, _, _, _) =>
+      throw InternalCompilerException(s"Unexpected type alias (should have been erased): $tpe", tpe.loc)
+    case Type.JvmToType(_, loc) =>
+      throw InternalCompilerException("Unexpected JVM type", loc)
+    case Type.JvmToEff(_, loc) =>
+      throw InternalCompilerException("Unexpected JVM eff", loc)
+    case Type.UnresolvedJvmType(_, loc) =>
+      throw InternalCompilerException("Unexpected JVM type", loc)
+  }
 
   /** Returns the enum/restrictable-enum/struct `MonoVar` and type arguments of `tpe0`. */
   private def getMonoVarAndTypeArgs(tpe0: Type): (MonoVar, List[Type]) = {

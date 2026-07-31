@@ -141,14 +141,18 @@ private[monomorph2] object Canonicalization {
     * type.
     */
   def default(tpe0: Type): Type = tpe0.kind match {
-    case Kind.Wild | Kind.WildCaseSet | Kind.Star | Kind.Bool | Kind.Predicate | Kind.Arrow(_, _) =>
-      Type.mkAnyType(tpe0.loc)
-    case Kind.Eff          => Type.Pure
-    case Kind.RecordRow    => Type.RecordRowEmpty
-    case Kind.SchemaRow    => Type.SchemaRowEmpty
-    case Kind.CaseSet(sym) => Type.Cst(TypeConstructor.CaseSet(SortedSet.empty, sym), tpe0.loc)
-    case Kind.Jvm          => throw InternalCompilerException(s"Unexpected type: '$tpe0'.", tpe0.loc)
-    case Kind.Error        => throw InternalCompilerException(s"Unexpected type '$tpe0'.", tpe0.loc)
+    case Kind.Wild          => Type.mkAnyType(tpe0.loc)
+    case Kind.WildCaseSet   => Type.mkAnyType(tpe0.loc)
+    case Kind.Star          => Type.mkAnyType(tpe0.loc)
+    case Kind.Bool          => Type.mkAnyType(tpe0.loc)
+    case Kind.Predicate     => Type.mkAnyType(tpe0.loc)
+    case Kind.Arrow(_, _)   => Type.mkAnyType(tpe0.loc)
+    case Kind.Eff           => Type.Pure
+    case Kind.RecordRow     => Type.RecordRowEmpty
+    case Kind.SchemaRow     => Type.SchemaRowEmpty
+    case Kind.CaseSet(sym)  => Type.Cst(TypeConstructor.CaseSet(SortedSet.empty, sym), tpe0.loc)
+    case Kind.Jvm           => throw InternalCompilerException(s"Unexpected type: '$tpe0'.", tpe0.loc)
+    case Kind.Error         => throw InternalCompilerException(s"Unexpected type '$tpe0'.", tpe0.loc)
   }
 
   // Copied from monomorph.Specialization.mkRecordExtendSorted
@@ -163,13 +167,14 @@ private[monomorph2] object Canonicalization {
     case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.RecordRowExtend(l), loc1), t, loc2), r, loc3) if l.name < label.name =>
       val newRest = mkRecordExtendSorted(label, tpe, r, loc)
       Type.Apply(Type.Apply(Type.Cst(TypeConstructor.RecordRowExtend(l), loc1), t, loc2), newRest, loc3)
-    case Type.Cst(_, _) | Type.Apply(_, _, _) | Type.Var(_, _) =>
-      Type.mkRecordRowExtend(label, tpe, rest, loc)
-    case Type.Alias(_, _, _, _)         => throw InternalCompilerException(s"Unexpected alias '$rest'", rest.loc)
-    case Type.AssocType(_, _, _, _)     => throw InternalCompilerException(s"Unexpected associated type '$rest'", rest.loc)
-    case Type.JvmToType(_, _)           => throw InternalCompilerException(s"Unexpected JVM type '$rest'", rest.loc)
-    case Type.JvmToEff(_, _)            => throw InternalCompilerException(s"Unexpected JVM eff '$rest'", rest.loc)
-    case Type.UnresolvedJvmType(_, _)   => throw InternalCompilerException(s"Unexpected JVM type '$rest'", rest.loc)
+    case Type.Cst(_, _)                => Type.mkRecordRowExtend(label, tpe, rest, loc)
+    case Type.Apply(_, _, _)           => Type.mkRecordRowExtend(label, tpe, rest, loc)
+    case Type.Var(_, _)                => Type.mkRecordRowExtend(label, tpe, rest, loc)
+    case Type.Alias(_, _, _, _)        => throw InternalCompilerException(s"Unexpected alias '$rest'", rest.loc)
+    case Type.AssocType(_, _, _, _)    => throw InternalCompilerException(s"Unexpected associated type '$rest'", rest.loc)
+    case Type.JvmToType(_, _)          => throw InternalCompilerException(s"Unexpected JVM type '$rest'", rest.loc)
+    case Type.JvmToEff(_, _)           => throw InternalCompilerException(s"Unexpected JVM eff '$rest'", rest.loc)
+    case Type.UnresolvedJvmType(_, _)  => throw InternalCompilerException(s"Unexpected JVM type '$rest'", rest.loc)
   }
 
   // Copied from monomorph.Specialization.mkSchemaExtendSorted
@@ -184,12 +189,13 @@ private[monomorph2] object Canonicalization {
     case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SchemaRowExtend(l), loc1), t, loc2), r, loc3) if l.name < label.name =>
       val newRest = mkSchemaExtendSorted(label, tpe, r, loc)
       Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SchemaRowExtend(l), loc1), t, loc2), newRest, loc3)
-    case Type.Cst(_, _) | Type.Apply(_, _, _) | Type.Var(_, _) =>
-      Type.mkSchemaRowExtend(label, tpe, rest, loc)
-    case Type.Alias(_, _, _, _)         => throw InternalCompilerException(s"Unexpected alias '$rest'", rest.loc)
-    case Type.AssocType(_, _, _, _)     => throw InternalCompilerException(s"Unexpected associated type '$rest'", rest.loc)
-    case Type.JvmToType(_, _)           => throw InternalCompilerException(s"Unexpected JVM type '$rest'", rest.loc)
-    case Type.JvmToEff(_, _)            => throw InternalCompilerException(s"Unexpected JVM eff '$rest'", rest.loc)
-    case Type.UnresolvedJvmType(_, _)   => throw InternalCompilerException(s"Unexpected JVM type '$rest'", rest.loc)
+    case Type.Cst(_, _)                => Type.mkSchemaRowExtend(label, tpe, rest, loc)
+    case Type.Apply(_, _, _)           => Type.mkSchemaRowExtend(label, tpe, rest, loc)
+    case Type.Var(_, _)                => Type.mkSchemaRowExtend(label, tpe, rest, loc)
+    case Type.Alias(_, _, _, _)        => throw InternalCompilerException(s"Unexpected alias '$rest'", rest.loc)
+    case Type.AssocType(_, _, _, _)    => throw InternalCompilerException(s"Unexpected associated type '$rest'", rest.loc)
+    case Type.JvmToType(_, _)          => throw InternalCompilerException(s"Unexpected JVM type '$rest'", rest.loc)
+    case Type.JvmToEff(_, _)           => throw InternalCompilerException(s"Unexpected JVM eff '$rest'", rest.loc)
+    case Type.UnresolvedJvmType(_, _)  => throw InternalCompilerException(s"Unexpected JVM type '$rest'", rest.loc)
   }
 }

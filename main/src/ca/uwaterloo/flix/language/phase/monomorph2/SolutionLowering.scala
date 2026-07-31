@@ -1198,11 +1198,8 @@ object SolutionLowering {
 
   /** Returns `true` if `method` is a Java auto-unboxing method (e.g., `intValue`, `booleanValue`). */
   private def isAutoUnboxMethod(method: java.lang.reflect.Method): Boolean = {
-    method.getParameterCount == 0 && (method.getName match {
-      case "booleanValue" | "charValue" | "byteValue" | "shortValue" |
-           "intValue" | "longValue" | "floatValue" | "doubleValue" => true
-      case _ => false
-    })
+    val autoUnboxMethodNames = Set("booleanValue", "charValue", "byteValue", "shortValue", "intValue", "longValue", "floatValue", "doubleValue")
+    method.getParameterCount == 0 && autoUnboxMethodNames.contains(method.getName)
   }
 
 
@@ -1373,7 +1370,7 @@ object SolutionLowering {
         val pat = mkTuplePattern(Nel(MonoAst.Pattern.Cst(Constant.Int32(-1), Type.Int32, loc), List(MonoAst.Pattern.Wild(locksType, loc))), loc)
         val defaultMatch = MonoAst.MatchRule(pat, None, defaultExp)
         List(defaultMatch)
-      case _ =>
+      case None =>
         List()
     }
   }

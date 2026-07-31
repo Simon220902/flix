@@ -51,7 +51,9 @@ private[monomorph2] object MonomorphHelpers {
     * flow keys — using it in `typeToMonoArg` generally would corrupt ordinary defs' keys.
     */
   def lowerChannelType(tpe: Type): Type = tpe match {
-    case Type.Apply(Type.Cst(TypeConstructor.Sender | TypeConstructor.Receiver, loc), elm, _) =>
+    case Type.Apply(Type.Cst(TypeConstructor.Sender, loc), elm, _) =>
+      Type.Apply(Type.Apply(Symbols.Types.ChannelMpmc, lowerChannelType(elm), loc), Type.IO, loc)
+    case Type.Apply(Type.Cst(TypeConstructor.Receiver, loc), elm, _) =>
       Type.Apply(Type.Apply(Symbols.Types.ChannelMpmc, lowerChannelType(elm), loc), Type.IO, loc)
     case Type.Apply(t1, t2, loc) =>
       Type.Apply(lowerChannelType(t1), lowerChannelType(t2), loc)

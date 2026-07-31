@@ -57,7 +57,11 @@ object ConstraintSolver {
     def enqueue(dst: MonoVar, tuple0: List[Type]): Unit = {
       val tuple = dst match {
         case MonoVar.Def(sym) if channelDefs.contains(sym) => tuple0.map(lowerChannelType)
-        case _                                             => tuple0
+        case MonoVar.Def(_)                                => tuple0
+        case MonoVar.Enum(_)                               => tuple0
+        case MonoVar.Sig(_)                                => tuple0
+        case MonoVar.RestrictableEnum(_)                   => tuple0
+        case MonoVar.Struct(_)                             => tuple0
       }
       val key = (dst, tuple)
       if (!solution.get(dst).exists(_.contains(tuple)) && !inFlight.contains(key)) {
@@ -88,7 +92,10 @@ object ConstraintSolver {
             for (case (implSym, implArgs) <- resolveSig(sigSym, tuple, root, instanceMap)) {
               enqueue(MonoVar.Def(implSym), implArgs)
             }
-          case _ => ()
+          case MonoVar.Def(_)              => ()
+          case MonoVar.Enum(_)             => ()
+          case MonoVar.RestrictableEnum(_) => ()
+          case MonoVar.Struct(_)           => ()
         }
 
         // Propagate: substitute this MonoVar's new tuple into all dependent flows.
