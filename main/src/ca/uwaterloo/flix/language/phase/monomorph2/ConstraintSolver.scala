@@ -28,10 +28,10 @@ import scala.collection.mutable
 
 /**
   * Solves the flow constraints produced by [[ConstraintGen]] to a fixpoint: starting from
-  * the ground (all-constant) flows, each newly solved tuple is substituted into the flows that
-  * depend on it until no new tuples appear. Sig destinations are additionally dispatched to their
-  * implementing (or default) def. The result is, per polymorphic symbol, the set of ground
-  * type-argument tuples it must be specialized at.
+  * the ground (all-constant) flows, each newly solved instantiation is substituted into the
+  * flows that depend on it until no new instantiations appear. Sig destinations are additionally
+  * dispatched to their implementing (or default) def. The result is, per polymorphic symbol, the
+  * set of ground instantiations it must be specialized at.
   */
 object ConstraintSolver {
 
