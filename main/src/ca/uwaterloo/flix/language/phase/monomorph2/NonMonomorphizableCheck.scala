@@ -47,14 +47,15 @@ import ca.uwaterloo.flix.util.{Graph, InternalCompilerException}
   *   [(a,a)] ~> a // Stemming from `case Node(PerfectTree[(a, a)])`
   *   [(b,b)] ~> b // Stemming from the recursive `size(inner)` call
   * }}}
-  * When we reinterpret the [[FlowConstraint]]s of a program with polymorphic recursion
-  * as a graph there will be at least one cycle with some "growing" edge.
-  * Where "growing" means that the type-variable in the cycle is nested in another type.
-  * I.e. for the two [[FlowConstraint]]s above we would have two growing self-loops.
+  * These are problematic because they establish a cycle (self-loop) with a "growing"
+  * edge. Where "growing" means that the type-variable in the cycle is nested in another
+  * type. When we reinterpret the [[FlowConstraint]]s of a program with polymorphic
+  * recursion as a graph there will be at least one cycle with some "growing" edge.
   *
-  * N.B. Beware that unreachable polymorphic recursive enum/struct declarations will be
-  * rejected whereas polymorphic recursive function definitions will not due to having
-  * already been filtered away during [[TreeShaker1]].
+  * N.B. Beware that there is some inconsistency wrt. reachability and rejection.
+  * Unreachable polymorphic recursive enum/struct declarations will be rejected whereas
+  * polymorphic recursive function definitions will not, due to having already been
+  * filtered away during [[TreeShaker1]].
   */
 object NonMonomorphizableCheck {
 
