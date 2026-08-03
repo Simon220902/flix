@@ -71,17 +71,11 @@ object NonMonomorphizableCheck {
     * [[InternalCompilerException]] if so.
     */
   def checkMonomorphizable(flows: List[FlowConstraint]): Unit = {
-    val positions = flows.flatMap {
-      case FlowConstraint(Instantiation(args), dst) =>
-        args.zipWithIndex.map { case (arg, i) =>
-          val dstV = Vertex(dst, i)
-          (arg, dstV, MonoArg.collectParams(arg).distinct)
-        }
-    }
-
-    val edges = positions.flatMap { case (arg, dstV, ps) =>
-      ps.map { case (v, j) => Edge(Vertex(v, j), dstV, growing = isGrowingHead(arg)) }
-    }
+    val edges = for {
+      FlowConstraint(Instantiation(args), dst) <- flows
+      (arg, i) <- args.zipWithIndex
+      (v, j) <- MonoArg.collectParams(arg).distinct
+    } yield Edge(Vertex(v, j), Vertex(dst, i), growing = isGrowingHead(arg))
 
     if (edges.isEmpty) return
 
