@@ -44,7 +44,7 @@ object FlixEvent {
   case class AfterMonomorph(root: MonoAst.Root) extends FlixEvent
 
   /**
-    * An event fired only by the constraint-based pipeline's `SolutionSpecialization.run`,
+    * An event fired only by the constraint-based pipeline's [[Specialize.run]],
     * breaking specialized-def counts down by origin ("regularDefs"/"instanceDefs"/
     * "defaultSigImpls"). No equivalent exists for the demand-driven baseline
     * (`Specialization.scala`) — diagnostic/benchmarking data, this-pipeline-only.

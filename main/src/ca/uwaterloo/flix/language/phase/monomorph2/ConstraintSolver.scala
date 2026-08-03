@@ -46,7 +46,7 @@ object ConstraintSolver {
     val prepared    = flows.iterator.map(f => prepareFlow(f, root)).toList
     val dependents  = buildDependents(prepared)
 
-    // SolutionLowering looks up @LoweringTargetChannel defs by a key already run through
+    // [[SpecializeAndLower]] looks up @LoweringTargetChannel defs by a key already run through
     // lowerChannelType, so their solved tuples need the same rewrite here.
     val channelDefs = Set(Defs.ChannelGet, Defs.ChannelPut, Defs.ChannelNewTuple, Defs.ChannelMpmcAdmin, Defs.ChannelUnsafeGetAndUnlock)
 
@@ -200,7 +200,7 @@ object ConstraintSolver {
     * the specializer's instantiated type cannot structurally diverge for the same instantiation.
     * Returns `None` if the result remains non-ground — a solver gap, not an error, so it fails
     * soft. Defaulting a constrained `Star` var to `AnyType` is safe even when no instance exists:
-    * `SolutionSpecialization.run` discards any speculative tuple whose reduction fails.
+    * [[Specialize.run]] discards any speculative tuple whose reduction fails.
     */
   private def collapseArg(arg: MonoArg, bindings: Map[MonoVar, List[Type]], root: TypedAst.Root)
                           (implicit flix: Flix): Option[Type] =

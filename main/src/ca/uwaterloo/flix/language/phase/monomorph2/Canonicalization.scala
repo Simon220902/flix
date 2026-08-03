@@ -30,7 +30,7 @@ import scala.collection.immutable.SortedSet
   * effect canonicalization, associated-type reduction, and defaulting of unresolved kinds.
   *
   * Both the solver ([[ConstraintSolver]], which computes types symbolically, ahead of time) and
-  * the specializer ([[SolutionSpecialize]], which computes the logically same types
+  * the specializer ([[Specialize]], which computes the logically same types
   * concretely, at an actual call site) must agree on this, or their `(sym, type)` defTable keys
   * diverge for the same instantiation.
   */

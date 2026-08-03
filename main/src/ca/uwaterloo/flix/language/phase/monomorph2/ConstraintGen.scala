@@ -225,7 +225,7 @@ object ConstraintGen {
 
   /**
     * Emits flow constraints for the default-handler calls that
-    * `SolutionLowering.wrapDefWithDefaultHandlers` synthesizes around entry points.
+    * [[SpecializeAndLower.wrapDefWithDefaultHandlers]] synthesizes around entry points.
     */
   private def entryPointHandlerFlows(defn: TypedAst.Def)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit =
     if (TypedAstOps.isEntryPoint(defn)(root)) {
@@ -251,7 +251,7 @@ object ConstraintGen {
   /**
     * Emits flow constraints for all call sites and enum/struct construction sites in `exp`.
     * Datalog and channel nodes additionally emit constraints for the stdlib calls
-    * [[SolutionLowering]] will synthesize for them.
+    * [[SpecializeAndLower]] will synthesize for them.
     */
   private def visitExp(exp0: Expr)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = exp0 match {
     case Expr.Cst(_, _, _)        => ()
@@ -621,11 +621,11 @@ object ConstraintGen {
     case TypedAst.Pattern.Error(_, _)  => ()
   }
 
-  /** A flow for `Fixpoint3.Boxable.box` at type `tpe` — mirrors `SolutionLowering.box`. */
+  /** A flow for `Fixpoint3.Boxable.box` at type `tpe` — mirrors [[SpecializeAndLower.box]]. */
   private def boxFlow(tpe: Type)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit =
     sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(tpe))), MonoVar.Def(Defs.Box)))
 
-  /** Flows for a head term — mirrors `SolutionLowering.lowerHeadTerm`. */
+  /** Flows for a head term — mirrors [[SpecializeAndLower.lowerHeadTerm]]. */
   private def headTermFlows(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = exp0 match {
     case Expr.Var(sym, tpe, _) =>
       if (!MonomorphHelpers.isQuantifiedVar(sym, cparams0)) boxFlow(tpe)
@@ -635,7 +635,7 @@ object ConstraintGen {
       else sctx.addFlow(FlowConstraint(Instantiation((fvs.map(_._2) :+ exp0.tpe).map(typeToMonoArg)), MonoVar.Def(Defs.Lift(fvs.length))))
   }
 
-  /** Flows for a body atom's terms — mirrors `SolutionLowering.lowerBodyTerm`. */
+  /** Flows for a body atom's terms — mirrors [[SpecializeAndLower.lowerBodyTerm]]. */
   private def bodyAtomTermFlows(cparams0: List[TypedAst.ConstraintParam], terms: List[TypedAst.Pattern])(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     for (term <- terms) {
       term match {
@@ -653,7 +653,7 @@ object ConstraintGen {
   }
 
   /**
-    * A flow for `lift{arity}b` — mirrors `SolutionLowering.mkGuard`. Arity 0 emits nothing:
+    * A flow for `lift{arity}b` — mirrors [[SpecializeAndLower.mkGuard]]. Arity 0 emits nothing:
     * there is no `lift0b`.
     */
   private def guardLiftFlow(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
@@ -662,7 +662,7 @@ object ConstraintGen {
   }
 
   /**
-    * A flow for `lift{inArity}X{outArity}` — mirrors `SolutionLowering.mkFunctional`.
+    * A flow for `lift{inArity}X{outArity}` — mirrors [[SpecializeAndLower.mkFunctional]].
     */
   private def functionalLiftFlow(cparams0: List[TypedAst.ConstraintParam], outArity: Int, exp0: TypedAst.Expr)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     val inVars = MonomorphHelpers.quantifiedVars(cparams0, exp0)
@@ -674,7 +674,7 @@ object ConstraintGen {
     sctx.addFlow(FlowConstraint(Instantiation((inVars.map(_._2) ++ outTypes).map(typeToMonoArg)), MonoVar.Def(Defs.LiftXM(inVars.length, outArity))))
   }
 
-  /** Flows for `lattice`/`box`/`Denotation` — mirrors `SolutionLowering.mkDenotation`. */
+  /** Flows for `lattice`/`box`/`Denotation` — mirrors [[SpecializeAndLower.mkDenotation]]. */
   private def latticeFlows(den: Denotation, lastTermType: Option[Type], loc: SourceLocation)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = den match {
     case Denotation.Relational =>
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(Types.Boxed))), MonoVar.Enum(Enums.Denotation)))
@@ -684,19 +684,19 @@ object ConstraintGen {
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(tpe))), MonoVar.Def(Defs.LatticeBox)))
   }
 
-  /** Returns `t` from `Vector[t]` — mirrors `SolutionLowering.unwrapVectorType`. */
+  /** Returns `t` from `Vector[t]` — mirrors [[SpecializeAndLower.unwrapVectorType]]. */
   private def unwrapVectorType(tpe0: Type): Type = Type.eraseAliases(tpe0) match {
     case Type.Apply(Type.Cst(TypeConstructor.Vector, _), extType, _) => extType
     case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Vector, _), _, _), but got $t", tpe0.loc)
   }
 
-  /** Mirrors `SolutionLowering.predicatesOfExtVar`. */
+  /** Mirrors [[SpecializeAndLower.predicatesOfExtVar]]. */
   private def predicatesOfExtVar(tpe0: Type): List[(Name.Pred, List[Type])] = Type.eraseAliases(tpe0) match {
     case Type.Apply(Type.Cst(TypeConstructor.Extensible, _), tpe1, _) => predicatesOfSchemaRow(tpe1)
     case t => throw InternalCompilerException(s"Expected Type.Apply(Type.Cst(TypeConstructor.Extensible, _), _, _), but got $t", tpe0.loc)
   }
 
-  /** Mirrors `SolutionLowering.predicatesOfSchemaRow`. */
+  /** Mirrors [[SpecializeAndLower.predicatesOfSchemaRow]]. */
   private def predicatesOfSchemaRow(row: Type): List[(Name.Pred, List[Type])] = row match {
     case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SchemaRowExtend(pred), _), rel, _), tpe2, _) =>
       (pred, termTypesOfRelation(rel)) :: predicatesOfSchemaRow(tpe2)
@@ -706,7 +706,7 @@ object ConstraintGen {
   }
 
   /**
-    * Mirrors `SolutionLowering.termTypesOfRelation`. Unlike it, a `Type.Var` tail — the
+    * Mirrors [[SpecializeAndLower.termTypesOfRelation]]. Unlike it, a `Type.Var` tail — the
     * relation's own arity trailing off unconstrained, not a term type — is skipped, not an error.
     */
   private def termTypesOfRelation(rel: Type): List[Type] = {

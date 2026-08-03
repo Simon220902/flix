@@ -47,7 +47,7 @@ private[monomorph2] object MonomorphHelpers {
     instances.map { case (sym, inst) => ((sym, inst.tpe.typeConstructor.get), inst) }.toMap
 
   /**
-    * Mirrors `SolutionLowering.lowerType`'s Sender/Receiver case. Only for `@LoweringTargetChannel`
+    * Mirrors [[SpecializeAndLower.lowerType]]'s Sender/Receiver case. Only for `@LoweringTargetChannel`
     * flow keys — using it in `typeToMonoArg` generally would corrupt ordinary defs' keys.
     */
   def lowerChannelType(tpe: Type): Type = tpe match {

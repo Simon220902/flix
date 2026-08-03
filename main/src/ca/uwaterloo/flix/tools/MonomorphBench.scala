@@ -81,7 +81,7 @@ object MonomorphBench {
     crudeMemoryMb: Long,
     // Def sub-category breakdown — only ever populated for the constraint-based pipeline (via
     // FlixEvent.AfterMonomorphCategories); the demand-driven baseline has no equivalent, so these
-    // stay None on a "baseline" Metrics. See SolutionSpecialization.scala's Context doc comment.
+    // stay None on a "baseline" Metrics. See Specialize.scala's Context doc comment.
     regularDefs: Option[Int] = None,
     instanceDefs: Option[Int] = None,
     defaultSigImpls: Option[Int] = None,
@@ -95,7 +95,7 @@ object MonomorphBench {
     // work landed in the "Monomorpher" phase. NOT the same thing as crudeMemoryMb: this is total
     // bytes *allocated* (includes anything since garbage-collected), not a point-in-time heap
     // snapshot — a churn/pressure signal, not a working-set size. Scope is also narrower than the
-    // whole monomorph super-phase: only SolutionSpecialization/Specialization (both already
+    // whole monomorph super-phase: only Specialize/Specialization (both already
     // instrumented with flix.profile calls) are covered — ConstraintCollection/ConstraintSolver
     // have no such instrumentation at all, so this says nothing about the new pipeline's
     // suspected-heaviest part (materializing the whole flow-constraint graph up front). Confirmed

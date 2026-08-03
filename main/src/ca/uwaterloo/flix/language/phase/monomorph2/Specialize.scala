@@ -34,11 +34,11 @@ import scala.jdk.CollectionConverters.*
   * restrictable-enum in a single parallel pass.
   *
   * `run` is the entry point and owns the `SharedContext` lookup tables (`defTable`/`enumTable`/
-  * `structTable`). The per-def specialize+lower walk itself lives in `[[SolutionLowering.visitDef]]`,
+  * `structTable`). The per-def specialize+lower walk itself lives in [[SpecializeAndLower.visitDef]],
   * which calls back into `lookupSym`/`lookupCaseSym`/`lookupStructSym`/`resolveSigSym` here to
   * resolve each call/tag/struct site.
   */
-object SolutionSpecialize {
+object Specialize {
 
   /**
     * Accumulates specialized defs; unlike `Specialization.SharedContext` there is no work queue, since
@@ -51,7 +51,7 @@ object SolutionSpecialize {
     * to a regular `EnumSym`: restrictable enums lower to regular enums (the restriction itself is
     * erased, checking already concluded), so they need no fresh-symbol infrastructure of their own.
     *
-    * Package-visible: `[[SolutionLowering]]` needs it as the type its `sctx` implicit is threaded
+    * Package-visible: [[SpecializeAndLower]] needs it as the type its `sctx` implicit is threaded
     * through.
     */
   private[monomorph2] class SharedContext(
@@ -60,7 +60,7 @@ object SolutionSpecialize {
     val enumTable: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym],
     val structTable: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym],
     val restrictableEnumTable: Map[(Symbol.RestrictableEnumSym, List[Type]), Symbol.EnumSym],
-    // Carried here (rather than as a separate implicit threaded through every SolutionLowering
+    // Carried here (rather than as a separate implicit threaded through every [[SpecializeAndLower]]
     // helper) solely for the fused walk's ApplySig case, which calls resolveSigSym.
     val instances: Map[(Symbol.TraitSym, TypeConstructor), Instance]
   ) {
@@ -93,7 +93,7 @@ object SolutionSpecialize {
     * - Parametric defs: must be in `defTable` (pre-populated from the solver solution); a miss
     *   crashes with "Solver gap", identifying a constraint-generator gap.
     *
-    * Package-visible: `SolutionLowering.lookup` also calls this directly to resolve
+    * Package-visible: [[SpecializeAndLower.lookup]] also calls this directly to resolve
     * lowering-synthesized calls (e.g. channel support functions).
     */
   private[monomorph2] def lookupSym(sym: Symbol.DefnSym, it: Type)
@@ -239,7 +239,7 @@ object SolutionSpecialize {
             TypedAst.FormalParam(varSym, StrictSubstitution.empty(tpe), src, decreasing, fpLoc)
         }
         // declaredScheme.base needs the same canonicalization as fparams/retTpe/eff below — its
-        // only consumer, SolutionLowering.lowerSpec, feeds it straight into functionType, and an
+        // only consumer, [[SpecializeAndLower.lowerSpec]], feeds it straight into functionType, and an
         // un-canonicalized type doesn't structurally match enumTable/structTable's keys (built
         // from canonicalized tuples throughout), so rewriteEnumStructType silently misses.
         val canonScheme = declaredScheme.copy(base = StrictSubstitution.empty(declaredScheme.base))
@@ -306,7 +306,7 @@ object SolutionSpecialize {
     * (which may themselves need rewriting, e.g. `List[Option[Int32]]` needs both `List` and
     * `Option` rewritten if both were specialized).
     *
-    * Package-visible: `SolutionLowering.visitType` calls this inline at every type-construction
+    * Package-visible: [[SpecializeAndLower.visitType]] calls this inline at every type-construction
     * site in the fused walk (folding this rewrite into the same pass instead of a separate
     * post-pass over the whole tree).
     */
@@ -340,7 +340,7 @@ object SolutionSpecialize {
   /**
     * Applies [[rewriteEnumStructType]] to `fp`'s type.
     *
-    * Package-visible: `SolutionLowering`'s per-def walk calls this directly wherever it lowers an
+    * Package-visible: [[SpecializeAndLower]]'s per-def walk calls this directly wherever it lowers an
     * already-specialized formal param.
     */
   private[monomorph2] def rewriteFormalParam(fp: MonoAst.FormalParam)(implicit sctx: SharedContext): MonoAst.FormalParam =
@@ -350,7 +350,7 @@ object SolutionSpecialize {
     * Applies [[rewriteEnumStructType]] to every op's `Spec` in `eff`.
     *
     * An op's `Spec` is lowered independently of any def body, so it never passes through
-    * `SolutionLowering.visitType`'s inline rewrite; this explicit post-pass is what keeps it
+    * [[SpecializeAndLower.visitType]]'s inline rewrite; this explicit post-pass is what keeps it
     * consistent with `TypeVerifier`'s enumSym-matches-embedded-type invariant.
     */
   private def rewriteEffect(eff: MonoAst.Effect)(implicit sctx: SharedContext): MonoAst.Effect =
@@ -471,14 +471,14 @@ object SolutionSpecialize {
     // case-set index is always the first solved type argument — see ConstraintCollection's
     // fromRestrictableEnums), and (b) the built declaration is an ordinary TypedAst.Enum, not a
     // TypedAst.RestrictableEnum — restrictable enums lower to regular enums, so their specialized
-    // copies can go straight through the same SolutionLowering.lowerEnum as regular enums.
+    // copies can go straight through the same [[SpecializeAndLower.lowerEnum]] as regular enums.
     val restrictableEnumEntries: List[(Symbol.RestrictableEnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
       for {
         (sym, tuples) <- solution.restrictableEnums.toList
         enm           <- root.restrictableEnums.get(sym).toList
         tuple         <- tuples.toList
         substMap       = (enm.index :: enm.tparams).zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
-        freshSym       = Symbol.freshEnumSym(SolutionLowering.lowerRestrictableEnumSym(sym))
+        freshSym       = Symbol.freshEnumSym(SpecializeAndLower.lowerRestrictableEnumSym(sym))
         subst         <- try {
                            List(StrictSubstitution.mk(Substitution(substMap)))
                          } catch {
@@ -536,7 +536,7 @@ object SolutionSpecialize {
     }, sortBy = (p: (Symbol.DefnSym, TypedAst.Def)) => sortBySize(p._2)) {
       case (sym, defn) => flix.profile(defn.sym, defn.loc) {
         sctx.incrementDefCategory(if (defToInst.contains(sym)) "instanceDefs" else "regularDefs")
-        sctx.addSpecializedDef(sym, SolutionLowering.visitDef(sym, defn, StrictSubstitution.empty))
+        sctx.addSpecializedDef(sym, SpecializeAndLower.visitDef(sym, defn, StrictSubstitution.empty))
       }
     }
 
@@ -548,20 +548,20 @@ object SolutionSpecialize {
           else if (defaultSigDefs.contains(defn.sym)) "defaultSigImpls"
           else "regularDefs"
         sctx.incrementDefCategory(category)
-        sctx.addSpecializedDef(freshSym, SolutionLowering.visitDef(freshSym, defn, subst))
+        sctx.addSpecializedDef(freshSym, SpecializeAndLower.visitDef(freshSym, defn, subst))
       }
     }
 
     val effects = ParOps.parMapValues(root.effects) {
       case TypedAst.Effect(doc, ann, mod, sym, targs, ops0, loc) =>
         val ops = ops0.map(visitEffectOp)
-        rewriteEffect(SolutionLowering.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc)))
+        rewriteEffect(SpecializeAndLower.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc)))
     }
 
     // Generic originals (tparams.nonEmpty) are dropped: every reachable instantiation already has
     // a specialized copy in enumEntries (built from the solver solution above), and every
     // construction/pattern site is routed there via the strict lookupCaseSym/lookupStructSym —
-    // including SolutionLowering's Datalog runtime enums (Fixpoint3.Ast.*, `FList`, `PredSym`,
+    // including [[SpecializeAndLower]]'s Datalog runtime enums (Fixpoint3.Ast.*, `FList`, `PredSym`,
     // `Denotation`), which are ordinary solver-predicted instantiations like any other. Only
     // non-parametric declarations keep their original sym, since they were never specialized in
     // the first place. Restrictable enums have no non-parametric case at all (their type-argument
@@ -569,27 +569,27 @@ object SolutionSpecialize {
     // replaces them the same way.
     val enums = ParOps.parMapValues(root.enums.filter { case (_, e) => e.tparams.isEmpty }) {
       case TypedAst.Enum(doc, ann, mod, sym, tparams, derives, cases, loc) =>
-        SolutionLowering.lowerEnum(TypedAst.Enum(doc, ann, mod, sym, tparams, derives, MapOps.mapValues(cases)(visitEnumCase), loc))
+        SpecializeAndLower.lowerEnum(TypedAst.Enum(doc, ann, mod, sym, tparams, derives, MapOps.mapValues(cases)(visitEnumCase), loc))
     }
 
     // One specialized declaration (fresh sym, renamed cases, ground field types, tparams = Nil)
     // per (sym, tuple) the solver actually found reachable — see enumEntries above and
     // lookupCaseSym, which is what makes expressions actually reference these fresh syms.
     val specializedEnums: Map[Symbol.EnumSym, MonoAst.Enum] =
-      ParOps.parMap(enumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SolutionLowering.lowerEnum(newEnum) }.toMap
+      ParOps.parMap(enumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SpecializeAndLower.lowerEnum(newEnum) }.toMap
 
     // Same shape as specializedEnums, per restrictableEnumEntries — see lookupRestrictableCaseSym,
     // which is what makes Expr.RestrictableTag/RestrictableChoosePattern reference these fresh syms.
     val specializedRestrictableEnums: Map[Symbol.EnumSym, MonoAst.Enum] =
-      ParOps.parMap(restrictableEnumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SolutionLowering.lowerEnum(newEnum) }.toMap
+      ParOps.parMap(restrictableEnumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SpecializeAndLower.lowerEnum(newEnum) }.toMap
 
     val structs = ParOps.parMapValues(root.structs.filter { case (_, s) => s.tparams.isEmpty }) {
       case TypedAst.Struct(doc, ann, mod, sym, tparams, sc, fields, loc) =>
-        SolutionLowering.lowerStruct(TypedAst.Struct(doc, ann, mod, sym, tparams, sc, MapOps.mapValues(fields)(visitStructField), loc))
+        SpecializeAndLower.lowerStruct(TypedAst.Struct(doc, ann, mod, sym, tparams, sc, MapOps.mapValues(fields)(visitStructField), loc))
     }
 
     val specializedStructs: Map[Symbol.StructSym, MonoAst.Struct] =
-      ParOps.parMap(structEntries) { case (_, _, freshSym, newStruct) => freshSym -> SolutionLowering.lowerStruct(newStruct) }.toMap
+      ParOps.parMap(structEntries) { case (_, _, freshSym, newStruct) => freshSym -> SpecializeAndLower.lowerStruct(newStruct) }.toMap
 
     // Diagnostic only (see SharedContext.defCategoryCounts) — no equivalent exists for the
     // demand-driven baseline (Specialization.scala), so MonomorphBench must treat this as
