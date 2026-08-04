@@ -29,17 +29,22 @@ import scala.collection.mutable
 /**
   * Solves the flow constraints produced by [[ConstraintGen]] to a fixpoint: starting from
   * the ground (all-constant) flows, each newly solved instantiation is substituted into the
-  * flows that depend on it until no new instantiations appear. Sig destinations are additionally
-  * dispatched to their implementing (or default) def. The result is, per polymorphic symbol, the
-  * set of ground instantiations it must be specialized at.
+  * flows that depend on it until no new instantiations appear.
+  *
+  * TODO Maybe add an example?
+  *
+  * Sig destinations are additionally dispatched to their implementing (or default) def.
+  *
+  * The result is, per polymorphic symbol, the set of ground instantiations it must be
+  * specialized at.
   */
 object ConstraintSolver {
 
   /**
     * Solves `flows` to a fixpoint and returns the set of required specializations.
     *
-    * Callers must run [[NonMonomorphizableCheck.checkMonomorphizable]] first; without it, a
-    * non-monomorphizable flow set makes the fixpoint loop grow without bound.
+    * Callers must run [[NonMonomorphizableCheck.checkMonomorphizable]] first to make
+    * sure that the fixpoint loop will not grow without bound.
     */
   def solve(flows: List[FlowConstraint], root: TypedAst.Root)(implicit flix: Flix): Solution = flix.phase("ConstraintSolver") {
     val instanceMap = MonomorphHelpers.mkInstanceMap(root.instances)
@@ -47,26 +52,26 @@ object ConstraintSolver {
     val dependents  = buildDependents(prepared)
 
     // [[SpecializeAndLower]] looks up @LoweringTargetChannel defs by a key already run through
-    // lowerChannelType, so their solved tuples need the same rewrite here.
+    // lowerChannelType, so their solved instantiations need the same rewrite here.
     val channelDefs = Set(Defs.ChannelGet, Defs.ChannelPut, Defs.ChannelNewTuple, Defs.ChannelMpmcAdmin, Defs.ChannelUnsafeGetAndUnlock)
 
     val solution  = mutable.Map.empty[MonoVar, mutable.Set[List[Type]]]
     val inFlight  = mutable.Set.empty[(MonoVar, List[Type])]
     val worklist  = mutable.Queue.empty[(MonoVar, List[Type])]
 
-    def enqueue(dst: MonoVar, tuple0: List[Type]): Unit = {
-      val tuple = dst match {
-        case MonoVar.Def(sym) if channelDefs.contains(sym) => tuple0.map(lowerChannelType)
-        case MonoVar.Def(_)                                => tuple0
-        case MonoVar.Enum(_)                               => tuple0
-        case MonoVar.Sig(_)                                => tuple0
-        case MonoVar.RestrictableEnum(_)                   => tuple0
-        case MonoVar.Struct(_)                             => tuple0
+    def enqueue(dst: MonoVar, inst0: List[Type]): Unit = {
+      val inst = dst match {
+        case MonoVar.Def(sym) if channelDefs.contains(sym) => inst0.map(lowerChannelType)
+        case MonoVar.Def(_)                                => inst0
+        case MonoVar.Enum(_)                               => inst0
+        case MonoVar.Sig(_)                                => inst0
+        case MonoVar.RestrictableEnum(_)                   => inst0
+        case MonoVar.Struct(_)                             => inst0
       }
-      val key = (dst, tuple)
-      if (!solution.get(dst).exists(_.contains(tuple)) && !inFlight.contains(key)) {
+      val key = (dst, inst)
+      if (!solution.get(dst).exists(_.contains(inst)) && !inFlight.contains(key)) {
         inFlight += key
-        worklist.enqueue((dst, tuple))
+        worklist.enqueue((dst, inst))
       }
     }
 
@@ -79,17 +84,17 @@ object ConstraintSolver {
 
     // Fixpoint loop.
     while (worklist.nonEmpty) {
-      val (dst, tuple) = worklist.dequeue()
-      inFlight -= ((dst, tuple))
+      val (dst, inst) = worklist.dequeue()
+      inFlight -= (dst, inst)
 
       val seen = solution.getOrElseUpdate(dst, mutable.Set.empty)
-      if (!seen.contains(tuple)) {
-        seen += tuple
+      if (!seen.contains(inst)) {
+        seen += inst
 
-        // Sig dispatch: resolve to impl def and forward the tuple.
+        // Sig dispatch: resolve to impl def and forward the instantiation.
         dst match {
           case MonoVar.Sig(sigSym) =>
-            for (case (implSym, implArgs) <- resolveSig(sigSym, tuple, root, instanceMap)) {
+            for (case (implSym, implArgs) <- resolveSig(sigSym, inst, root, instanceMap)) {
               enqueue(MonoVar.Def(implSym), implArgs)
             }
           case MonoVar.Def(_)              => ()
@@ -98,20 +103,20 @@ object ConstraintSolver {
           case MonoVar.Struct(_)           => ()
         }
 
-        // Propagate: substitute this MonoVar's new tuple into all dependent flows.
+        // Propagate: substitute this MonoVar's new instantiation into all dependent flows.
         for (pf <- dependents.getOrElse(dst, Nil)) {
-          for (groundTuple <- collapseArgsPrepared(pf, Map(dst -> tuple), root)) {
-            enqueue(pf.dst, groundTuple)
+          for (groundInstantiation <- collapseArgsPrepared(pf, Map(dst -> inst), root)) {
+            enqueue(pf.dst, groundInstantiation)
           }
         }
       }
     }
 
     Solution(
-      defs = solution.collect { case (MonoVar.Def(sym), tuples) => sym -> tuples.toSet }.toMap,
-      enums = solution.collect { case (MonoVar.Enum(sym), tuples) => sym -> tuples.toSet }.toMap,
-      structs = solution.collect { case (MonoVar.Struct(sym), tuples) => sym -> tuples.toSet }.toMap,
-      restrictableEnums = solution.collect { case (MonoVar.RestrictableEnum(sym), tuples) => sym -> tuples.toSet }.toMap
+      defs = solution.collect { case (MonoVar.Def(sym), insts) => sym -> insts.toSet }.toMap,
+      enums = solution.collect { case (MonoVar.Enum(sym), insts) => sym -> insts.toSet }.toMap,
+      structs = solution.collect { case (MonoVar.Struct(sym), insts) => sym -> insts.toSet }.toMap,
+      restrictableEnums = solution.collect { case (MonoVar.RestrictableEnum(sym), insts) => sym -> insts.toSet }.toMap
     )
   }(MonomorphDebug.DebugSolution)
 
@@ -129,8 +134,9 @@ object ConstraintSolver {
 
   /**
     * Assembles a plain (possibly non-ground) `Type` from `arg`: `Param(v, i)` becomes
-    * `bindings(v)(i)`, or `None` if `v` has no (long enough) tuple yet — "not ready, try again
-    * later". No defaulting or canonicalization happens here; [[collapseArg]] does that once on
+    * `bindings(v)(i)`, or `None` if `v` has no (long enough) instantiation yet
+    * — "not ready, try again later".
+    * No defaulting or canonicalization happens here; [[collapseArg]] does that once on
     * the whole assembled type.
     */
   private def assembleArg(arg: MonoArg, bindings: Map[MonoVar, List[Type]]): Option[Type] = arg match {
@@ -168,9 +174,9 @@ object ConstraintSolver {
 
   /**
     * A flow with its Param-free arg positions collapsed once, up front: such a position collapses
-    * to the same result on every tuple the flow is reconsidered for. `preCollapsed(i)` is
+    * to the same result on every instantiation the flow is reconsidered for. `preCollapsed(i)` is
     * `Some(result)` for a Param-free position and `None` for one that must still be collapsed
-    * per-tuple via `bindings`.
+    * per-instantiation via `bindings`.
     */
   private case class PreparedFlow(dst: MonoVar, args: List[MonoArg], preCollapsed: List[Option[Option[Type]]])
 
@@ -184,7 +190,7 @@ object ConstraintSolver {
       PreparedFlow(dst, args, preCollapsed)
   }
 
-  /** Collapses `pf`'s args to a ground tuple, or `None` if any position is not ready. */
+  /** Collapses `pf`'s args to a ground instantiation, or `None` if any position is not ready. */
   private def collapseArgsPrepared(pf: PreparedFlow, bindings: Map[MonoVar, List[Type]], root: TypedAst.Root)
                                    (implicit flix: Flix): Option[List[Type]] = {
     val resolved = pf.args.zip(pf.preCollapsed).map {
@@ -200,7 +206,7 @@ object ConstraintSolver {
     * the specializer's instantiated type cannot structurally diverge for the same instantiation.
     * Returns `None` if the result remains non-ground — a solver gap, not an error, so it fails
     * soft. Defaulting a constrained `Star` var to `AnyType` is safe even when no instance exists:
-    * [[Specialize.run]] discards any speculative tuple whose reduction fails.
+    * [[Specialize.run]] discards any speculative instantiation whose reduction fails.
     */
   private def collapseArg(arg: MonoArg, bindings: Map[MonoVar, List[Type]], root: TypedAst.Root)
                           (implicit flix: Flix): Option[Type] =
@@ -215,27 +221,27 @@ object ConstraintSolver {
     }
 
   /**
-    * Resolves a sig call with type-arg `tuple` to the impl def sym and its type args.
+    * Resolves a sig call with `instantiation` to the impl def sym and its type args.
     * Returns `None` if the instance cannot be found.
     */
   private def resolveSig(
     sigSym: Symbol.SigSym,
-    tuple: List[Type],
+    instantiation: List[Type],
     root: TypedAst.Root,
     instanceMap: Map[(Symbol.TraitSym, TypeConstructor), TypedAst.Instance]
   )(implicit flix: Flix): Option[(Symbol.DefnSym, List[Type])] = {
-    val traitType = tuple.head
+    val traitType = instantiation.head
     for {
       tyCon    <- traitType.typeConstructor
       instance <- instanceMap.get((sigSym.trt, tyCon))
       result   <- instance.defs.find(_.sym.text == sigSym.name) match {
         case Some(implDef) =>
-          val sigOwnArgs = tuple.tail // type args beyond the trait type param
+          val sigOwnArgs = instantiation.tail // type args beyond the trait type param
           instanceArgsFor(instance, traitType, root).map(instanceArgs => (implDef.sym, instanceArgs ++ sigOwnArgs))
 
         case None =>
           // Sig has a default impl; synthesise a sym for the trait-level def. The default impl
-          // belongs to the trait, not the instance, so it forwards the full sig tuple as-is rather
+          // belongs to the trait, not the instance, so it forwards the full sig instantiation as-is rather
           // than the instance's tparam values — but the instantiation still has to be checked for
           // validity, the same way the non-default path above does.
           for {
@@ -243,7 +249,7 @@ object ConstraintSolver {
             _ <- instanceArgsFor(instance, traitType, root)
           } yield {
             val ns = sigSym.trt.namespace :+ sigSym.trt.name
-            (new Symbol.DefnSym(None, ns, sigSym.name, sigSym.loc), tuple)
+            (new Symbol.DefnSym(None, ns, sigSym.name, sigSym.loc), instantiation)
           }
       }
     } yield result
