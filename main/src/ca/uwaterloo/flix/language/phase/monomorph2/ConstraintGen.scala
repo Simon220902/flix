@@ -230,7 +230,7 @@ object ConstraintGen {
   private def entryPointHandlerFlows(defn: TypedAst.Def)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit =
     if (TypedAstOps.isEntryPoint(defn)(root)) {
       val loc = defn.spec.eff.loc
-      val defEffects = Canonicalization.evalEffect(defn.spec.eff)
+      val defEffects = Canonicalization.evalEff(defn.spec.eff)
       val requiredHandlers = root.defaultHandlers.filter(h => defEffects.contains(h.handledSym))
       requiredHandlers.foldLeft(defn.spec.eff) { case (eff, handler) =>
         val handlerDef = root.defs(handler.handlerSym)
