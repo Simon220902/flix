@@ -31,8 +31,6 @@ import scala.collection.mutable
   * the ground (all-constant) flows, each newly solved instantiation is substituted into the
   * flows that depend on it until no new instantiations appear.
   *
-  * TODO Maybe add an example?
-  *
   * Sig destinations are additionally dispatched to their implementing (or default) def.
   *
   * The result is, per polymorphic symbol, the set of ground instantiations it must be
@@ -48,16 +46,16 @@ object ConstraintSolver {
     */
   def solve(flows: List[FlowConstraint], root: TypedAst.Root)(implicit flix: Flix): Solution = flix.phase("ConstraintSolver") {
     val instanceMap = MonomorphHelpers.mkInstanceMap(root.instances)
-    val prepared    = flows.iterator.map(f => prepareFlow(f, root)).toList
-    val dependents  = buildDependents(prepared)
-
-    // [[SpecializeAndLower]] looks up @LoweringTargetChannel defs by a key already run through
-    // lowerChannelType, so their solved instantiations need the same rewrite here.
-    val channelDefs = Set(Defs.ChannelGet, Defs.ChannelPut, Defs.ChannelNewTuple, Defs.ChannelMpmcAdmin, Defs.ChannelUnsafeGetAndUnlock)
+    val pregrounded = flows.iterator.map(f => pregroundFlow(f, root)).toList
+    val dependents  = buildDependents(pregrounded)
 
     val solution  = mutable.Map.empty[MonoVar, mutable.Set[List[Type]]]
     val inFlight  = mutable.Set.empty[(MonoVar, List[Type])]
     val worklist  = mutable.Queue.empty[(MonoVar, List[Type])]
+
+    // Param substitution can reintroduce a raw Sender/Receiver.
+    // It is re-lowered so the key matches [[SpecializeAndLower]]'s lookup.
+    val channelDefs = Set(Defs.ChannelGet, Defs.ChannelPut, Defs.ChannelNewTuple, Defs.ChannelMpmcAdmin, Defs.ChannelUnsafeGetAndUnlock)
 
     def enqueue(dst: MonoVar, inst0: List[Type]): Unit = {
       val inst = dst match {
@@ -75,9 +73,9 @@ object ConstraintSolver {
       }
     }
 
-    // Seed: ground flows (all-Const args) become initial worklist entries.
-    for (pf <- prepared) {
-      for (t <- collapseArgsPrepared(pf, Map.empty, root)) {
+    // Seed: ground flows (all-Const instantiations) become initial worklist entries.
+    for (pf <- pregrounded) {
+      for (t <- groundArgs(pf, Map.empty, root)) {
         enqueue(pf.dst, t)
       }
     }
@@ -85,7 +83,7 @@ object ConstraintSolver {
     // Fixpoint loop.
     while (worklist.nonEmpty) {
       val (dst, inst) = worklist.dequeue()
-      inFlight -= (dst, inst)
+      inFlight -= ((dst, inst))
 
       val seen = solution.getOrElseUpdate(dst, mutable.Set.empty)
       if (!seen.contains(inst)) {
@@ -105,7 +103,7 @@ object ConstraintSolver {
 
         // Propagate: substitute this MonoVar's new instantiation into all dependent flows.
         for (pf <- dependents.getOrElse(dst, Nil)) {
-          for (groundInstantiation <- collapseArgsPrepared(pf, Map(dst -> inst), root)) {
+          for (groundInstantiation <- groundArgs(pf, Map(dst -> inst), root)) {
             enqueue(pf.dst, groundInstantiation)
           }
         }
@@ -120,9 +118,9 @@ object ConstraintSolver {
     )
   }(MonomorphDebug.DebugSolution)
 
-  /** For each MonoVar, the set of (prepared) flows whose args contain `Param(mvar, _)`. */
-  private def buildDependents(flows: List[PreparedFlow]): Map[MonoVar, List[PreparedFlow]] = {
-    val m = mutable.Map.empty[MonoVar, mutable.ListBuffer[PreparedFlow]]
+  /** Return for each MonoVar, the (pregrounded) flows whose args contain `Param(mvar, _)`. */
+  private def buildDependents(flows: List[PregroundedFlow]): Map[MonoVar, List[PregroundedFlow]] = {
+    val m = mutable.Map.empty[MonoVar, mutable.ListBuffer[PregroundedFlow]]
     for (pf <- flows) {
       val mvars = pf.args.flatMap(arg => MonoArg.collectParams(arg)).map(_._1).toSet
       for (v <- mvars) {
@@ -133,38 +131,44 @@ object ConstraintSolver {
   }
 
   /**
-    * Assembles a plain (possibly non-ground) `Type` from `arg`: `Param(v, i)` becomes
-    * `bindings(v)(i)`, or `None` if `v` has no (long enough) instantiation yet
-    * — "not ready, try again later".
-    * No defaulting or canonicalization happens here; [[collapseArg]] does that once on
-    * the whole assembled type.
+    * Substitutes `bindings` into `arg`'s `Param`s.
+    * Returns `None` if some `Param`'s var isn't bound (yet).
     */
-  private def assembleArg(arg: MonoArg, bindings: Map[MonoVar, List[Type]]): Option[Type] = arg match {
+  private def substArg(arg: MonoArg, bindings: Map[MonoVar, List[Type]]): Option[Type] = arg match {
     case MonoArg.Const(t) => Some(t)
-
-    case MonoArg.Param(v, i) => bindings.get(v).flatMap { tup =>
-      if (i < tup.length) Some(tup(i)) else None
-    }
-
+    case MonoArg.Param(v, i) =>
+      for {
+        inst <- bindings.get(v)
+        tpe  <- inst.lift(i)
+      } yield tpe
     case MonoArg.App(head, args) =>
       for {
-        h  <- assembleArg(head, bindings)
-        as <- assembleArgs(args, bindings)
+        h  <- substArg(head, bindings)
+        as <- substArgs(args, bindings)
       } yield as.foldLeft(h) { case (acc, t) => Type.Apply(acc, t, h.loc) }
-
     case MonoArg.Assoc(sym, a, kind, loc) =>
-      assembleArg(a, bindings).map { t =>
+      substArg(a, bindings).map { t =>
         Type.AssocType(SymUse.AssocTypeSymUse(sym, loc), t, kind, loc)
       }
   }
 
-  /** Assembles every arg in `args`, or `None` if any is not ready. */
-  private def assembleArgs(args: List[MonoArg], bindings: Map[MonoVar, List[Type]]): Option[List[Type]] = {
-    val resolved = args.map(assembleArg(_, bindings))
-    if (resolved.forall(_.isDefined)) Some(resolved.map(_.get)) else None
-  }
+  /**
+    * Substitutes `bindings` into every arg in `args`.
+    * Returns `None` if some `Param`'s var isn't bound (yet).
+    */
+  private def substArgs(args: List[MonoArg], bindings: Map[MonoVar, List[Type]]): Option[List[Type]] =
+    sequence(args.map(substArg(_, bindings)))
 
-  /** Rewrites every `Region` constant in `t` to the `IO` effect. */
+  /** `None` if any `x` is. */
+  private def sequence[A](xs: List[Option[A]]): Option[List[A]] =
+    xs.foldRight(Option(List.empty[A])) { (x, acc) =>
+      for {
+        v  <- x
+        vs <- acc
+      } yield v :: vs
+    }
+
+  /** Rewrites every `Region` constant in `t` to `IO`. */
   private def rewriteRegionToIO(t: Type): Type = t match {
     case Type.Cst(TypeConstructor.Region(_), loc) => Type.Cst(TypeConstructor.Effect(Symbol.IO, Kind.Eff), loc)
     case Type.Apply(t1, t2, loc)                  => Type.Apply(rewriteRegionToIO(t1), rewriteRegionToIO(t2), loc)
@@ -172,52 +176,41 @@ object ConstraintSolver {
     case other                                    => other
   }
 
-  /**
-    * A flow with its Param-free arg positions collapsed once, up front: such a position collapses
-    * to the same result on every instantiation the flow is reconsidered for. `preCollapsed(i)` is
-    * `Some(result)` for a Param-free position and `None` for one that must still be collapsed
-    * per-instantiation via `bindings`.
+  /** A [[FlowConstraint]] with each Param-free arg position pre-grounded once, since those can't
+    * change on retry. `preGrounded(i)` is `None` iff position `i` still has a `Param`.
     */
-  private case class PreparedFlow(dst: MonoVar, args: List[MonoArg], preCollapsed: List[Option[Option[Type]]])
+  private case class PregroundedFlow(dst: MonoVar, args: List[MonoArg], preGrounded: List[Option[Type]])
 
-  /** Returns `flow` with its Param-free positions pre-collapsed. */
-  private def prepareFlow(flow: FlowConstraint, root: TypedAst.Root)(implicit flix: Flix): PreparedFlow = flow match {
+  /** Returns `flow` with its Param-free positions pre-grounded. */
+  private def pregroundFlow(flow: FlowConstraint, root: TypedAst.Root)(implicit flix: Flix): PregroundedFlow = flow match {
     case FlowConstraint(Instantiation(args), dst) =>
-      val preCollapsed = args.map { arg =>
-        if (MonoArg.collectParams(arg).isEmpty) Some(collapseArg(arg, Map.empty, root))
-        else None
+      val preGrounded = args.map { arg =>
+        if (MonoArg.collectParams(arg).nonEmpty) None
+        else groundArg(arg, Map.empty, root)
       }
-      PreparedFlow(dst, args, preCollapsed)
+      PregroundedFlow(dst, args, preGrounded)
   }
 
-  /** Collapses `pf`'s args to a ground instantiation, or `None` if any position is not ready. */
-  private def collapseArgsPrepared(pf: PreparedFlow, bindings: Map[MonoVar, List[Type]], root: TypedAst.Root)
-                                   (implicit flix: Flix): Option[List[Type]] = {
-    val resolved = pf.args.zip(pf.preCollapsed).map {
-      case (_, Some(precomputed)) => precomputed
-      case (arg, None)            => collapseArg(arg, bindings, root)
-    }
-    if (resolved.forall(_.isDefined)) Some(resolved.map(_.get)) else None
-  }
+  /** Grounds `pf`'s args to a ground instantiation, or `None` if any position is not ready. */
+  private def groundArgs(pf: PregroundedFlow, bindings: Map[MonoVar, List[Type]], root: TypedAst.Root)
+                         (implicit flix: Flix): Option[List[Type]] =
+    sequence(pf.args.zip(pf.preGrounded).map {
+      case (_, Some(t)) => Some(t)
+      case (arg, None)  => groundArg(arg, bindings, root)
+    })
 
   /**
-    * Collapses `arg` to a ground type: assembles it (see [[assembleArg]]), then defaults and
-    * canonicalizes via the shared [[Canonicalization]] pipeline, so the solver's collapsed type and
-    * the specializer's instantiated type cannot structurally diverge for the same instantiation.
-    * Returns `None` if the result remains non-ground — a solver gap, not an error, so it fails
-    * soft. Defaulting a constrained `Star` var to `AnyType` is safe even when no instance exists:
-    * [[Specialize.run]] discards any speculative instantiation whose reduction fails.
+    * Grounds `arg` via [[substArg]] and the shared [[Canonicalization]] pipeline.
     */
-  private def collapseArg(arg: MonoArg, bindings: Map[MonoVar, List[Type]], root: TypedAst.Root)
+  private def groundArg(arg: MonoArg, bindings: Map[MonoVar, List[Type]], root: TypedAst.Root)
                           (implicit flix: Flix): Option[Type] =
-    assembleArg(arg, bindings).flatMap { raw =>
+    substArg(arg, bindings).map { raw =>
       val defaulted = rewriteRegionToIO(raw).map(Canonicalization.default)
-      try {
-        val result = Canonicalization.simplify(defaulted, isGround = true)(root, flix)
-        if (result.typeVars.nonEmpty) None else Some(result)
-      } catch {
-        case _: InternalCompilerException => None
+      val result = Canonicalization.simplify(defaulted, isGround = true)(root, flix)
+      if (result.typeVars.nonEmpty) {
+        throw InternalCompilerException(s"Defaulted arg did not fully ground: $result", result.loc)
       }
+      result
     }
 
   /**
@@ -240,10 +233,8 @@ object ConstraintSolver {
           instanceArgsFor(instance, traitType, root).map(instanceArgs => (implDef.sym, instanceArgs ++ sigOwnArgs))
 
         case None =>
-          // Sig has a default impl; synthesise a sym for the trait-level def. The default impl
-          // belongs to the trait, not the instance, so it forwards the full sig instantiation as-is rather
-          // than the instance's tparam values — but the instantiation still has to be checked for
-          // validity, the same way the non-default path above does.
+          // No impl def: sig has a default impl. Synthesize a trait-level sym and forward the
+          // instantiation as-is (the default belongs to the trait, not the instance).
           for {
             _ <- root.sigs(sigSym).exp
             _ <- instanceArgsFor(instance, traitType, root)
@@ -255,16 +246,14 @@ object ConstraintSolver {
     } yield result
   }
 
-  /**
-    * Unifies `instance`'s declared type against `traitType` (the sig call's own trait-type-param
-    * argument) and returns the resulting values of `instance`'s type params, in order. `None` if
-    * the instantiation doesn't unify or leaves some instance type param unresolved.
+  /** Unifies `instance`'s type against `traitType`, returning its tparams' values in order.
+    * `None` if unification fails or leaves some tparam unresolved.
     */
   private def instanceArgsFor(instance: TypedAst.Instance, traitType: Type, root: TypedAst.Root)
                               (implicit flix: Flix): Option[List[Type]] =
     if (instance.tparams.isEmpty) Some(Nil)
-    else ConstraintSolver2.fullyUnify(instance.tpe, traitType, RegionScope.Top, RigidityEnv.empty)(root.eqEnv, flix).flatMap { subst =>
-      val args = instance.tparams.map(tp => subst.m.get(tp.sym))
-      if (args.exists(_.isEmpty)) None else Some(args.map(_.get))
-    }
+    else for {
+      subst <- ConstraintSolver2.fullyUnify(instance.tpe, traitType, RegionScope.Top, RigidityEnv.empty)(root.eqEnv, flix)
+      args  <- sequence(instance.tparams.map(tp => subst.m.get(tp.sym)))
+    } yield args
 }
