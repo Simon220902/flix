@@ -26,23 +26,21 @@ import ca.uwaterloo.flix.util.collection.CofiniteSet
 import scala.collection.immutable.SortedSet
 
 /**
-  * The single, shared definition of "what a given (possibly non-ground) monomorph type becomes":
-  * effect canonicalization, associated-type reduction, and defaulting of unresolved kinds.
+  * Shared definition of what a given (possibly non-ground) monomorph type becomes:
+  * effect canonicalization and associated-type reduction.
   *
-  * Both the solver ([[ConstraintSolver]], which computes types symbolically, ahead of time) and
-  * the specializer ([[Specialize]], which computes the logically same types
-  * concretely, at an actual call site) must agree on this, or their `(sym, type)` defTable keys
-  * diverge for the same instantiation.
+  * Both [[ConstraintSolver]] and [[Specialize]] must agree on this, or
+  * their `(sym, type)` defTable keys diverge for the same instantiation.
   */
 private[monomorph2] object Canonicalization {
 
-  /** Returns the canonical effect equivalent to `eff`. */
+  /** Puts the effect formula `eff` into canonical form. */
   def canonicalEffect(eff: Type): Type = coSetToType(evalEff(eff), eff.loc)
 
   /**
-    * Evaluates `eff`.
+    * Evaluates the effect formula `eff` to a set of atomic effects.
     *
-    * N.B.: `eff` must be simplified and ground.
+    * N.B. Throws [[InternalCompilerException]] if `eff` is not simplified and ground.
     */
   def evalEff(eff: Type): CofiniteSet[Symbol.EffSym] = eff match {
     case Type.Univ                                                                      => CofiniteSet.universe
@@ -58,13 +56,21 @@ private[monomorph2] object Canonicalization {
     case other => throw InternalCompilerException(s"Unexpected effect $other", other.loc)
   }
 
-  /** Returns the [[Type]] representation of `set` with `loc`. */
+  /**
+    * Renders `set` as a [[Type]] (the inverse of [[evalEff]]).
+    * - A finite [[CofiniteSet.Set]] becomes a union of `Effect` constants.
+    * - A [[CofiniteSet.Compl]] becomes the complement of one.
+    */
   def coSetToType(set: CofiniteSet[Symbol.EffSym], loc: SourceLocation): Type = set match {
     case CofiniteSet.Set(s)   => Type.mkUnion(s.toList.map(sym => Type.Cst(TypeConstructor.Effect(sym, Kind.Eff), loc)), loc)
     case CofiniteSet.Compl(s) => Type.mkComplement(Type.mkUnion(s.toList.map(sym => Type.Cst(TypeConstructor.Effect(sym, Kind.Eff), loc)), loc), loc)
   }
 
-  /** Reduces the given associated into its definition, will crash if not able to. */
+  /**
+    * Reduces the associated type `assoc` (e.g. `Foo.Assoc[a]`) to its concrete definition.
+    *
+    * N.B. Throws [[InternalCompilerException]] if `assoc` is not actually reducible.
+    */
   def reduceAssocType(assoc: Type.AssocType)(implicit root: TypedAst.Root, flix: Flix): Type = {
     val progress = Progress()
     val (res, cs) = TypeReduction2.reduce(assoc)(RegionScope.Top, RigidityEnv.empty, progress, root.eqEnv, flix)
@@ -74,11 +80,11 @@ private[monomorph2] object Canonicalization {
   }
 
   /**
-    * Rebuilds `Type.Apply(normalize(tpe1), normalize(tpe2), loc)`, folding ground effect,
-    * bool, and case-set/record-row/schema-row formulas via the same smart constructors used
-    * elsewhere, so the result matches what the specializer's query is built from (e.g. `{Cst} + {}`
-    * collapses to `{Cst}`, not a raw `CaseUnion` node; a ground effect formula collapses to its
-    * canonical union-of-constants form).
+    * Normalizes `app` by rebuilding it via the matching `Type.mk*` function for its head (e.g.
+    * `Type.mkUnion`, `Type.mkCaseUnion`, `Type.mkRecordRowExtend`).
+    *
+    * N.B. If `isGround` and the result has effect kind, it is further canonicalized via
+    * [[canonicalEffect]].
     */
   def normalizeApply(normalize: Type => Type, app: Type.Apply, isGround: Boolean): Type = {
     val Type.Apply(tpe1, tpe2, loc) = app
@@ -110,14 +116,17 @@ private[monomorph2] object Canonicalization {
   }
 
   /**
-    * Removes [[Type.Alias]] and [[Type.AssocType]], or crashes if some [[Type.AssocType]] is not
-    * reducible.
+    * Removes [[Type.Alias]] and [[Type.AssocType]] from `tpe`.
     *
-    * @param isGround If true, then `tpe` will be normalized.
+    * N.B. Throws [[InternalCompilerException]] if `tpe` contains a non-reducible [[Type.AssocType]]
+    * or an unresolved JVM type.
+    *
+    * N.B. If `isGround`, `tpe` is also put into canonical form. Only pass `true` once `tpe` has no
+    * free type variables left.
     */
   def simplify(tpe: Type, isGround: Boolean)(implicit root: TypedAst.Root, flix: Flix): Type = tpe match {
-    case v@Type.Var(_, _)          => v
-    case c@Type.Cst(_, _)          => c
+    case Type.Var(_, _)            => tpe
+    case Type.Cst(_, _)            => tpe
     case app@Type.Apply(_, _, _)   => normalizeApply(simplify(_, isGround), app, isGround)
     case Type.Alias(_, _, t, _)    => simplify(t, isGround)
     case Type.AssocType(symUse, arg0, kind, loc) =>
@@ -149,13 +158,12 @@ private[monomorph2] object Canonicalization {
     case Kind.Error         => throw InternalCompilerException(s"Unexpected type '$tpe0'.", tpe0.loc)
   }
 
-
   /**
     * Returns a sorted record, assuming that `rest` is sorted.
     *
     * labels of the same name are not reordered.
     *
-    * N.B: `rest` must not contain [[Type.AssocType]] or [[Type.Alias]].
+    * N.B. `rest` must not contain [[Type.AssocType]] or [[Type.Alias]].
     */
   private def mkRecordExtendSorted(label: Name.Label, tpe: Type, rest: Type, loc: SourceLocation): Type = rest match {
     case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.RecordRowExtend(l), loc1), t, loc2), r, loc3) if l.name < label.name =>
@@ -176,7 +184,7 @@ private[monomorph2] object Canonicalization {
     *
     * Sorting is stable on duplicate predicates.
     *
-    * Assumes that rest does not contain variables, aliases, or associated types.
+    * N.B. `rest` must not contain variables, aliases, or associated types.
     */
   private def mkSchemaExtendSorted(label: Name.Pred, tpe: Type, rest: Type, loc: SourceLocation): Type = rest match {
     case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SchemaRowExtend(l), loc1), t, loc2), r, loc3) if l.name < label.name =>
