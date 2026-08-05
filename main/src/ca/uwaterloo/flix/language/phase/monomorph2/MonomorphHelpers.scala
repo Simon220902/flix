@@ -22,33 +22,24 @@ import ca.uwaterloo.flix.language.ast.{Symbol, Type, TypeConstructor, TypedAst}
 import ca.uwaterloo.flix.util.collection.ListMap
 
 /**
-  * Generic helpers shared across the constraint-based monomorphization pipeline. Unlike
-  * [[Canonicalization]], nothing here carries a "solver and specializer must agree" contract —
-  * these are plain, reusable tree-walking utilities.
+  * Generic helpers shared across the constraint-based monomorphization pipeline.
   */
 private[monomorph2] object MonomorphHelpers {
 
-  /**
-    * Returns `true` if the given variable symbol `sym` is a quantified variable according to the
-    * given constraint params `cparams0`.
-    *
-    * That is, the variable symbol is *NOT* lexically bound.
-    */
+  /** Returns `true` if `sym` is a quantified (i.e. not lexically bound) variable in `cparams0`. */
   def isQuantifiedVar(sym: Symbol.VarSym, cparams0: List[TypedAst.ConstraintParam]): Boolean =
     cparams0.exists(p => p.bnd.sym == sym)
 
-  /** Returns the free variables of `exp0` that are bound by the constraint params `cparams0`. */
+  /** Returns the free variables of `exp0` that are quantified (bound by `cparams0`). */
   def quantifiedVars(cparams0: List[TypedAst.ConstraintParam], exp0: Expr): List[(Symbol.VarSym, Type)] =
     TypedAstOps.freeVars(exp0).toList.filter { case (sym, _) => isQuantifiedVar(sym, cparams0) }
 
-  // Copied from monomorph.Specialization.mkInstanceMap; keep in sync if that baseline changes.
-  /** Creates a table for fast lookup of instances. */
+  /** Returns a table for fast lookup of instances. */
   def mkInstanceMap(instances: ListMap[Symbol.TraitSym, TypedAst.Instance]): Map[(Symbol.TraitSym, TypeConstructor), TypedAst.Instance] =
     instances.map { case (sym, inst) => ((sym, inst.tpe.typeConstructor.get), inst) }.toMap
 
   /**
-    * Mirrors [[SpecializeAndLower.lowerType]]'s Sender/Receiver case. Only for `@LoweringTargetChannel`
-    * flow keys — using it in `typeToMonoArg` generally would corrupt ordinary defs' keys.
+    * Mirrors [[SpecializeAndLower.lowerType]]'s Sender/Receiver case. (Only for `@LoweringTargetChannel` types)
     */
   def lowerChannelType(tpe: Type): Type = tpe match {
     case Type.Apply(Type.Cst(TypeConstructor.Sender, loc), elm, _) =>
