@@ -16,11 +16,8 @@
 
 package ca.uwaterloo.flix.language.phase.monomorph2
 
-import ca.uwaterloo.flix.language.ast.Kind.kindArgs
-import ca.uwaterloo.flix.language.ast.{Kind, SourceLocation, Type, TypeConstructor}
+import ca.uwaterloo.flix.language.ast.{Kind, SourceLocation}
 import ca.uwaterloo.flix.util.{Graph, InternalCompilerException}
-
-import scala.annotation.tailrec
 
 /**
   * The purpose of this phase is to reject non-monomorphizable programs (i.e. programs with
@@ -101,7 +98,7 @@ object NonMonomorphizableCheck {
     */
   private def isGrowingHead(arg: MonoArg): Boolean = arg match {
     // a direct copy, never growth
-    case MonoArg.Param(_, _) => false
+    case MonoArg.Param(_, _)                => false
     // set algebra doesn't count as nesting
     case MonoArg.App(MonoArg.Const(tpe), _) =>
       Kind.resultKind(tpe.kind) match {
@@ -110,9 +107,9 @@ object NonMonomorphizableCheck {
         case Kind.CaseSet(_) => false
         case _               => true
       }
-    case MonoArg.App(_, _)                              => true
-    case MonoArg.Const(_)                               => true
-    case MonoArg.Assoc(_, _, _, _)                      => true
+    case MonoArg.App(_, _)                  => true
+    case MonoArg.Const(_)                   => true
+    case MonoArg.Assoc(_, _, _, _)          => true
   }
 
   /** Returns the source location of `mvar`'s declaration. */
