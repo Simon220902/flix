@@ -56,7 +56,7 @@ object SpecializeAndLower {
   private def lowerType(tpe0: Type): Type = tpe0.typeConstructor match {
     case Some(TypeConstructor.Schema) =>
       // Erase every Schema type, regardless of its polymorphic type applications, to the Datalog type.
-      Types.Datalog
+      Types.Fixpoint.Ast.Datalog.Datalog
     case _ => lowerTypeNonSchema(tpe0)
   }
 
@@ -271,7 +271,7 @@ object SpecializeAndLower {
         val expTpe = subst(exp.tpe)
         val typeArg = expTpe.typeArguments.headOption.getOrElse(
           throw InternalCompilerException(s"Expected ProxyEff[ef] type, got $expTpe", loc))
-        val purityEnumSym = Enums.Purity
+        val purityEnumSym = Enums.Reflect.Purity
         val caseName = typeArg match {
           case Type.Cst(TypeConstructor.Pure, _) => "Pure"
           case _                                 => "Impure"
@@ -283,7 +283,7 @@ object SpecializeAndLower {
         val expTpe = subst(exp.tpe)
         val typeArg = expTpe.typeArguments.headOption.getOrElse(
           throw InternalCompilerException(s"Expected Proxy[t] type, got $expTpe", loc))
-        val jvmTypeEnumSym = Enums.JvmType
+        val jvmTypeEnumSym = Enums.Reflect.JvmType
         val caseName = jvmTypeCaseName(typeArg.baseType)
         val caseSym = findCaseSym(jvmTypeEnumSym, caseName)
         MonoAst.Expr.ApplyAtomic(AtomicOp.Tag(caseSym), Nil, Type.mkEnum(jvmTypeEnumSym, Nil, loc), Type.Pure, loc)
@@ -291,7 +291,7 @@ object SpecializeAndLower {
       case SemanticOp.ReflectOp.ReflectValue =>
         val e = visitExp(exp, env0, subst)
         val expTpe = subst(exp.tpe)
-        val jvmValueEnumSym = Enums.JvmValue
+        val jvmValueEnumSym = Enums.Reflect.JvmValue
         val resultType = Type.mkEnum(jvmValueEnumSym, Nil, loc)
         val caseName = jvmTypeCaseName(expTpe.baseType)
         val caseSym = findCaseSym(jvmValueEnumSym, caseName)
@@ -740,18 +740,18 @@ object SpecializeAndLower {
 
     case TypedAst.Expr.FixpointLambda(pparams, exp, _, eff, loc) =>
       // Synthesizes a predicate rename via the Fixpoint solver's rename function.
-      val resultType = Types.Datalog
-      val defn = lookupSym(Defs.Rename, resultType)
-      val predExps = mkList(pparams.map(pparam => mkPredSym(pparam.pred)), Types.PredSym, loc)
+      val resultType = Types.Fixpoint.Ast.Datalog.Datalog
+      val defn = lookupSym(Defs.Fixpoint.Solver.Rename, resultType)
+      val predExps = mkList(pparams.map(pparam => mkPredSym(pparam.pred)), Types.Fixpoint.Ast.Shared.PredSym, loc)
       val argExps = predExps :: visitExp(exp, env0, subst) :: Nil
-      MonoAst.Expr.ApplyDef(defn, argExps, Types.RenameType, resultType, subst(eff), loc)
+      MonoAst.Expr.ApplyDef(defn, argExps, Types.Fixpoint.Solver.RenameType, resultType, subst(eff), loc)
 
     case TypedAst.Expr.FixpointMerge(exp1, exp2, _, eff, loc) =>
       // Synthesizes a call to the Fixpoint solver's merge function.
-      val resultType = Types.Datalog
-      val defn = lookupSym(Defs.Merge, resultType)
+      val resultType = Types.Fixpoint.Ast.Datalog.Datalog
+      val defn = lookupSym(Defs.Fixpoint.Solver.Union, resultType)
       val argExps = visitExp(exp1, env0, subst) :: visitExp(exp2, env0, subst) :: Nil
-      MonoAst.Expr.ApplyDef(defn, argExps, Types.MergeType, resultType, subst(eff), loc)
+      MonoAst.Expr.ApplyDef(defn, argExps, Types.Fixpoint.Solver.MergeType, resultType, subst(eff), loc)
 
     case TypedAst.Expr.FixpointQueryWithProvenance(exps, select, withh, tpe0, eff, loc) =>
       // Synthesizes a call to the Fixpoint solver's provenanceOf function.
@@ -1211,7 +1211,7 @@ object SpecializeAndLower {
     // itpe is the def-lookup key: computed and used raw (un-rewritten), matching every other
     // lookup-key position in the fused walk — only the node's own field positions get rewritten.
     val itpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
-    val defnSym = lookupSym(Defs.ChannelNewTuple, itpe)
+    val defnSym = lookupSym(Defs.Concurrent.Channel.NewChannelTuple, itpe)
     MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(itpe), visitTypeSubstituted(tpe), eff, loc)
   }
 
@@ -1222,7 +1222,7 @@ object SpecializeAndLower {
     // already-visited channel expression) reaches here. Only the node's own field positions below
     // get the rewrite.
     val itpe = lowerType(Type.mkIoArrow(chanTpe, tpe, loc))
-    val defnSym = lookupSym(Defs.ChannelGet, itpe)
+    val defnSym = lookupSym(Defs.Concurrent.Channel.Get, itpe)
     MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(itpe), visitTypeSubstituted(tpe), eff, loc)
   }
 
@@ -1240,7 +1240,7 @@ object SpecializeAndLower {
     // chanTpe/valTpe — see mkGetChannel's doc comment for why `exp1.tpe`/`exp2.tpe` can't be used
     // directly (already enum/struct-rewritten by the time the visited exprs reach here).
     val itpe = lowerType(Type.mkIoUncurriedArrow(List(valTpe, chanTpe), Type.Unit, loc))
-    val defnSym = lookupSym(Defs.ChannelPut, itpe)
+    val defnSym = lookupSym(Defs.Concurrent.Channel.Put, itpe)
     val chanSym = mkLetSym("chan", loc)
     val valueSym = mkLetSym("value", loc)
     val chanVar = MonoAst.Expr.Var(chanSym, exp1.tpe, loc)
@@ -1301,11 +1301,11 @@ object SpecializeAndLower {
     val admins = ListOps.zip(rs, channels) map {
       case ((_, _, _, rawChanTpe), (chanSym, _)) =>
         // itpe/lookup key built from the RAW channel type — see SelectChannel case's doc comment.
-        val itpe = lowerType(Type.mkPureArrow(rawChanTpe, Types.ChannelMpmcAdmin, loc))
-        val defnSym = lookupSym(Defs.ChannelMpmcAdmin, itpe)
-        MonoAst.Expr.ApplyDef(defnSym, List(MonoAst.Expr.Var(chanSym, visitTypeSubstituted(rawChanTpe), loc)), Specialize.rewriteEnumStructType(itpe), Types.ChannelMpmcAdmin, Type.Pure, loc)
+        val itpe = lowerType(Type.mkPureArrow(rawChanTpe, Types.Concurrent.Channel.MpmcAdmin, loc))
+        val defnSym = lookupSym(Defs.Concurrent.Channel.MpmcAdmin, itpe)
+        MonoAst.Expr.ApplyDef(defnSym, List(MonoAst.Expr.Var(chanSym, visitTypeSubstituted(rawChanTpe), loc)), Specialize.rewriteEnumStructType(itpe), Types.Concurrent.Channel.MpmcAdmin, Type.Pure, loc)
     }
-    mkList(admins, Types.ChannelMpmcAdmin, loc)
+    mkList(admins, Types.Concurrent.Channel.MpmcAdmin, loc)
   }
 
   /**
@@ -1316,7 +1316,7 @@ object SpecializeAndLower {
     * `false` is `true` instead when `default` is `Some`.
     */
   private def mkChannelSelect(admins: MonoAst.Expr, default: Option[MonoAst.Expr], loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
-    val locksType = Types.mkList(Types.ConcurrentReentrantLock, loc)
+    val locksType = Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc)
 
     val selectRetTpe = Type.mkTuple(List(Type.Int32, locksType), loc)
     val itpe = Type.mkIoUncurriedArrow(List(admins.tpe, Type.Bool), selectRetTpe, loc)
@@ -1324,7 +1324,7 @@ object SpecializeAndLower {
       case Some(_) => MonoAst.Expr.Cst(Constant.Bool(false), Type.Bool, loc)
       case None => MonoAst.Expr.Cst(Constant.Bool(true), Type.Bool, loc)
     }
-    val defnSym = lookupSym(Defs.ChannelSelectFrom, itpe)
+    val defnSym = lookupSym(Defs.Concurrent.Channel.SelectFrom, itpe)
     MonoAst.Expr.ApplyDef(defnSym, List(admins, blocking), Specialize.rewriteEnumStructType(lowerType(itpe)), Specialize.rewriteEnumStructType(selectRetTpe), Type.IO, loc)
   }
 
@@ -1340,7 +1340,7 @@ object SpecializeAndLower {
     */
   private def mkChannelCases(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], eff: Type, loc: SourceLocation)(implicit sctx: SharedContext, flix: Flix): List[MonoAst.MatchRule] = {
     // RAW (lookup-key form) and rewritten (node-field form) both needed — see doc comment above.
-    val locksTypeRaw = Types.mkList(Types.ConcurrentReentrantLock, loc)
+    val locksTypeRaw = Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc)
     val locksType = Specialize.rewriteEnumStructType(locksTypeRaw)
 
     ListOps.zip(rs, channels).zipWithIndex map {
@@ -1351,7 +1351,7 @@ object SpecializeAndLower {
         val getTpe = extractChannelTpe(rawChanTpe)
         val itpe = lowerType(Type.mkIoUncurriedArrow(List(rawChanTpe, locksTypeRaw), getTpe, loc))
         val args = List(MonoAst.Expr.Var(chSym, visitTypeSubstituted(rawChanTpe), loc), MonoAst.Expr.Var(locksSym, locksType, loc))
-        val defnSym = lookupSym(Defs.ChannelUnsafeGetAndUnlock, itpe)
+        val defnSym = lookupSym(Defs.Concurrent.Channel.UnsafeGetAndUnlock, itpe)
         val getExp = MonoAst.Expr.ApplyDef(defnSym, args, Specialize.rewriteEnumStructType(itpe), visitTypeSubstituted(getTpe), eff, loc)
         val e = MonoAst.Expr.Let(sym, getExp, exp, exp.tpe, eff, Occur.Unknown, loc)
         MonoAst.MatchRule(pat, None, e)
@@ -1366,7 +1366,7 @@ object SpecializeAndLower {
   private def mkSelectDefaultCase(default: Option[MonoAst.Expr], loc: SourceLocation)(implicit sctx: SharedContext): List[MonoAst.MatchRule] = {
     default match {
       case Some(defaultExp) =>
-        val locksType = Specialize.rewriteEnumStructType(Types.mkList(Types.ConcurrentReentrantLock, loc))
+        val locksType = Specialize.rewriteEnumStructType(Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc))
         val pat = mkTuplePattern(Nel(MonoAst.Pattern.Cst(Constant.Int32(-1), Type.Int32, loc), List(MonoAst.Pattern.Wild(locksType, loc))), loc)
         val defaultMatch = MonoAst.MatchRule(pat, None, defaultExp)
         List(defaultMatch)
@@ -1425,7 +1425,7 @@ object SpecializeAndLower {
   /** Returns a new channel expression. */
   private def mkNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
     val itpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
-    val defnSym = lookupSym(Defs.ChannelNew, itpe)
+    val defnSym = lookupSym(Defs.Concurrent.Channel.NewChannel, itpe)
     MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(itpe), Specialize.rewriteEnumStructType(tpe), eff, loc)
   }
 
@@ -1494,7 +1494,7 @@ object SpecializeAndLower {
 
   /** Returns a `Nil` expression with type list of `elmType` (assumed specialized and lowered). */
   private def mkNil(elmType: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
-    mkTag(Enums.FList, "Nil", Nil, Types.mkList(elmType, loc), loc)
+    mkTag(Enums.List.List, "Nil", Nil, Types.List.mkList(elmType, loc), loc)
   }
 
   /**
@@ -1507,7 +1507,7 @@ object SpecializeAndLower {
     * (unspecialized) case sym while `Nil` got the fresh one.
     */
   private def mkCons(hd: MonoAst.Expr, tail: MonoAst.Expr, elmType: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
-    mkTag(Enums.FList, "Cons", List(hd, tail), Types.mkList(elmType, loc), loc)
+    mkTag(Enums.List.List, "Cons", List(hd, tail), Types.List.mkList(elmType, loc), loc)
   }
 
   /**
@@ -1516,7 +1516,7 @@ object SpecializeAndLower {
     * (rewritten) as the returned node's own type.
     *
     * `sym` is almost always non-generic (Datalog/PredSym/etc. runtime AST nodes); the two
-    * actually-generic exceptions are `Enums.FList` (`mkNil`/`mkCons`) and `Enums.Denotation`
+    * actually-generic exceptions are `Enums.List.FList` (`mkNil`/`mkCons`) and `Enums.Fixpoint.Ast.Shared.Denotation`
     * (`mkDenotation`'s `Relational` case), whose instantiations `ConstraintCollection` predicts.
     * Because `mkTag` synthesizes its own `AtomicOp.Tag` node directly instead of going through
     * `visitExp`'s Tag case, it must perform the case-sym lookup and the enum/struct-type rewrite
@@ -1537,7 +1537,7 @@ object SpecializeAndLower {
 
   /** Returns `(t1, t2)` where `tpe = Concurrent.Channel.Mpmc[t1, t2]`. `tpe` is assumed specialized, but not lowered. */
   private def extractChannelTpe(tpe: Type): Type = tpe match {
-    case Type.Apply(Type.Apply(Types.ChannelMpmc, elmType, _), _, _) => elmType
+    case Type.Apply(Type.Apply(Types.Concurrent.Channel.Mpmc, elmType, _), _, _) => elmType
     case _ => throw InternalCompilerException(s"Cannot interpret '$tpe' as a channel type", tpe.loc)
   }
 
@@ -1560,7 +1560,7 @@ object SpecializeAndLower {
     * The type of a channel which can transmit variables of type `tpe`.
     */
   private def mkChannelTpe(tpe: Type, loc: SourceLocation): Type = {
-    Type.Apply(Type.Apply(Types.ChannelMpmc, tpe, loc), Type.IO, loc)
+    Type.Apply(Type.Apply(Types.Concurrent.Channel.Mpmc, tpe, loc), Type.IO, loc)
   }
 
   /*
@@ -1572,11 +1572,11 @@ object SpecializeAndLower {
     val factExps = cs.filter(c => c.body.isEmpty).map(lowerConstraint(_, env0, subst))
     val ruleExps = cs.filter(c => c.body.nonEmpty).map(lowerConstraint(_, env0, subst))
 
-    val factListExp = mkVector(factExps, Types.Constraint, loc)
-    val ruleListExp = mkVector(ruleExps, Types.Constraint, loc)
+    val factListExp = mkVector(factExps, Types.Fixpoint.Ast.Datalog.Constraint, loc)
+    val ruleListExp = mkVector(ruleExps, Types.Fixpoint.Ast.Datalog.Constraint, loc)
 
     val innerExp = List(factListExp, ruleListExp)
-    mkTag(Enums.Datalog, "Datalog", innerExp, Types.Datalog, loc)
+    mkTag(Enums.Fixpoint.Ast.Datalog.Datalog, "Datalog", innerExp, Types.Fixpoint.Ast.Datalog.Datalog, loc)
   }
 
   /**
@@ -1591,15 +1591,15 @@ object SpecializeAndLower {
     val (goalPredSym, goalTerms) = select match {
       case TypedAst.Predicate.Head.Atom(pred, _, terms, _, loc1) =>
         val boxedTerms = terms.map(t => box(visitExp(t, env0, subst), subst(t.tpe)))
-        (mkPredSym(pred), mkVector(boxedTerms, Types.Boxed, loc1))
+        (mkPredSym(pred), mkVector(boxedTerms, Types.Fixpoint.Boxed, loc1))
     }
-    val withPredSyms = mkVector(withh.map(mkPredSym), Types.PredSym, loc)
+    val withPredSyms = mkVector(withh.map(mkPredSym), Types.Fixpoint.Ast.Shared.PredSym, loc)
     val extVarType = unwrapVectorType(tpe, loc)
     val preds = predicatesOfExtVar(extVarType, loc)
     val lambdaExp = mkExtVarLambda(preds, extVarType, loc)
     val argExps = goalPredSym :: goalTerms :: withPredSyms :: lambdaExp :: mergedExp :: Nil
-    val itpe = Types.mkProvenanceOf(extVarType, loc)
-    val defn = lookupSym(Defs.ProvenanceOf, itpe)
+    val itpe = Types.Fixpoint.Solver.mkProvenanceOf(extVarType, loc)
+    val defn = lookupSym(Defs.Fixpoint.Solver.ProvenanceOf, itpe)
     MonoAst.Expr.ApplyDef(defn, argExps, Specialize.rewriteEnumStructType(itpe), Specialize.rewriteEnumStructType(tpe), eff, loc)
   }
 
@@ -1611,13 +1611,13 @@ object SpecializeAndLower {
     val predArity = selects.length
 
     // Define the name and type of the appropriate factsX function in Solver.flix
-    val defTpe = Type.mkPureUncurriedArrow(List(Types.PredSym, Types.Datalog), tpe, loc)
-    val sym = lookupSym(Defs.Facts(predArity), defTpe)
+    val defTpe = Type.mkPureUncurriedArrow(List(Types.Fixpoint.Ast.Shared.PredSym, Types.Fixpoint.Ast.Datalog.Datalog), tpe, loc)
+    val sym = lookupSym(Defs.Fixpoint.Solver.Facts(predArity), defTpe)
 
     // Merge and solve exps
     val mergedExp = mergeExps(loweredQueryExp :: loweredExps, loc)
-    val solveDefn = lookupSym(Defs.Solve, Types.SolveType)
-    val solvedExp = MonoAst.Expr.ApplyDef(solveDefn, mergedExp :: Nil, Types.SolveType, Types.Datalog, eff, loc)
+    val solveDefn = lookupSym(Defs.Fixpoint.Solver.RunSolver, Types.Fixpoint.Solver.SolveType)
+    val solvedExp = MonoAst.Expr.ApplyDef(solveDefn, mergedExp :: Nil, Types.Fixpoint.Solver.SolveType, Types.Fixpoint.Ast.Datalog.Datalog, eff, loc)
 
     // Put everything together
     val argExps = mkPredSym(pred) :: solvedExp :: Nil
@@ -1639,23 +1639,23 @@ object SpecializeAndLower {
     */
   private def lowerSolveWithProject(exps0: List[TypedAst.Expr], optPreds: Option[List[Name.Pred]], mode: SolveMode, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val defn = mode match {
-      case SolveMode.Default => lookupSym(Defs.Solve, Types.Datalog)
-      case SolveMode.WithProvenance => lookupSym(Defs.SolveWithProvenance, Types.Datalog)
+      case SolveMode.Default => lookupSym(Defs.Fixpoint.Solver.RunSolver, Types.Fixpoint.Ast.Datalog.Datalog)
+      case SolveMode.WithProvenance => lookupSym(Defs.Fixpoint.Solver.RunSolverWithProvenance, Types.Fixpoint.Ast.Datalog.Datalog)
     }
     val exps = exps0.map(visitExp(_, env0, subst))
     val mergedExp = mergeExps(exps, loc)
     val argExps = mergedExp :: Nil
-    val solvedExp = MonoAst.Expr.ApplyDef(defn, argExps, Types.SolveType, Types.Datalog, eff, loc)
+    val solvedExp = MonoAst.Expr.ApplyDef(defn, argExps, Types.Fixpoint.Solver.SolveType, Types.Fixpoint.Ast.Datalog.Datalog, eff, loc)
     val tmpVarSym = Symbol.freshVarSym("tmp%", BoundBy.Let, loc)(RegionScope.Top, flix)
     val letBodyExp = optPreds match {
       case Some(preds) =>
         mergeExps(preds.map(pred => {
-          val varExp = MonoAst.Expr.Var(tmpVarSym, Types.Datalog, loc)
+          val varExp = MonoAst.Expr.Var(tmpVarSym, Types.Fixpoint.Ast.Datalog.Datalog, loc)
           projectSym(mkPredSym(pred), varExp, loc)
         }), loc)
-      case None => MonoAst.Expr.Var(tmpVarSym, Types.Datalog, loc)
+      case None => MonoAst.Expr.Var(tmpVarSym, Types.Fixpoint.Ast.Datalog.Datalog, loc)
     }
-    MonoAst.Expr.Let(tmpVarSym, solvedExp, letBodyExp, Types.Datalog, eff, Occur.Unknown, loc)
+    MonoAst.Expr.Let(tmpVarSym, solvedExp, letBodyExp, Types.Fixpoint.Ast.Datalog.Datalog, eff, Occur.Unknown, loc)
 
   }
 
@@ -1666,12 +1666,12 @@ object SpecializeAndLower {
         // The exp's own type/eff are TypedAst-level reads: substitute before use (fused walk).
         val expTpe = subst(exp.tpe)
 
-        val defTpe = Type.mkPureUncurriedArrow(List(Types.PredSym, lowerType(expTpe)), Types.Datalog, loc)
+        val defTpe = Type.mkPureUncurriedArrow(List(Types.Fixpoint.Ast.Shared.PredSym, lowerType(expTpe)), Types.Fixpoint.Ast.Datalog.Datalog, loc)
 
-        val sym = lookupSym(Defs.ProjectInto(arity), defTpe)
+        val sym = lookupSym(Defs.Fixpoint.Solver.InjectInto(arity), defTpe)
 
         val argExps = mkPredSym(pred) :: visitExp(exp, env0, subst) :: Nil
-        MonoAst.Expr.ApplyDef(sym, argExps, Specialize.rewriteEnumStructType(defTpe), Types.Datalog, subst(exp.eff), loc)
+        MonoAst.Expr.ApplyDef(sym, argExps, Specialize.rewriteEnumStructType(defTpe), Types.Fixpoint.Ast.Datalog.Datalog, subst(exp.eff), loc)
     }
     mergeExps(loweredExps, loc)
 
@@ -1690,9 +1690,9 @@ object SpecializeAndLower {
           else { val freshSym = Symbol.freshVarSym(bnd.sym); env1 + (bnd.sym -> freshSym) }
       }
       val headExp = lowerHeadPred(cparams, head, env, subst)
-      val bodyExp = mkVector(body.map(lowerBodyPred(cparams, _, env, subst)), Types.BodyPredicate, loc)
+      val bodyExp = mkVector(body.map(lowerBodyPred(cparams, _, env, subst)), Types.Fixpoint.Ast.Datalog.BodyPredicate, loc)
       val innerExp = List(headExp, bodyExp)
-      mkTag(Enums.Constraint, "Constraint", innerExp, Types.Constraint, loc)
+      mkTag(Enums.Fixpoint.Ast.Datalog.Constraint, "Constraint", innerExp, Types.Fixpoint.Ast.Datalog.Constraint, loc)
   }
 
   /**
@@ -1702,9 +1702,9 @@ object SpecializeAndLower {
     case TypedAst.Predicate.Head.Atom(pred, den, terms, _, loc) =>
       val predSymExp = mkPredSym(pred)
       val denotationExp = mkDenotation(den, terms.lastOption.map(t => subst(t.tpe)), loc)
-      val termsExp = mkVector(terms.map(lowerHeadTerm(cparams0, _, env, subst)), Types.HeadTerm, loc)
+      val termsExp = mkVector(terms.map(lowerHeadTerm(cparams0, _, env, subst)), Types.Fixpoint.Ast.Datalog.HeadTerm, loc)
       val innerExp = List(predSymExp, denotationExp, termsExp)
-      mkTag(Enums.HeadPredicate, "HeadAtom", innerExp, Types.HeadPredicate, loc)
+      mkTag(Enums.Fixpoint.Ast.Datalog.HeadPredicate, "HeadAtom", innerExp, Types.Fixpoint.Ast.Datalog.HeadPredicate, loc)
   }
 
   /**
@@ -1716,9 +1716,9 @@ object SpecializeAndLower {
       val denotationExp = mkDenotation(den, terms.lastOption.map(t => subst(t.tpe)), loc)
       val polarityExp = mkPolarity(polarity, loc)
       val fixityExp = mkFixity(fixity, loc)
-      val termsExp = mkVector(terms.map(lowerBodyTerm(cparams0, _, env, subst)), Types.BodyTerm, loc)
+      val termsExp = mkVector(terms.map(lowerBodyTerm(cparams0, _, env, subst)), Types.Fixpoint.Ast.Datalog.BodyTerm, loc)
       val innerExp = List(predSymExp, denotationExp, polarityExp, fixityExp, termsExp)
-      mkTag(Enums.BodyPredicate, "BodyAtom", innerExp, Types.BodyPredicate, loc)
+      mkTag(Enums.Fixpoint.Ast.Datalog.BodyPredicate, "BodyAtom", innerExp, Types.Fixpoint.Ast.Datalog.BodyPredicate, loc)
 
     case TypedAst.Predicate.Body.Functional(outVars0, exp0, loc) =>
       // Compute the universally quantified variables (i.e. the variables not bound by the local scope).
@@ -1801,27 +1801,27 @@ object SpecializeAndLower {
   }
 
   /**
-    * Returns an expression merging `exps` using `Defs.Merge`.
+    * Returns an expression merging `exps` using `Defs.Fixpoint.Solver.Merge`.
     */
   private def mergeExps(exps: List[MonoAst.Expr], loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr =
     exps.reduceRight {
       (exp, acc) =>
-        val resultType = Types.Datalog
-        val defn = lookupSym(Defs.Merge, resultType)
+        val resultType = Types.Fixpoint.Ast.Datalog.Datalog
+        val defn = lookupSym(Defs.Fixpoint.Solver.Union, resultType)
         val argExps = exp :: acc :: Nil
-        val itpe = Types.MergeType
+        val itpe = Types.Fixpoint.Solver.MergeType
         MonoAst.Expr.ApplyDef(defn, argExps, itpe, resultType, exp.eff, loc)
     }
 
   /**
     * Returns a new `Datalog` from `datalogExp` containing only facts from the predicate given by the `PredSym` `predSymExp`
-    * using `Defs.Filter`.
+    * using `Defs.Fixpoint.Solver.Filter`.
     */
   private def projectSym(predSymExp: MonoAst.Expr, datalogExp: MonoAst.Expr, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
-    val resultType = Types.Datalog
-    val defn = lookupSym(Defs.Filter, resultType)
+    val resultType = Types.Fixpoint.Ast.Datalog.Datalog
+    val defn = lookupSym(Defs.Fixpoint.Solver.ProjectSym, resultType)
     val argExps = predSymExp :: datalogExp :: Nil
-    val itpe = Types.FilterType
+    val itpe = Types.Fixpoint.Solver.FilterType
     MonoAst.Expr.ApplyDef(defn, argExps, itpe, resultType, datalogExp.eff, loc)
   }
 
@@ -1833,11 +1833,11 @@ object SpecializeAndLower {
 
     val argType = Type.mkPureCurriedArrow(argTypes, resultType, exp0.loc)
 
-    val returnType = Type.mkPureCurriedArrow(argTypes.map(_ => Types.Boxed), Types.Boxed, exp0.loc)
+    val returnType = Type.mkPureCurriedArrow(argTypes.map(_ => Types.Fixpoint.Boxed), Types.Fixpoint.Boxed, exp0.loc)
 
     val liftType = Type.mkPureArrow(argType, returnType, exp0.loc)
 
-    val sym = lookupSym(Defs.Lift(argTypes.length), liftType)
+    val sym = lookupSym(Defs.Fixpoint.Boxable.Lift(argTypes.length), liftType)
 
     MonoAst.Expr.ApplyDef(sym, List(exp0), Specialize.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
   }
@@ -1847,11 +1847,11 @@ object SpecializeAndLower {
 
     val argType = Type.mkPureCurriedArrow(argTypes, Type.Bool, exp0.loc)
 
-    val returnType = Type.mkPureCurriedArrow(argTypes.map(_ => Types.Boxed), Type.Bool, exp0.loc)
+    val returnType = Type.mkPureCurriedArrow(argTypes.map(_ => Types.Fixpoint.Boxed), Type.Bool, exp0.loc)
 
     val liftType = Type.mkPureArrow(argType, returnType, exp0.loc)
 
-    val sym = lookupSym(Defs.LiftB(argTypes.length), liftType)
+    val sym = lookupSym(Defs.Fixpoint.Boxable.LiftB(argTypes.length), liftType)
 
     MonoAst.Expr.ApplyDef(sym, List(exp0), Specialize.rewriteEnumStructType(liftType), returnType, Type.Pure, exp0.loc)
   }
@@ -1865,14 +1865,14 @@ object SpecializeAndLower {
 
     val argType = Type.mkPureCurriedArrow(argTypes, resultType, loc)
 
-    val returnType = Type.mkPureArrow(Type.mkVector(Types.Boxed, loc), Type.mkVector(Type.mkVector(Types.Boxed, loc), loc), loc)
+    val returnType = Type.mkPureArrow(Type.mkVector(Types.Fixpoint.Boxed, loc), Type.mkVector(Type.mkVector(Types.Fixpoint.Boxed, loc), loc), loc)
 
     val liftType = Type.mkPureArrow(argType, returnType, loc)
 
     val numberOfInVars = argTypes.length
     val numberOfOutVars = outVars.length
 
-    val sym = lookupSym(Defs.LiftXM(numberOfInVars, numberOfOutVars), liftType)
+    val sym = lookupSym(Defs.Fixpoint.Boxable.LiftXM(numberOfInVars, numberOfOutVars), liftType)
 
     MonoAst.Expr.ApplyDef(sym, List(exp0), Specialize.rewriteEnumStructType(liftType), returnType, Type.Pure, loc)
   }
@@ -1882,21 +1882,21 @@ object SpecializeAndLower {
     */
   private def mkHeadTermVar(sym: Symbol.VarSym)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
     val innerExp = List(mkVarSym(sym))
-    mkTag(Enums.HeadTerm, "Var", innerExp, Types.HeadTerm, sym.loc)
+    mkTag(Enums.Fixpoint.Ast.Datalog.HeadTerm, "Var", innerExp, Types.Fixpoint.Ast.Datalog.HeadTerm, sym.loc)
   }
 
   /**
     * Constructs a `Fixpoint/Ast/Datalog.HeadTerm.Lit` value which wraps the given expression `exp`.
     */
   private def mkHeadTermLit(exp: MonoAst.Expr)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
-    mkTag(Enums.HeadTerm, "Lit", List(exp), Types.HeadTerm, exp.loc)
+    mkTag(Enums.Fixpoint.Ast.Datalog.HeadTerm, "Lit", List(exp), Types.Fixpoint.Ast.Datalog.HeadTerm, exp.loc)
   }
 
   /**
     * Constructs a `Fixpoint/Ast/Datalog.BodyTerm.Wild` from the given source location `loc`.
     */
   private def mkBodyTermWild(loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
-    mkTag(Enums.BodyTerm, "Wild", Nil, Types.BodyTerm, loc)
+    mkTag(Enums.Fixpoint.Ast.Datalog.BodyTerm, "Wild", Nil, Types.Fixpoint.Ast.Datalog.BodyTerm, loc)
   }
 
   /**
@@ -1904,14 +1904,14 @@ object SpecializeAndLower {
     */
   private def mkBodyTermVar(sym: Symbol.VarSym)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
     val innerExp = List(mkVarSym(sym))
-    mkTag(Enums.BodyTerm, "Var", innerExp, Types.BodyTerm, sym.loc)
+    mkTag(Enums.Fixpoint.Ast.Datalog.BodyTerm, "Var", innerExp, Types.Fixpoint.Ast.Datalog.BodyTerm, sym.loc)
   }
 
   /**
     * Constructs a `Fixpoint/Ast/Datalog.BodyTerm.Lit` from the given expression `exp0`.
     */
   private def mkBodyTermLit(exp: MonoAst.Expr)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
-    mkTag(Enums.BodyTerm, "Lit", List(exp), Types.BodyTerm, exp.loc)
+    mkTag(Enums.Fixpoint.Ast.Datalog.BodyTerm, "Lit", List(exp), Types.Fixpoint.Ast.Datalog.BodyTerm, exp.loc)
   }
 
   /**
@@ -1919,7 +1919,7 @@ object SpecializeAndLower {
     */
   private def mkVarSym(sym: Symbol.VarSym)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
     val nameExp = MonoAst.Expr.Cst(Constant.Str(sym.text), Type.Str, sym.loc)
-    mkTag(Enums.VarSym, "VarSym", List(nameExp), Types.VarSym, sym.loc)
+    mkTag(Enums.Fixpoint.Ast.Datalog.VarSym, "VarSym", List(nameExp), Types.Fixpoint.Ast.Datalog.VarSym, sym.loc)
   }
 
   /**
@@ -1928,7 +1928,7 @@ object SpecializeAndLower {
     */
   private def mkDenotation(d: Denotation, tpeOpt: Option[Type], loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = d match {
     case Denotation.Relational =>
-      mkTag(Enums.Denotation, "Relational", Nil, Types.Denotation, loc)
+      mkTag(Enums.Fixpoint.Ast.Shared.Denotation, "Relational", Nil, Types.Fixpoint.Ast.Shared.Denotation, loc)
 
     case Denotation.Latticenal =>
       tpeOpt match {
@@ -1936,16 +1936,16 @@ object SpecializeAndLower {
         case Some(tpe) =>
           val innerType = lowerType(tpe)
           // The type `Denotation[tpe]`.
-          val unboxedDenotationType = Type.mkEnum(Enums.Denotation, innerType :: Nil, loc)
+          val unboxedDenotationType = Type.mkEnum(Enums.Fixpoint.Ast.Shared.Denotation, innerType :: Nil, loc)
 
           // The type `Denotation[Boxed]`.
-          val boxedDenotationType = Types.Denotation
+          val boxedDenotationType = Types.Fixpoint.Ast.Shared.Denotation
 
           val latticeType: Type = Type.mkPureArrow(Type.Unit, unboxedDenotationType, loc)
-          val latticeSym: Symbol.DefnSym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Ast.Shared.lattice"), latticeType)
+          val latticeSym: Symbol.DefnSym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Symbols.fixpointVersion}.Ast.Shared.lattice"), latticeType)
 
           val boxType: Type = Type.mkPureArrow(unboxedDenotationType, boxedDenotationType, loc)
-          val boxSym: Symbol.DefnSym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Defs.version}.Ast.Shared.box"), boxType)
+          val boxSym: Symbol.DefnSym = lookupSym(Symbol.mkDefnSym(s"Fixpoint${Symbols.fixpointVersion}.Ast.Shared.box"), boxType)
 
           val innerApply = MonoAst.Expr.ApplyDef(latticeSym, List(MonoAst.Expr.Cst(Constant.Unit, Type.Unit, loc)), Specialize.rewriteEnumStructType(latticeType), Specialize.rewriteEnumStructType(unboxedDenotationType), Type.Pure, loc)
           MonoAst.Expr.ApplyDef(boxSym, List(innerApply), Specialize.rewriteEnumStructType(boxType), Specialize.rewriteEnumStructType(boxedDenotationType), Type.Pure, loc)
@@ -1957,10 +1957,10 @@ object SpecializeAndLower {
     */
   private def mkPolarity(p: Polarity, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = p match {
     case Polarity.Positive =>
-      mkTag(Enums.Polarity, "Positive", Nil, Types.Polarity, loc)
+      mkTag(Enums.Fixpoint.Ast.Datalog.Polarity, "Positive", Nil, Types.Fixpoint.Ast.Datalog.Polarity, loc)
 
     case Polarity.Negative =>
-      mkTag(Enums.Polarity, "Negative", Nil, Types.Polarity, loc)
+      mkTag(Enums.Fixpoint.Ast.Datalog.Polarity, "Negative", Nil, Types.Fixpoint.Ast.Datalog.Polarity, loc)
   }
 
   /**
@@ -1968,10 +1968,10 @@ object SpecializeAndLower {
     */
   private def mkFixity(f: Fixity, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = f match {
     case Fixity.Loose =>
-      mkTag(Enums.Fixity, "Loose", Nil, Types.Fixity, loc)
+      mkTag(Enums.Fixpoint.Ast.Datalog.Fixity, "Loose", Nil, Types.Fixpoint.Ast.Datalog.Fixity, loc)
 
     case Fixity.Fixed =>
-      mkTag(Enums.Fixity, "Fixed", Nil, Types.Fixity, loc)
+      mkTag(Enums.Fixpoint.Ast.Datalog.Fixity, "Fixed", Nil, Types.Fixpoint.Ast.Datalog.Fixity, loc)
   }
 
   /**
@@ -1993,7 +1993,7 @@ object SpecializeAndLower {
       val fparam = MonoAst.FormalParam(sym, Type.Unit, Occur.Unknown, loc)
       val tpe = Type.mkPureArrow(Type.Unit, exp.tpe, loc)
       val lambdaExp = MonoAst.Expr.Lambda(fparam, exp, tpe, loc)
-      return mkTag(Enums.BodyPredicate, s"Guard0", List(lambdaExp), Types.BodyPredicate, loc)
+      return mkTag(Enums.Fixpoint.Ast.Datalog.BodyPredicate, s"Guard0", List(lambdaExp), Types.Fixpoint.Ast.Datalog.BodyPredicate, loc)
     }
 
     // Introduce a fresh variable for each free variable.
@@ -2022,7 +2022,7 @@ object SpecializeAndLower {
     // Construct the `Fixpoint/Ast/Datalog.BodyPredicate` value.
     val varExps = fvs.map(kv => mkVarSym(kv._1))
     val innerExp = liftedExp :: varExps
-    mkTag(Enums.BodyPredicate, s"Guard$arity", innerExp, Types.BodyPredicate, loc)
+    mkTag(Enums.Fixpoint.Ast.Datalog.BodyPredicate, s"Guard$arity", innerExp, Types.Fixpoint.Ast.Datalog.BodyPredicate, loc)
   }
 
   /**
@@ -2068,10 +2068,10 @@ object SpecializeAndLower {
     val liftedExp = liftXY(outVars, lambdaExp, inVars.map(_._2), rawResultTpe, exp.loc)
 
     // Construct the `Fixpoint/Ast/Datalog.BodyPredicate` value.
-    val boundVarVector = mkVector(outVars.map(mkVarSym), Types.VarSym, loc)
-    val freeVarVector = mkVector(inVars.map(kv => mkVarSym(kv._1)), Types.VarSym, loc)
+    val boundVarVector = mkVector(outVars.map(mkVarSym), Types.Fixpoint.Ast.Datalog.VarSym, loc)
+    val freeVarVector = mkVector(inVars.map(kv => mkVarSym(kv._1)), Types.Fixpoint.Ast.Datalog.VarSym, loc)
     val innerExp = List(boundVarVector, liftedExp, freeVarVector)
-    mkTag(Enums.BodyPredicate, s"Functional", innerExp, Types.BodyPredicate, loc)
+    mkTag(Enums.Fixpoint.Ast.Datalog.BodyPredicate, s"Functional", innerExp, Types.Fixpoint.Ast.Datalog.BodyPredicate, loc)
   }
 
   /**
@@ -2113,7 +2113,7 @@ object SpecializeAndLower {
     // Construct the `Fixpoint/Ast/Datalog.BodyPredicate` value.
     val varExps = fvs.map(kv => mkVarSym(kv._1))
     val innerExp = liftedExp :: varExps
-    mkTag(Enums.HeadTerm, s"App$arity", innerExp, Types.HeadTerm, loc)
+    mkTag(Enums.Fixpoint.Ast.Datalog.HeadTerm, s"App$arity", innerExp, Types.Fixpoint.Ast.Datalog.HeadTerm, loc)
   }
 
   /**
@@ -2124,7 +2124,7 @@ object SpecializeAndLower {
       val nameExp = MonoAst.Expr.Cst(Constant.Str(sym), Type.Str, loc)
       val idExp = MonoAst.Expr.Cst(Constant.Int64(0), Type.Int64, loc)
       val inner = List(nameExp, idExp)
-      mkTag(Enums.PredSym, "PredSym", inner, Types.PredSym, loc)
+      mkTag(Enums.Fixpoint.Ast.Shared.PredSym, "PredSym", inner, Types.Fixpoint.Ast.Shared.PredSym, loc)
   }
 
   /**
@@ -2135,8 +2135,8 @@ object SpecializeAndLower {
     */
   private def box(exp: MonoAst.Expr, rawTpe: Type)(implicit sctx: SharedContext): MonoAst.Expr = {
     val loc = exp.loc
-    val tpe = Type.mkPureArrow(rawTpe, Types.Boxed, loc)
-    MonoAst.Expr.ApplyDef(lookupSym(Defs.Box, tpe), List(exp), Specialize.rewriteEnumStructType(tpe), Types.Boxed, Type.Pure, loc)
+    val tpe = Type.mkPureArrow(rawTpe, Types.Fixpoint.Boxed, loc)
+    MonoAst.Expr.ApplyDef(lookupSym(Defs.Fixpoint.Boxable.Box, tpe), List(exp), Specialize.rewriteEnumStructType(tpe), Types.Fixpoint.Boxed, Type.Pure, loc)
   }
 
   /**
@@ -2412,12 +2412,12 @@ object SpecializeAndLower {
   private def mkExtVarLambda(preds: List[(Name.Pred, List[Type])], tpe: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val predSymVar = Symbol.freshVarSym("predSym", BoundBy.FormalParam, loc)(RegionScope.Top, flix)
     val termsVar = Symbol.freshVarSym("terms", BoundBy.FormalParam, loc)(RegionScope.Top, flix)
-    mkLambdaExp(predSymVar, Types.PredSym,
-      mkLambdaExp(termsVar, Types.VectorOfBoxed,
+    mkLambdaExp(predSymVar, Types.Fixpoint.Ast.Shared.PredSym,
+      mkLambdaExp(termsVar, Types.Fixpoint.VectorOfBoxed,
         mkExtVarBody(preds, predSymVar, termsVar, tpe, loc),
         tpe, Type.Pure, loc
       ),
-      Type.mkPureArrow(Types.VectorOfBoxed, tpe, loc), Type.Pure, loc
+      Type.mkPureArrow(Types.Fixpoint.VectorOfBoxed, tpe, loc), Type.Pure, loc
     )
   }
 
@@ -2453,16 +2453,16 @@ object SpecializeAndLower {
   private def mkExtVarBody(preds: List[(Name.Pred, List[Type])], predSymVar: Symbol.VarSym, termsVar: Symbol.VarSym, tpe: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val nameVar = Symbol.freshVarSym(Name.Ident("name", loc), BoundBy.Pattern)(RegionScope.Top, flix)
     MonoAst.Expr.Match(
-      exp = MonoAst.Expr.Var(predSymVar, Types.PredSym, loc),
+      exp = MonoAst.Expr.Var(predSymVar, Types.Fixpoint.Ast.Shared.PredSym, loc),
       rules = List(
         MonoAst.MatchRule(
           pat = MonoAst.Pattern.Tag(
-            symUse = SymUse.CaseSymUse(findCaseSym(Enums.PredSym, "PredSym"), loc),
+            symUse = SymUse.CaseSymUse(findCaseSym(Enums.Fixpoint.Ast.Shared.PredSym, "PredSym"), loc),
             pats = List(
               MonoAst.Pattern.Var(nameVar, Type.Str, Occur.Unknown, loc),
               MonoAst.Pattern.Wild(Type.Int64, loc)
             ),
-            tpe = Types.PredSym, loc = loc
+            tpe = Types.Fixpoint.Ast.Shared.PredSym, loc = loc
           ),
           guard = None,
           exp = MonoAst.Expr.Match(
@@ -2508,19 +2508,19 @@ object SpecializeAndLower {
     * where `"terms" == termsVar.text`.
     */
   private def mkUnboxedTerm(termsVar: Symbol.VarSym, tpe: Type, i: Int, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
-    val outerItpe = Type.mkPureUncurriedArrow(List(Types.Boxed), tpe, loc)
-    val innerItpe = Type.mkPureUncurriedArrow(List(Type.Int32, Types.VectorOfBoxed), Types.Boxed, loc)
+    val outerItpe = Type.mkPureUncurriedArrow(List(Types.Fixpoint.Boxed), tpe, loc)
+    val innerItpe = Type.mkPureUncurriedArrow(List(Type.Int32, Types.Fixpoint.VectorOfBoxed), Types.Fixpoint.Boxed, loc)
     MonoAst.Expr.ApplyDef(
-      sym = lookupSym(Defs.Unbox, outerItpe),
+      sym = lookupSym(Defs.Fixpoint.Boxable.Unbox, outerItpe),
       exps = List(
         MonoAst.Expr.ApplyDef(
           sym = lookupSym(Symbol.mkDefnSym(s"Vector.get"), innerItpe),
           exps = List(
             MonoAst.Expr.Cst(Constant.Int32(i), Type.Int32, loc),
-            MonoAst.Expr.Var(termsVar, Types.VectorOfBoxed, loc)
+            MonoAst.Expr.Var(termsVar, Types.Fixpoint.VectorOfBoxed, loc)
           ),
           itpe = innerItpe,
-          tpe = Types.Boxed, eff = Type.Pure, loc = loc
+          tpe = Types.Fixpoint.Boxed, eff = Type.Pure, loc = loc
         )
       ),
       itpe = Specialize.rewriteEnumStructType(outerItpe),
