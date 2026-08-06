@@ -433,11 +433,12 @@ object ConstraintGen {
     case Expr.Spawn(exp1, exp2, _, _, _) =>
       visitExp(exp1)
       visitExp(exp2)
-    // Generates, for each non-last fragment (element type `a`):
-    //   Concurrent.Channel.newChannel(bufferSize: Int32): Mpmc[a, Static] \ IO
-    //   Concurrent.Channel.put(e: a, c: Mpmc[a, Static]): Unit \ IO
-    //   Concurrent.Channel.get(c: Mpmc[a, Static]): a \ IO
+
     case Expr.ParYield(frags, exp, _, _, _) =>
+      // Generates, for each non-last fragment (element type `a`):
+      //   Concurrent.Channel.newChannel(bufferSize: Int32): Mpmc[a, Static] \ IO
+      //   Concurrent.Channel.put(e: a, c: Mpmc[a, Static]): Unit \ IO
+      //   Concurrent.Channel.get(c: Mpmc[a, Static]): a \ IO
       for (f <- frags) {
         visitPat(f.pat)
         visitExp(f.exp)
@@ -450,6 +451,7 @@ object ConstraintGen {
         sctx.addFlow(FlowConstraint(Instantiation(List(elmArg)), MonoVar.Def(Defs.Concurrent.Channel.Put)))
         sctx.addFlow(FlowConstraint(Instantiation(List(elmArg)), MonoVar.Def(Defs.Concurrent.Channel.Get)))
       }
+
     case Expr.InvokeConstructor(_, exps, _, _, _) =>
       for (exp <- exps) {
         visitExp(exp)
@@ -484,25 +486,29 @@ object ConstraintGen {
       for (m <- methods) {
         visitExp(m.exp)
       }
-    // Generates: Concurrent.Channel.get(c: Mpmc[a, Static]): a \ IO
+
     case Expr.GetChannel(exp, tpe, _, _) =>
+      // Generates: Concurrent.Channel.get(c: Mpmc[a, Static]): a \ IO
       visitExp(exp)
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(MonomorphHelpers.lowerChannelType(tpe)))), MonoVar.Def(Defs.Concurrent.Channel.Get)))
-    // Generates: Concurrent.Channel.put(e: a, c: Mpmc[a, Static]): Unit \ IO
+
     case Expr.PutChannel(exp1, exp2, _, _, _) =>
+      // Generates: Concurrent.Channel.put(e: a, c: Mpmc[a, Static]): Unit \ IO
       visitExp(exp1)
       visitExp(exp2)
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(MonomorphHelpers.lowerChannelType(exp2.tpe)))), MonoVar.Def(Defs.Concurrent.Channel.Put)))
-    // Generates: Concurrent.Channel.newChannelTuple(bufferSize: Int32): (Mpmc[a, Static], Mpmc[a, Static]) \ IO
+
     case Expr.NewChannel(exp, tpe, _, _) =>
+      // Generates: Concurrent.Channel.newChannelTuple(bufferSize: Int32): (Mpmc[a, Static], Mpmc[a, Static]) \ IO
       val elmType = extractChannelElm(tpe)
       visitExp(exp)
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(MonomorphHelpers.lowerChannelType(elmType)))), MonoVar.Def(Defs.Concurrent.Channel.NewChannelTuple)))
-    // Generates, per rule (element type `a`, not a Channel.get call):
-    //   Concurrent.Channel.unsafeGetAndUnlock(c: Mpmc[a, Static], locks: List[ReentrantLock]): a \ IO
-    //   Concurrent.Channel.mpmcAdmin(c: Mpmc[a, Static]): MpmcAdmin
-    // Plus one fixed `List[MpmcAdmin]` value, built via mkTag/mkList.
+
     case Expr.SelectChannel(rules, default, _, _, _) =>
+      // Generates, per rule (element type `a`, not a Channel.get call):
+      //   Concurrent.Channel.unsafeGetAndUnlock(c: Mpmc[a, Static], locks: List[ReentrantLock]): a \ IO
+      //   Concurrent.Channel.mpmcAdmin(c: Mpmc[a, Static]): MpmcAdmin
+      // Plus one fixed `List[MpmcAdmin]` value, built via mkTag/mkList.
       for (rule <- rules) {
         val elmType = rule.chan.tpe match {
           // Only possible shape since ConstraintGen.visitSelectRule unifies every rule's channel with Receiver[_]
@@ -519,11 +525,12 @@ object ConstraintGen {
         visitExp(exp)
       }
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(Types.Concurrent.Channel.MpmcAdmin))), MonoVar.Enum(Enums.List.List)))
-    // Generates the Box/Unbox/liftN/lattice/Facts/ProjectInto/ProvenanceOf calls for Datalog
-    // fixpoint nodes, mirroring the TypedAst structure lowering itself inspects — see
-    // `boxFlow`/`headTermFlows`/`guardLiftFlow`/`functionalLiftFlow`/`latticeFlows` below for the
-    // concrete signature each one predicts.
+
     case Expr.FixpointConstraintSet(cs, _, _) =>
+      // Generates the Box/Unbox/liftN/lattice/Facts/ProjectInto/ProvenanceOf calls for Datalog
+      // fixpoint nodes, mirroring the TypedAst structure lowering itself inspects — see
+      // `boxFlow`/`headTermFlows`/`guardLiftFlow`/`functionalLiftFlow`/`latticeFlows` below for the
+      // concrete signature each one predicts.
       for (c <- cs) {
         val cparams0 = c.cparams
         c.head match {
@@ -548,9 +555,9 @@ object ConstraintGen {
           }
         }
       }
-    // Generates a `List[PredSym]` value directly via mkTag/mkList (bypassing the ordinary
-    // rewrite path), so its instantiation must be predicted here.
     case Expr.FixpointLambda(_, exp, _, _, _) =>
+      // Generates a `List[PredSym]` value directly via mkTag/mkList (bypassing the ordinary
+      // rewrite path), so its instantiation must be predicted here.
       visitExp(exp)
       sctx.addFlow(FlowConstraint(Instantiation(List(typeToMonoArg(Types.Fixpoint.Ast.Shared.PredSym))), MonoVar.Enum(Enums.List.List)))
     case Expr.FixpointMerge(exp1, exp2, _, _, _) =>
@@ -560,10 +567,10 @@ object ConstraintGen {
       for (exp <- exps) {
         visitExp(exp)
       }
-    // Generates: Fixpoint3.Solver.injectIntoN(p: PredSym, ts: f[(t1, ..., tN)]): Datalog \ ...
-    // with Order[t1], ..., Order[tN], Foldable[f] — `f` is the container constructor, `t1..tN`
-    // the tuple's component types.
     case Expr.FixpointInjectInto(exps, predsAndArities, _, _, loc) =>
+      // Generates: Fixpoint3.Solver.injectIntoN(p: PredSym, ts: f[(t1, ..., tN)]): Datalog \ ...
+      // with Order[t1], ..., Order[tN], Foldable[f] — `f` is the container constructor, `t1..tN`
+      // the tuple's component types.
       for (case (e, PredicateAndArity(_, arity)) <- exps.zip(predsAndArities)) {
         Type.eraseAliases(e.tpe) match {
           case Type.Apply(tc, innerTpe, _) =>
@@ -574,10 +581,10 @@ object ConstraintGen {
           case t => throw InternalCompilerException(s"Unexpected non-foldable type: '$t'.", loc)
         }
       }
-    // Generates: Fixpoint3.Solver.factsN(p: PredSym, d: Datalog): Vector[(t1, ..., tN)] with
-    // Order[t1], ..., Order[tN] — the `t1..tN` flow args must come from the resolved result type
-    // `tpe0`, NOT from `selects`' own term types, which may still carry locally-scoped type vars.
     case Expr.FixpointQueryWithSelect(exps, queryExp, selects, from, where, _, tpe0, _, _) =>
+      // Generates: Fixpoint3.Solver.factsN(p: PredSym, d: Datalog): Vector[(t1, ..., tN)] with
+      // Order[t1], ..., Order[tN] — the `t1..tN` flow args must come from the resolved result type
+      // `tpe0`, NOT from `selects`' own term types, which may still carry locally-scoped type vars.
       val arity = selects.length
       val innerTpe = unwrapVectorType(tpe0)
       val argTypes = unmkTuplish(arity, innerTpe)
@@ -599,13 +606,13 @@ object ConstraintGen {
         visitExp(exp)
       }
       sctx.addFlow(FlowConstraint(Instantiation(argTypes.map(typeToMonoArg)), MonoVar.Def(Defs.Fixpoint.Solver.Facts(arity))))
-    // Generates, per goal term (type `a`): Fixpoint3.Boxable.box(x: a): Boxed with Order[a]
-    // Generates, per term type `t` the extensible-variant result can carry:
-    //   Fixpoint3.Boxable.unbox(x: Boxed): t
-    // Plus, at a fixed `Boxed` type:
-    //   Fixpoint3.Solver.provenanceOf(p: PredSym, f: Vector[Boxed], withh: Vector[PredSym], mkExtVar: PredSym -> Vector[Boxed] -> t, d: Datalog): Vector[t]
-    //   Vector.get(i: Int32, v: Vector[Boxed]): Boxed
     case Expr.FixpointQueryWithProvenance(exps, select, _, tpe0, _, _) =>
+      // Generates, per goal term (type `a`): Fixpoint3.Boxable.box(x: a): Boxed with Order[a]
+      // Generates, per term type `t` the extensible-variant result can carry:
+      //   Fixpoint3.Boxable.unbox(x: Boxed): t
+      // Plus, at a fixed `Boxed` type:
+      //   Fixpoint3.Solver.provenanceOf(p: PredSym, f: Vector[Boxed], withh: Vector[PredSym], mkExtVar: PredSym -> Vector[Boxed] -> t, d: Datalog): Vector[t]
+      //   Vector.get(i: Int32, v: Vector[Boxed]): Boxed
       for (exp <- exps) {
         visitExp(exp)
       }
