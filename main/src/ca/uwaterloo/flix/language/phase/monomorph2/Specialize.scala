@@ -321,7 +321,7 @@ object Specialize {
         case Type.Cst(TypeConstructor.Struct(sym, _), _) if sctx.structTable.contains((sym, args)) =>
           Type.mkStruct(sctx.structTable((sym, args)), Nil, loc)
         case _ =>
-          args.foldLeft(rewriteEnumStructType(tpe.baseType)) { case (acc, arg) => Type.Apply(acc, rewriteEnumStructType(arg), loc) }
+          Type.mkApply(rewriteEnumStructType(tpe.baseType), args.map(rewriteEnumStructType), loc)
       }
     case Type.Alias(sym, args, inner, loc) =>
       Type.Alias(sym, args.map(rewriteEnumStructType), rewriteEnumStructType(inner), loc)
@@ -374,21 +374,25 @@ object Specialize {
     // The solver tuple for a default sig impl is [traitType, ...sig-own args], so the trait
     // tparams must be prepended when building the substMap in entries below.
     val defaultSigDefs: Map[Symbol.DefnSym, TypedAst.Def] =
-      root.sigs.values.flatMap { sig =>
-        sig.exp.map { exp =>
-          val ns      = sig.sym.trt.namespace :+ sig.sym.trt.name
-          val defnSym = new Symbol.DefnSym(None, ns, sig.sym.name, sig.sym.loc)
-          defnSym -> TypedAst.Def(defnSym, sig.spec, exp, sig.sym.loc)
-        }
+      root.sigs.values.flatMap {
+        sig =>
+          sig.exp.map {
+            exp =>
+              val ns      = sig.sym.trt.namespace :+ sig.sym.trt.name
+              val defnSym = new Symbol.DefnSym(None, ns, sig.sym.name, sig.sym.loc)
+              defnSym -> TypedAst.Def(defnSym, sig.spec, exp, sig.sym.loc)
+          }
       }.toMap
     // Maps each default-sig-sym to the trait's own tparams (not in sig.spec.tparams).
     val defaultSigTraitTparams: Map[Symbol.DefnSym, List[TypedAst.TypeParam]] =
-      root.sigs.values.flatMap { sig =>
-        sig.exp.map { _ =>
-          val ns      = sig.sym.trt.namespace :+ sig.sym.trt.name
-          val defnSym = new Symbol.DefnSym(None, ns, sig.sym.name, sig.sym.loc)
-          defnSym -> List(root.traits(sig.sym.trt).tparam)
-        }
+      root.sigs.values.flatMap {
+        sig =>
+          sig.exp.map {
+            _ =>
+              val ns      = sig.sym.trt.namespace :+ sig.sym.trt.name
+              val defnSym = new Symbol.DefnSym(None, ns, sig.sym.name, sig.sym.loc)
+              defnSym -> List(root.traits(sig.sym.trt).tparam)
+          }
       }.toMap
 
     val allDefs: Map[Symbol.DefnSym, TypedAst.Def] = root.defs ++ allInstanceDefs ++ defaultSigDefs

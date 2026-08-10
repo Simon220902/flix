@@ -69,15 +69,16 @@ private[monomorph2] object MonomorphDebug {
     sb.append("  node [fontname=\"Courier\", fontsize=10];\n")
     sb.append("  edge [fontname=\"Courier\", fontsize=8];\n\n")
 
-    allMonoVarsOf(flows).foreach { mvar =>
-      val (shape, color) = mvar match {
-        case _: MonoVar.Def              => ("box",     "lightblue")
-        case _: MonoVar.Enum             => ("ellipse", "lightyellow")
-        case _: MonoVar.Sig              => ("diamond", "lightgreen")
-        case _: MonoVar.RestrictableEnum => ("ellipse", "lightsalmon")
-        case _: MonoVar.Struct           => ("box",     "lightcyan")
-      }
-      sb.append(s"""  ${dotId(mvar)} [label="${dotEscape(monoVarLabel(mvar))}", shape=$shape, style=filled, fillcolor=$color];\n""")
+    allMonoVarsOf(flows).foreach {
+      mvar =>
+        val (shape, color) = mvar match {
+          case _: MonoVar.Def              => ("box",     "lightblue")
+          case _: MonoVar.Enum             => ("ellipse", "lightyellow")
+          case _: MonoVar.Sig              => ("diamond", "lightgreen")
+          case _: MonoVar.RestrictableEnum => ("ellipse", "lightsalmon")
+          case _: MonoVar.Struct           => ("box",     "lightcyan")
+        }
+        sb.append(s"""  ${dotId(mvar)} [label="${dotEscape(monoVarLabel(mvar))}", shape=$shape, style=filled, fillcolor=$color];\n""")
     }
 
     sb.append("\n")
@@ -92,8 +93,9 @@ private[monomorph2] object MonomorphDebug {
         sb.append(s"""  $sid [label="${dotEscape(label)}", shape=plaintext];\n""")
         sb.append(s"""  $sid -> ${dotId(dst)};\n""")
       } else {
-        srcMVars.distinct.foreach { src =>
-          sb.append(s"""  ${dotId(src)} -> ${dotId(dst)} [label="${dotEscape(label)}"];\n""")
+        srcMVars.distinct.foreach {
+          src =>
+            sb.append(s"""  ${dotId(src)} -> ${dotId(dst)} [label="${dotEscape(label)}"];\n""")
         }
       }
     }
