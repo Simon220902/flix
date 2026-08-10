@@ -410,7 +410,7 @@ object Specialize {
       for {
         (sym, tuples)  <- solution.defs.toList
         defn           <- allDefs.get(sym).toList
-        tuple          <- tuples.toList
+        tuple          <- tuples
         instTparams     = defToInst.get(sym).map(_.tparams).getOrElse(Nil)
         // For default sig impls the trait's tparam(s) are prepended in the solver tuple
         // but NOT in defn.spec.tparams; recover them from defaultSigTraitTparams.
@@ -448,7 +448,7 @@ object Specialize {
         (sym, tuples) <- solution.enums.toList
         enm           <- root.enums.get(sym).toList
         if enm.tparams.nonEmpty
-        tuple         <- tuples.toList
+        tuple         <- tuples
         substMap       = enm.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
         freshSym       = Symbol.freshEnumSym(enm.sym)
         subst         <- try {
@@ -476,7 +476,7 @@ object Specialize {
       for {
         (sym, tuples) <- solution.restrictableEnums.toList
         enm           <- root.restrictableEnums.get(sym).toList
-        tuple         <- tuples.toList
+        tuple         <- tuples
         substMap       = (enm.index :: enm.tparams).zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
         freshSym       = Symbol.freshEnumSym(SpecializeAndLower.lowerRestrictableEnumSym(sym))
         subst         <- try {
@@ -500,7 +500,7 @@ object Specialize {
         (sym, tuples) <- solution.structs.toList
         struct        <- root.structs.get(sym).toList
         if struct.tparams.nonEmpty
-        tuple         <- tuples.toList
+        tuple         <- tuples
         substMap       = struct.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
         freshSym       = Symbol.freshStructSym(struct.sym)
         subst         <- try {

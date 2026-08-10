@@ -131,7 +131,7 @@ private[monomorph2] object MonomorphDebug {
 
   /** Returns a plain-text listing of `solution`: summary stats, then every solved tuple by category. */
   private def solutionToText(solution: Solution): String = {
-    def section[K](title: String, mk: K => MonoVar, m: Map[K, Set[List[Type]]]): String = {
+    def section[K](title: String, mk: K => MonoVar, m: Map[K, List[List[Type]]]): String = {
       val lines = m.toList.map { case (k, tuples) =>
         s"${monoVarLabel(mk(k))} -> ${tuples.toList.map(t => s"[${t.mkString(", ")}]").sorted.mkString(", ")}"
       }.sorted
