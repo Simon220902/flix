@@ -21,8 +21,8 @@ import ca.uwaterloo.flix.language.ast.{Kind, Name, RigidityEnv, SourceLocation, 
 import ca.uwaterloo.flix.language.ast.TypedAst.{Expr, FormalParam, MatchRule, Predicate, TypeParam}
 import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.shared.{Denotation, PredicateAndArity, RegionScope}
-import ca.uwaterloo.flix.language.phase.monomorph2.Symbols.{Defs, Enums, Types}
 import ca.uwaterloo.flix.language.phase.typer.ConstraintSolver2
+import ca.uwaterloo.flix.language.phase.monomorph2.Symbols.{Defs, Enums, Types}
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -139,10 +139,11 @@ object ConstraintGen {
   private def visitType(tpe0: Type)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     def dealiasedVisitType(tpe: Type): Unit = tpe match {
       case at @ Type.AssocType(_, arg, _, _) =>
-        if (at.typeVars.isEmpty)
+        if (at.typeVars.isEmpty) {
           visitType(Canonicalization.reduceAssocType(at)(root, flix))
-        else
+        } else {
           dealiasedVisitType(arg)
+        }
       case app @ Type.Apply(_, _, _)    =>
         val args = app.typeArguments
         for (arg <- args) {
@@ -676,11 +677,18 @@ object ConstraintGen {
     */
   private def headTermFlows(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = exp0 match {
     case Expr.Var(sym, tpe, _) =>
-      if (!MonomorphHelpers.isQuantifiedVar(sym, cparams0)) boxFlow(tpe)
+      if (!MonomorphHelpers.isQuantifiedVar(sym, cparams0)) {
+        boxFlow(tpe)
+      }
     case _ =>
       val fvs = MonomorphHelpers.quantifiedVars(cparams0, exp0)
-      if (fvs.isEmpty) boxFlow(exp0.tpe)
-      else sctx.addFlow(FlowConstraint(Instantiation((fvs.map(_._2) :+ exp0.tpe).map(typeToMonoArg)), MonoVar.Def(Defs.Fixpoint.Boxable.Lift(fvs.length))))
+      if (fvs.isEmpty) {
+        boxFlow(exp0.tpe)
+      } else {
+        val argTypes = fvs.map(_._2) // t1, ..., tN
+        val liftArgs = (argTypes :+ exp0.tpe).map(typeToMonoArg)
+        sctx.addFlow(FlowConstraint(Instantiation(liftArgs), MonoVar.Def(Defs.Fixpoint.Boxable.Lift(fvs.length))))
+      }
   }
 
   /** Flows for a body atom's terms — mirrors [[SpecializeAndLower.lowerBodyTerm]]. */
@@ -689,8 +697,11 @@ object ConstraintGen {
       term match {
         case TypedAst.Pattern.Wild(_, _)         => ()
         case TypedAst.Pattern.Var(bnd, tpe, _)   =>
-          if (!MonomorphHelpers.isQuantifiedVar(bnd.sym, cparams0)) boxFlow(tpe)
-          else ()
+          if (!MonomorphHelpers.isQuantifiedVar(bnd.sym, cparams0)) {
+            boxFlow(tpe)
+          } else {
+            ()
+          }
         case TypedAst.Pattern.Cst(_, tpe, _)     => boxFlow(tpe)
         case TypedAst.Pattern.Tag(_, _, _, _)    => ()
         case TypedAst.Pattern.Tuple(_, _, _)     => ()
@@ -707,7 +718,11 @@ object ConstraintGen {
     */
   private def guardLiftFlow(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr)(implicit tparamEnv: TparamEnv,  sctx: SharedContext, root: TypedAst.Root, flix: Flix): Unit = {
     val fvs = MonomorphHelpers.quantifiedVars(cparams0, exp0)
-    if (fvs.nonEmpty) sctx.addFlow(FlowConstraint(Instantiation(fvs.map(kv => typeToMonoArg(kv._2))), MonoVar.Def(Defs.Fixpoint.Boxable.LiftB(fvs.length))))
+    if (fvs.nonEmpty) {
+      val argTypes = fvs.map(_._2) // t1, ..., tN
+      val liftArgs = argTypes.map(typeToMonoArg)
+      sctx.addFlow(FlowConstraint(Instantiation(liftArgs), MonoVar.Def(Defs.Fixpoint.Boxable.LiftB(fvs.length))))
+    }
   }
 
   /**
@@ -722,7 +737,9 @@ object ConstraintGen {
       case t => throw InternalCompilerException(s"Expected Vector[_], but got $t", exp0.loc)
     }
     val outTypes = unmkTuplish(outArity, inner)
-    sctx.addFlow(FlowConstraint(Instantiation((inVars.map(_._2) ++ outTypes).map(typeToMonoArg)), MonoVar.Def(Defs.Fixpoint.Boxable.LiftXM(inVars.length, outArity))))
+    val inTypes = inVars.map(_._2) // i1, ..., iM
+    val liftArgs = (inTypes ++ outTypes).map(typeToMonoArg)
+    sctx.addFlow(FlowConstraint(Instantiation(liftArgs), MonoVar.Def(Defs.Fixpoint.Boxable.LiftXM(inTypes.length, outArity))))
   }
 
   /**
@@ -788,7 +805,11 @@ object ConstraintGen {
     * an arity-1 result bare, so a single value can itself be tuple-typed.
     */
   private def unmkTuplish(arity: Int, tpe: Type): List[Type] =
-    if (arity <= 1) List(tpe) else tpe.typeArguments
+    if (arity <= 1) {
+      List(tpe)
+    } else {
+      tpe.typeArguments
+    }
 
   /** Converts `tpe0` to a `MonoArg` relative to the current declaration context. */
   private def typeToMonoArg(tpe0: Type)(implicit tparamEnv: TparamEnv, root: TypedAst.Root, flix: Flix): MonoArg =
@@ -802,16 +823,17 @@ object ConstraintGen {
       // flow is still emitted but the solver does not propagate it.
       tparamEnv.get(sym).getOrElse(MonoArg.Const(tpe))
     case at @ Type.AssocType(symUse, arg, kind, assocLoc) =>
-      if (tpe.typeVars.isEmpty)
+      if (tpe.typeVars.isEmpty) {
         MonoArg.Const(Canonicalization.reduceAssocType(at)(root, flix))
-      else
+      } else {
         MonoArg.Assoc(symUse.sym, dealiasedTypeToMonoArg(arg), kind, assocLoc)
+      }
     case Type.Cst(_, _) =>
       MonoArg.Const(tpe)
     case Type.Apply(_, _, _) =>
-      if (tpe.kind == Kind.Eff && tpe.typeVars.isEmpty)
+      if (tpe.kind == Kind.Eff && tpe.typeVars.isEmpty) {
         MonoArg.Const(Canonicalization.simplify(tpe, isGround = true)(root, flix))
-      else {
+      } else {
         MonoArg.App(dealiasedTypeToMonoArg(tpe.baseType), tpe.typeArguments.map(arg => dealiasedTypeToMonoArg(arg)))
       }
     case Type.Alias(_, _, _, _) =>
