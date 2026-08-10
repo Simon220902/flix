@@ -17,7 +17,6 @@
 package ca.uwaterloo.flix.language.phase.monomorph2
 
 import ca.uwaterloo.flix.api.Flix
-import ca.uwaterloo.flix.language.ast.Type
 import ca.uwaterloo.flix.language.dbg.AstPrinter
 import ca.uwaterloo.flix.util.FileOps
 import ca.uwaterloo.flix.util.tc.Debug
@@ -133,9 +132,9 @@ private[monomorph2] object MonomorphDebug {
 
   /** Returns a plain-text listing of `solution`: summary stats, then every solved tuple by category. */
   private def solutionToText(solution: Solution): String = {
-    def section[K](title: String, mk: K => MonoVar, m: Map[K, List[List[Type]]]): String = {
+    def section[K](title: String, mk: K => MonoVar, m: Map[K, List[GroundInstantiation]]): String = {
       val lines = m.toList.map { case (k, tuples) =>
-        s"${monoVarLabel(mk(k))} -> ${tuples.toList.map(t => s"[${t.mkString(", ")}]").sorted.mkString(", ")}"
+        s"${monoVarLabel(mk(k))} -> ${tuples.map(t => s"[${t.args.mkString(", ")}]").sorted.mkString(", ")}"
       }.sorted
       s"$title (${m.size} symbols, ${m.values.map(_.size).sum} tuples):\n" + lines.mkString("\n")
     }
