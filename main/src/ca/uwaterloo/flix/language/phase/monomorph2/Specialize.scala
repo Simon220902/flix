@@ -30,30 +30,24 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import scala.jdk.CollectionConverters.*
 
 /**
-  * Solution-driven specialization: uses the solver's solution to specialize all def/enum/struct/
-  * restrictable-enum in a single parallel pass.
+  * Solution-driven specialization: uses the solver's solution to specialize every def/enum/
+  * struct/restrictable-enum in a single parallel pass.
   *
-  * `run` is the entry point and owns the `SharedContext` lookup tables (`defTable`/`enumTable`/
-  * `structTable`/`restrictableEnumTable`). The per-def specialize+lower walk itself lives in
-  * [[SpecializeAndLower.visitDef]], which calls back into `lookupSym`/`lookupCaseSym`/
-  * `lookupRestrictableCaseSym`/`lookupStructSym`/`resolveSigSym` here to resolve each call/tag/
-  * struct site.
+  * `run` builds the `SharedContext` lookup tables; [[SpecializeAndLower.visitDef]] does the actual
+  * per-def specialize+lower walk, resolving each call/tag/struct site via `lookupSym`/
+  * `lookupCaseSym`/`lookupRestrictableCaseSym`/`lookupStructSym`/`resolveSigSym`.
   */
 object Specialize {
 
   /**
-    * Accumulates specialized defs; unlike `Specialization.SharedContext` there is no work queue, since
-    * every specialization is known upfront from the solver solution.
+    * Accumulates specialized defs; unlike `Specialization.SharedContext` there is no work queue,
+    * since every specialization is known upfront.
     *
-    * `defTable` maps (original sym, instantiated arrow type) → fresh specialized sym.
-    * `enumTable`/`structTable`/`restrictableEnumTable` mirror it for enums/structs/restrictable
-    * enums, keyed by (original sym, ground type-arg tuple) — see
-    * `lookupCaseSym`/`lookupStructSym`/`lookupRestrictableCaseSym`. `restrictableEnumTable` maps
-    * to a regular `EnumSym`: restrictable enums lower to regular enums (the restriction itself is
-    * erased, checking already concluded), so they need no fresh-symbol infrastructure of their own.
-    *
-    * Package-visible: [[SpecializeAndLower]] needs it as the type its `sctx` implicit is threaded
-    * through.
+    * `defTable` maps (original sym, instantiated type) → fresh sym. `enumTable`/`structTable`/
+    * `restrictableEnumTable` mirror it for enums/structs/restrictable enums, keyed by (original
+    * sym, ground type-arg tuple) — see `lookupCaseSym`/`lookupStructSym`/`lookupRestrictableCaseSym`.
+    * `restrictableEnumTable` maps to a regular `EnumSym`, since restrictable enums lower to
+    * regular enums.
     */
   private[monomorph2] class SharedContext(
     val defTable: Map[(Symbol.DefnSym, Type), Symbol.DefnSym],
@@ -61,8 +55,7 @@ object Specialize {
     val enumTable: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym],
     val structTable: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym],
     val restrictableEnumTable: Map[(Symbol.RestrictableEnumSym, List[Type]), Symbol.EnumSym],
-    // Carried here (rather than as a separate implicit threaded through every [[SpecializeAndLower]]
-    // helper) solely for the fused walk's ApplySig case, which calls resolveSigSym.
+    // Needed only by resolveSigSym (the fused walk's ApplySig case).
     val instances: Map[(Symbol.TraitSym, TypeConstructor), Instance]
   ) {
     private val specializedDefsQueue: ConcurrentLinkedQueue[(Symbol.DefnSym, MonoAst.Def)] = new ConcurrentLinkedQueue()
@@ -75,8 +68,7 @@ object Specialize {
     def specializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
       specializedDefsQueue.asScala.toMap
 
-    // Diagnostic only, for `MonomorphBench`'s `Xmonobench` table: which of "regularDefs"/
-    // "instanceDefs"/"defaultSigImpls" each specialized def came from.
+    // Diagnostic only, for MonomorphBench's Xmonobench table.
     private val defCategoryCountsQueue: ConcurrentLinkedQueue[String] = new ConcurrentLinkedQueue()
 
     /** Increments the count for `category` (one of "regularDefs"/"instanceDefs"/"defaultSigImpls"). */
@@ -91,17 +83,12 @@ object Specialize {
   /**
     * Returns the sym to use for a call to `sym` instantiated at `it`.
     * - Non-parametric defs: keep the original sym.
-    * - Parametric defs: must be in `defTable` (pre-populated from the solver solution); a miss
-    *   crashes with "Solver gap", identifying a constraint-generator gap.
-    *
-    * Package-visible: [[SpecializeAndLower]] also calls this directly to resolve
-    * lowering-synthesized calls (e.g. channel support functions).
+    * - Parametric defs: must be in `defTable`; a miss crashes with "Solver gap".
     */
   private[monomorph2] def lookupSym(sym: Symbol.DefnSym, it: Type)
                        (implicit sctx: SharedContext): Symbol.DefnSym = {
     val defn = sctx.allDefs.getOrElse(sym, throw InternalCompilerException(s"lookupSym: sym not in allDefs: $sym", sym.loc))
-    // Check defTable first: polymorphic instance defs and default-sig impls may have empty
-    // spec.tparams but still need specialization (via instTparams / traitTparams).
+    // defTable first: instance/default-sig defs can have empty spec.tparams but still need specialization.
     sctx.defTable.get((sym, it)) match {
       case Some(specializedSym) => specializedSym
       case None if defn.spec.tparams.isEmpty => defn.sym  // truly non-parametric
@@ -113,15 +100,10 @@ object Specialize {
   }
 
   /**
-    * Returns the case sym to use for a `Tag`/`Pattern.Tag` whose original case is `caseSym` and
-    * whose ground enum type at this expression/pattern site is `groundEnumTpe`.
-    * - Non-generic enums (`groundEnumTpe` has no type arguments): keep the original case sym —
-    *   there is only one possible instantiation, so nothing was ever entered into `enumTable`
-    *   for it (mirrors `lookupSym`'s "truly non-parametric" case for defs).
-    * - Generic enums: must be in `enumTable` (pre-populated from the solver solution).
-    * - Missing entries: crash with "Solver gap" — ALWAYS, including `AnyType`-containing tuples:
-    *   pattern-only instantiations are deliberately specialized at `AnyType` by
-    *   `ConstraintCollection.visitPat` (see its ⚠️ doc comment), so no tolerance exists here.
+    * Returns the case sym to use for a `Tag`/`Pattern.Tag` at ground enum type `groundEnumTpe`.
+    * - Non-generic enums: keep the original case sym.
+    * - Generic enums: must be in `enumTable`; a miss always crashes with "Solver gap", even for
+    *   `AnyType`-defaulted pattern-only instantiations.
     */
   private[monomorph2] def lookupCaseSym(caseSym: Symbol.CaseSym, groundEnumTpe: Type)(implicit sctx: SharedContext): Symbol.CaseSym = {
     val argTypes = groundEnumTpe.typeArguments
@@ -136,11 +118,9 @@ object Specialize {
   }
 
   /**
-    * Returns the (regular) case sym to use for a restrictable tag/pattern whose original
-    * restrictable case is `caseSym` and whose ground restrictable-enum type at this expression
-    * site is `groundEnumTpe`. Unlike `lookupCaseSym`, there is no "non-generic keeps original sym"
-    * branch: a restrictable enum's type-argument list always starts with its case-set index
-    * (`Kind.CaseSet`), so `argTypes` is never empty — every reference must be in the table.
+    * Returns the (regular) case sym for a restrictable tag/pattern at ground type `groundEnumTpe`.
+    * Always looked up in `restrictableEnumTable` — a restrictable enum's type args always include
+    * its case-set index, so there is no "non-generic" case.
     */
   private[monomorph2] def lookupRestrictableCaseSym(caseSym: Symbol.RestrictableCaseSym, groundEnumTpe: Type)(implicit sctx: SharedContext): Symbol.CaseSym = {
     val argTypes = groundEnumTpe.typeArguments
@@ -154,10 +134,8 @@ object Specialize {
   }
 
   /**
-    * Returns the struct sym to use for a `StructNew`/`StructGet`/`StructPut` whose original
-    * struct is `sym` and whose ground struct type at this expression site is `groundStructTpe`.
-    * Same "non-generic keeps original / generic must be in `structTable` / miss is a Solver gap"
-    * shape as `lookupCaseSym`.
+    * Returns the struct sym for a `StructNew`/`StructGet`/`StructPut` at ground type
+    * `groundStructTpe`. Same shape as `lookupCaseSym`.
     */
   private[monomorph2] def lookupStructSym(sym: Symbol.StructSym, groundStructTpe: Type)(implicit sctx: SharedContext): Symbol.StructSym = {
     val argTypes = groundStructTpe.typeArguments
@@ -241,10 +219,9 @@ object Specialize {
           case TypedAst.FormalParam(varSym, tpe, src, decreasing, fpLoc) =>
             TypedAst.FormalParam(varSym, StrictSubstitution.empty(tpe), src, decreasing, fpLoc)
         }
-        // declaredScheme.base needs the same canonicalization as fparams/retTpe/eff below — its
-        // only consumer, [[SpecializeAndLower.lowerSpec]], feeds it straight into functionType, and an
-        // un-canonicalized type doesn't structurally match enumTable/structTable's keys (built
-        // from canonicalized tuples throughout), so rewriteEnumStructType silently misses.
+        // declaredScheme.base needs the same canonicalization as fparams/retTpe/eff: its consumer
+        // ([[SpecializeAndLower.lowerSpec]]) matches it against enumTable/structTable keys, which
+        // are canonicalized.
         val canonScheme = declaredScheme.copy(base = StrictSubstitution.empty(declaredScheme.base))
         val spec = TypedAst.Spec(doc, ann, mod, tparams, fparams, canonScheme, StrictSubstitution.empty(retTpe), StrictSubstitution.empty(eff), tconstrs, econstrs)
         TypedAst.Op(sym, spec, loc)
@@ -290,28 +267,14 @@ object Specialize {
     (TypedAst.FormalParam(Binder(freshSym, subst0(bnd.tpe)), subst0(tpe), src, decreasing, loc), Map(bnd.sym -> freshSym))
   }
 
-  // `lookupCaseSym`/`lookupStructSym` only rewrite the *symbol* on Tag/Is/Untag/StructNew/
-  // StructGet/StructPut. Every other `Type` value in the tree still refers to the *original*
-  // enum/struct sym with concrete type args, since `StrictSubstitution` only substitutes and
-  // canonicalizes — it has no notion of fresh specialized syms. `TypeVerifier` asserts that a
-  // Tag/Is/Untag's case-sym's `enumSym` matches the enum sym embedded in the surrounding type, so
-  // `rewriteEnumStructType` below must rewrite the type everywhere it appears. It must run after
-  // `lookupCaseSym`/`lookupStructSym` build their lookup keys from the raw type, or the lookup
-  // keys would themselves already be rewritten and never match.
+  // Must run after lookupCaseSym/lookupStructSym build their lookup keys from the raw type — the
+  // keys would already be rewritten and never match otherwise.
 
   /**
-    * Structurally rewrites `tpe`: any `Enum(sym, args)`/`Struct(sym, args)`/
-    * `RestrictableEnum(sym, args)` sub-type whose `(sym, args)` pair is a key in
-    * `sctx.enumTable`/`sctx.structTable`/`sctx.restrictableEnumTable` becomes `Enum(freshSym, Nil)`/
-    * `Struct(freshSym, Nil)` (fully specialized, no more type arguments) — note a
-    * `RestrictableEnum` reference becomes a plain `Enum` type too, since that table maps to a
-    * regular `EnumSym`; anything else is left alone except for recursing into its own sub-parts
-    * (which may themselves need rewriting, e.g. `List[Option[Int32]]` needs both `List` and
-    * `Option` rewritten if both were specialized).
-    *
-    * Package-visible: [[SpecializeAndLower.visitType]] calls this inline at every type-construction
-    * site in the fused walk (folding this rewrite into the same pass instead of a separate
-    * post-pass over the whole tree).
+    * Structurally rewrites `tpe`: any `Enum`/`Struct`/`RestrictableEnum` sub-type whose
+    * `(sym, args)` is a key in `sctx.enumTable`/`structTable`/`restrictableEnumTable` becomes the
+    * fully-specialized `Enum(freshSym, Nil)`/`Struct(freshSym, Nil)` (a `RestrictableEnum`
+    * becomes a plain `Enum`); everything else recurses into its sub-parts unchanged.
     */
   private[monomorph2] def rewriteEnumStructType(tpe: Type)(implicit sctx: SharedContext): Type = tpe match {
     case Type.Apply(_, _, loc) =>
@@ -340,47 +303,30 @@ object Specialize {
       eff = rewriteEnumStructType(spec.eff)
     )
 
-  /**
-    * Applies [[rewriteEnumStructType]] to `fp`'s type.
-    *
-    * Package-visible: [[SpecializeAndLower]]'s per-def walk calls this directly wherever it lowers an
-    * already-specialized formal param.
-    */
+  /** Applies [[rewriteEnumStructType]] to `fp`'s type. */
   private[monomorph2] def rewriteFormalParam(fp: MonoAst.FormalParam)(implicit sctx: SharedContext): MonoAst.FormalParam =
     fp.copy(tpe = rewriteEnumStructType(fp.tpe))
 
   /**
-    * Applies [[rewriteEnumStructType]] to every op's `Spec` in `eff`.
-    *
-    * An op's `Spec` is lowered independently of any def body, so it never passes through
-    * [[SpecializeAndLower.visitType]]'s inline rewrite; this explicit post-pass is what keeps it
-    * consistent with `TypeVerifier`'s enumSym-matches-embedded-type invariant.
+    * Applies [[rewriteEnumStructType]] to every op's `Spec` in `eff` — op specs skip
+    * [[SpecializeAndLower.visitType]]'s inline rewrite entirely, so this is the only pass they get.
     */
   private def rewriteEffect(eff: MonoAst.Effect)(implicit sctx: SharedContext): MonoAst.Effect =
     eff.copy(ops = eff.ops.map(op => op.copy(spec = rewriteSpec(op.spec))))
 
   /**
     * Returns every def reachable from `root` — top-level, instance, and default-sig-impl — plus
-    * the side tables [[mkDefEntries]] needs to reconstruct each one's declared type parameters.
-    *
-    * Instance defs live in `root.instances`, not `root.defs`, and default-sig impls don't exist as
-    * `TypedAst.Def` at all (`sig.exp` defines the body at the trait level) — both are synthesized
-    * into ordinary `TypedAst.Def` entries here, using the same sym formula as `ConstraintGen`, so
-    * `lookupSym` can treat every def uniformly.
+    * the tables [[mkDefEntries]] needs for each one's declared type parameters.
     */
   private def mkAllDefs(root: TypedAst.Root): (Map[Symbol.DefnSym, TypedAst.Def], Map[Symbol.DefnSym, TypedAst.Instance], Map[Symbol.DefnSym, TypedAst.Def], Map[Symbol.DefnSym, List[TypedAst.TypeParam]]) = {
-    // Instance defs live in root.instances, not root.defs — merge for unified lookup.
-    // Also track which instance each def belongs to, so we can use inst.tparams when building subst.
+    // Instance defs live in root.instances, not root.defs.
     val allInstanceDefs: Map[Symbol.DefnSym, TypedAst.Def] =
       root.instances.values.flatMap(_.defs).map(d => d.sym -> d).toMap
-    // Map from instance-def sym → its owning Instance (for inst.tparams lookup).
+    // Instance-def sym → its owning Instance (for inst.tparams lookup).
     val defToInst: Map[Symbol.DefnSym, TypedAst.Instance] =
       root.instances.values.flatMap(inst => inst.defs.map(d => d.sym -> inst)).toMap
-    // Default sig implementations: sig.exp defines the body at the trait level.
-    // Build synthetic TypedAst.Def entries using the same sym formula as ConstraintCollection/Solver.
-    // Also track each default-sig-sym → the trait's own tparams (not in sig.spec.tparams).
-    // The solver tuple for a default sig impl is [traitType, ...sig-own args], so the trait
-    // tparams must be prepended when building the substMap in mkDefEntries.
+    // Default sig impls don't exist as TypedAst.Def — sig.exp is the trait-level body; synthesize
+    // one using the same sym formula as ConstraintGen.
     val defaultSigDefs: Map[Symbol.DefnSym, TypedAst.Def] =
       root.sigs.values.flatMap {
         sig =>
@@ -407,20 +353,11 @@ object Specialize {
   }
 
   /**
-    * Returns one `(freshSym, defn, subst, instantiatedType)` entry per `(sym, tuple)` pair the
-    * solver found reachable, for every parametric def (top-level, instance, or default-sig-impl).
-    *
-    * Solver tuple ordering for instance defs:
-    *   [inst.tparams values..., sig-own tparams values...]
-    * where the prefix covers the instance's tparams (free vars in spec.declaredScheme.base)
-    * and the suffix covers spec.tparams (the def's own declared tparams).
-    * A speculative tuple the solver proposes (e.g. a stray Star var defaulted to AnyType) can
-    * require an instance that doesn't exist (e.g. Coerce[AnyType]) — StrictSubstitution.mk or
-    * subst(declaredScheme.base) then throws InternalCompilerException while reducing an
-    * associated type. Compute both here, together, and drop just this one (sym, tuple) pair on
-    * failure rather than letting the exception propagate out of the for-comprehension and abort
-    * every other def's entries — same outcome as "the solver never proposed this tuple," just
-    * reached by attempting the real reduction instead of predicting it up front.
+    * Returns one `(freshSym, defn, subst, instantiatedType)` entry per `(sym, tuple)` the solver
+    * found reachable, for every parametric def. Solver tuples are
+    * `[inst.tparams values..., sig-own tparams values...]` for instance/default-sig defs. A tuple
+    * that fails to instantiate (e.g. a defaulted `AnyType` needing a nonexistent instance) is
+    * silently dropped rather than crashing.
     */
   private def mkDefEntries(
     solution: Solution,
@@ -433,12 +370,9 @@ object Specialize {
       defn           <- allDefs.get(sym).toList
       tuple          <- tuples.map(_.args)
       instTparams     = defToInst.get(sym).map(_.tparams).getOrElse(Nil)
-      // For default sig impls the trait's tparam(s) are prepended in the solver tuple
-      // but NOT in defn.spec.tparams; recover them from defaultSigTraitTparams.
+      // Prepended in the solver tuple but not in defn.spec.tparams.
       traitTparams    = defaultSigTraitTparams.getOrElse(sym, Nil)
-      // inst.tparams are free vars in the scheme — pair with the tuple prefix.
-      // traitTparams cover the trait's own params (default sigs only).
-      // spec.tparams are the def's own generics — pair with the tuple suffix.
+      // Pairs with the tuple prefix; defn.spec.tparams pairs with the suffix.
       prefixTparams   = instTparams ++ traitTparams
       substMap        = (prefixTparams.zip(tuple) ++ defn.spec.tparams.zip(tuple.drop(prefixTparams.length)))
                           .map { case (tp, ty) => tp.sym -> ty }.toMap
@@ -453,13 +387,9 @@ object Specialize {
     } yield (freshSym, defn, subst, it)
 
   /**
-    * Returns one `(sym, tuple, freshSym, newEnum)` entry per `(sym, tuple)` pair the solver found
-    * reachable, for every enum with a nonempty tparams list (non-generic ones need no
-    * specialization at all — see `lookupCaseSym`'s "argTypes.isEmpty" case, which keeps the
-    * original sym). Same speculative-tuple tolerance as [[mkDefEntries]] (drop on
-    * InternalCompilerException rather than crash the whole computation), even though it's less
-    * likely to matter here (enum case field types rarely carry trait constraints the way def
-    * signatures do).
+    * Returns one `(sym, tuple, freshSym, newEnum)` entry per `(sym, tuple)` the solver found
+    * reachable, for every enum with a nonempty tparams list. Same drop-on-failure behavior as
+    * [[mkDefEntries]].
     */
   private def mkEnumEntries(solution: Solution)(implicit root: TypedAst.Root, flix: Flix): List[(Symbol.EnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
     for {
@@ -483,11 +413,9 @@ object Specialize {
     }
 
   /**
-    * Same shape as [[mkEnumEntries]], except: (a) the tuple is zipped against `index :: tparams`
-    * (the case-set index is always the first solved type argument — see `ConstraintGen`'s
-    * `visitRestrictableEnum`), and (b) the built declaration is an ordinary `TypedAst.Enum`, not a
-    * `TypedAst.RestrictableEnum` — restrictable enums lower to regular enums, so their specialized
-    * copies can go straight through the same [[SpecializeAndLower.lowerEnum]] as regular enums.
+    * Same as [[mkEnumEntries]], except the tuple is zipped against `index :: tparams` (the
+    * case-set index is always the first solved argument), and the result is a plain
+    * `TypedAst.Enum` — restrictable enums lower to regular enums.
     */
   private def mkRestrictableEnumEntries(solution: Solution)(implicit root: TypedAst.Root, flix: Flix): List[(Symbol.RestrictableEnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
     for {
@@ -557,14 +485,11 @@ object Specialize {
 
     implicit val sctx: SharedContext = new SharedContext(defTableMap, allDefs, enumTableMap, structTableMap, restrictableEnumTableMap, is)
 
-    // Biggest-first scheduling (same convention as Typer.scala/Lexer.scala/Weeder2.scala/
-    // Parser2.scala's ParOps.*WithPriority uses): starting the largest defs' work first reduces
-    // the long-tail straggler effect where most threads finish their small defs early and idle
-    // while one thread grinds through whatever big def happened to be scheduled last.
+    // Biggest-first scheduling reduces long-tail stragglers (same convention as
+    // Typer/Lexer/Weeder2/Parser2's ParOps.*WithPriority uses).
     def sortBySize(defn: TypedAst.Def): Int = defn.loc.startLine - defn.loc.endLine
 
-    // Non-parametric defs: those with no spec.tparams AND no instance tparams AND not a
-    // default-sig impl (which has trait tparams not in spec.tparams — always goes via entries).
+    // Non-parametric: no spec.tparams, no instance tparams, and not a default-sig impl.
     ParOps.parMapWithPriority(allDefs.filter { case (sym, d) =>
       d.spec.tparams.isEmpty &&
       defToInst.get(sym).map(_.tparams.isEmpty).getOrElse(true) &&
@@ -594,28 +519,19 @@ object Specialize {
         rewriteEffect(SpecializeAndLower.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc)))
     }
 
-    // Generic originals (tparams.nonEmpty) are dropped: every reachable instantiation already has
-    // a specialized copy in enumEntries (built from the solver solution above), and every
-    // construction/pattern site is routed there via the strict lookupCaseSym/lookupStructSym —
-    // including [[SpecializeAndLower]]'s Datalog runtime enums (Fixpoint3.Ast.*, `FList`, `PredSym`,
-    // `Denotation`), which are ordinary solver-predicted instantiations like any other. Only
-    // non-parametric declarations keep their original sym, since they were never specialized in
-    // the first place. Restrictable enums have no non-parametric case at all (their type-argument
-    // list always starts with the case-set index) — see specializedRestrictableEnums below, which
-    // replaces them the same way.
+    // Generic originals are dropped: every reachable instantiation already has a specialized copy
+    // in enumEntries, reached via the strict lookupCaseSym/lookupStructSym. Restrictable enums
+    // have no non-parametric case at all — see specializedRestrictableEnums below.
     val enums = ParOps.parMapValues(root.enums.filter { case (_, e) => e.tparams.isEmpty }) {
       case TypedAst.Enum(doc, ann, mod, sym, tparams, derives, cases, loc) =>
         SpecializeAndLower.lowerEnum(TypedAst.Enum(doc, ann, mod, sym, tparams, derives, MapOps.mapValues(cases)(visitEnumCase), loc))
     }
 
-    // One specialized declaration (fresh sym, renamed cases, ground field types, tparams = Nil)
-    // per (sym, tuple) the solver actually found reachable — see enumEntries above and
-    // lookupCaseSym, which is what makes expressions actually reference these fresh syms.
+    // One specialized declaration per (sym, tuple) the solver found reachable.
     val specializedEnums: Map[Symbol.EnumSym, MonoAst.Enum] =
       ParOps.parMap(enumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SpecializeAndLower.lowerEnum(newEnum) }.toMap
 
-    // Same shape as specializedEnums, per restrictableEnumEntries — see lookupRestrictableCaseSym,
-    // which is what makes Expr.RestrictableTag/RestrictableChoosePattern reference these fresh syms.
+    // Same as specializedEnums, for restrictableEnumEntries.
     val specializedRestrictableEnums: Map[Symbol.EnumSym, MonoAst.Enum] =
       ParOps.parMap(restrictableEnumEntries) { case (_, _, freshSym, newEnum) => freshSym -> SpecializeAndLower.lowerEnum(newEnum) }.toMap
 
@@ -627,9 +543,7 @@ object Specialize {
     val specializedStructs: Map[Symbol.StructSym, MonoAst.Struct] =
       ParOps.parMap(structEntries) { case (_, _, freshSym, newStruct) => freshSym -> SpecializeAndLower.lowerStruct(newStruct) }.toMap
 
-    // Diagnostic only (see SharedContext.defCategoryCounts) — no equivalent exists for the
-    // demand-driven baseline (Specialization.scala), so MonomorphBench must treat this as
-    // this-pipeline-only data, not something to expect from every run.
+    // Diagnostic only — MonomorphBench must treat this as pipeline-specific data.
     flix.emitEvent(FlixEvent.AfterMonomorphCategories(sctx.defCategoryCounts))
 
     MonoAst.Root(
