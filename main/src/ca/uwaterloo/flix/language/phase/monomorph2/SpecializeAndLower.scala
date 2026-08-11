@@ -573,15 +573,7 @@ object SpecializeAndLower {
       val e = visitExp(exp, env0, subst)
       val es = exps.map(visitExp(_, env0, subst))
       val t = visitType(tpe, subst)
-      // Box primitive args and unbox Object returns for Java generic methods: e.g. `m.put("k", 42)`
-      // boxes 42 via Integer.valueOf; `m.get("k")` unboxes via intValue.
-      val javaParamTypes = method.getParameterTypes
-      val boxedArgs = es.zip(javaParamTypes).map { case (arg, paramType) => boxIfNecessary(arg, paramType) }
-      val javaReturnType = method.getReturnType
-      val needsUnbox = isPrimType(t) && !javaReturnType.isPrimitive
-      val invokeType = if (needsUnbox) boxedWrapperType(t, loc) else t
-      val invoke = MonoAst.Expr.ApplyAtomic(AtomicOp.InvokeMethod(method), e :: boxedArgs, invokeType, subst(eff), loc)
-      unboxIfNecessary(invoke, t, javaReturnType)
+      mkJavaInvoke(method, List(e), es, t, subst(eff), loc, AtomicOp.InvokeMethod.apply)
 
     case TypedAst.Expr.InvokeSuperMethod(method, exps, tpe, eff, loc) =>
       // The super call is routed through the enclosing NewObject's this-ref (LocalContext).
@@ -597,14 +589,7 @@ object SpecializeAndLower {
     case TypedAst.Expr.InvokeStaticMethod(method, exps, tpe, eff, loc) =>
       val es = exps.map(visitExp(_, env0, subst))
       val t = visitType(tpe, subst)
-      // Box primitive args and unbox Object returns (same as InvokeMethod).
-      val javaParamTypes = method.getParameterTypes
-      val boxedArgs = es.zip(javaParamTypes).map { case (arg, paramType) => boxIfNecessary(arg, paramType) }
-      val javaReturnType = method.getReturnType
-      val needsUnbox = isPrimType(t) && !javaReturnType.isPrimitive
-      val invokeType = if (needsUnbox) boxedWrapperType(t, loc) else t
-      val invoke = MonoAst.Expr.ApplyAtomic(AtomicOp.InvokeStaticMethod(method), boxedArgs, invokeType, subst(eff), loc)
-      unboxIfNecessary(invoke, t, javaReturnType)
+      mkJavaInvoke(method, Nil, es, t, subst(eff), loc, AtomicOp.InvokeStaticMethod.apply)
 
     case TypedAst.Expr.GetField(field, exp, tpe, eff, loc) =>
       val e = visitExp(exp, env0, subst)
@@ -1169,6 +1154,20 @@ object SpecializeAndLower {
         expr.loc.asSynthetic
       )
     } else expr
+  }
+
+  /**
+    * Returns a call to Java `method`, boxing `args` and unboxing the result symmetrically (see
+    * `boxIfNecessary`/`unboxIfNecessary`). Shared by `InvokeMethod`/`InvokeStaticMethod` — `mkOp`
+    * is the `AtomicOp` constructor and `receiver` is `List(thisRef)` or `Nil`.
+    */
+  private def mkJavaInvoke(method: java.lang.reflect.Method, receiver: List[MonoAst.Expr], args: List[MonoAst.Expr], t: Type, eff: Type, loc: SourceLocation, mkOp: java.lang.reflect.Method => AtomicOp): MonoAst.Expr = {
+    val boxedArgs = args.zip(method.getParameterTypes).map { case (arg, paramType) => boxIfNecessary(arg, paramType) }
+    val javaReturnType = method.getReturnType
+    val needsUnbox = isPrimType(t) && !javaReturnType.isPrimitive
+    val invokeType = if (needsUnbox) boxedWrapperType(t, loc) else t
+    val invoke = MonoAst.Expr.ApplyAtomic(mkOp(method), receiver ++ boxedArgs, invokeType, eff, loc)
+    unboxIfNecessary(invoke, t, javaReturnType)
   }
 
   /**
