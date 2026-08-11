@@ -39,9 +39,6 @@ import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
   * into enum types (boxing values via `Boxable`), and channel expressions and `Sender`/`Receiver`
   * types into the channel enum encoding.
   *
-  * Forked from [[ca.uwaterloo.flix.language.phase.monomorph.Lowering]]; `mkCast`, Java box/unbox,
-  * and the `subst*` suite are intentionally kept textually in sync with it.
-  *
   * `ConstraintGen` predicts every def-lookup key and specialized symbol synthesized here — keep
   * the two in sync.
   */
