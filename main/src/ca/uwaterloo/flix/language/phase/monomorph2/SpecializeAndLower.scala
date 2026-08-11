@@ -627,12 +627,9 @@ object SpecializeAndLower {
       MonoAst.Expr.ApplyAtomic(AtomicOp.PutStaticField(field), List(e), t, subst(eff), loc)
 
     case TypedAst.Expr.NewObject(sym, clazz, tpe, eff, constructors, methods, loc) =>
-      // NB: the thisRef must use the FRESHENED fparam sym (the method body's vars are renamed),
-      // so the fparams are specialized here, before the body is visited under the new lctx.
-      // Mint a fresh anonymous class symbol for each specialization. Otherwise distinct
-      // specializations of an enclosing generic def (e.g. `mk[String]` and `mk[Int32]`)
-      // would reuse the same anonymous class name and collide, so one specialization would
-      // run with the other's generated class.
+      // thisRef must use the FRESHENED fparam sym, so fparams are specialized before the body is
+      // visited. A fresh anonymous class sym per specialization avoids two specializations of an
+      // enclosing generic def (e.g. mk[String]/mk[Int32]) colliding on the same class name.
       val freshSym = Symbol.mkFreshAnonClassSym(sym.loc)
       val cs = constructors.map {
         case TypedAst.JvmConstructor(cExp, cRetTpe, cEff, cLoc) =>
@@ -646,11 +643,8 @@ object SpecializeAndLower {
           val thisRef = MonoAst.Expr.Var(thisParam.sym, thisParam.tpe, loc)
           implicit val lctx: LocalContext = LocalContext(Some(freshSym), Some(thisRef))
           val e0 = visitExp(mExp, env0 ++ env1, subst)
-          // If this method overrides a Java method whose erased return type is a reference
-          // (e.g. `Object` for a generic interface method) but the Flix result is a primitive,
-          // box it so the value matches the erased JVM signature. This mirrors the boxing applied
-          // to generic Java method *calls* above (see `boxIfNecessary`), and the call site
-          // unboxes the result symmetrically.
+          // If this overrides a Java method whose erased return type is a reference but the Flix
+          // result is primitive, box it to match the erased signature (mirrors boxIfNecessary).
           val e = overriddenJavaReturnType(clazz, mIdent.name, fs.tail.length) match {
             case Some(javaReturnType) => boxIfNecessary(e0, javaReturnType)
             case None => e0
@@ -961,12 +955,9 @@ object SpecializeAndLower {
     val baseTypeLoc = defn.spec.declaredScheme.base.loc.asSynthetic
     val expLoc = defn.exp.loc.asSynthetic
     val effDif = Type.mkDifference(defn.spec.eff, defaultHandler.handledEff, effLoc)
-    // Canonicalized (not left as a raw `(ef - handledEff) + IO` formula): the solution-driven
-    // specializer's defTable keys are built via StrictSubstitution, which canonicalizes ground
-    // effect formulas on the way in (see MonomorphCanon). The synthesized ApplyDef's `itpe`
-    // (handlerArrowType below) must be in that same canonical form, or the (sym, type) lookup
-    // that visitExp performs when it later visits this node misses even though the types are
-    // semantically equal.
+    // Canonicalized: defTable keys are built via StrictSubstitution, which canonicalizes ground
+    // effects — the synthesized ApplyDef's itpe must match that same form or the lookup silently
+    // misses despite being semantically equal.
     val eff = Canonicalization.canonicalEffect(Type.mkUnion(effDif, Type.IO, effLoc))
     val tpe = Type.mkCurriedArrowWithEffect(defn.spec.fparams.map(_.tpe), eff, defn.spec.retTpe, baseTypeLoc)
     val spec = defn.spec.copy(
@@ -987,10 +978,8 @@ object SpecializeAndLower {
         expLoc
       )
     val handlerArrowType = Type.mkArrowWithEffect(innerLambda.tpe, eff, defn.spec.retTpe, expLoc)
-    // The handler sym is embedded unresolved: this synthesized TypedAst node is subsequently
-    // visited by visitExp, whose ApplyDef case resolves it against the solver solution like any
-    // other call site. Resolving it here instead would make visitExp re-look-up an already-fresh
-    // sym, which is not in allDefs and crashes.
+    // Embedded unresolved: visitExp's ApplyDef case resolves it later, like any other call site —
+    // resolving it here would make that re-lookup crash (the fresh sym isn't in allDefs).
     val handlerDefSymUse = SymUse.DefSymUse(defaultHandler.handlerSym, expLoc)
     val handlerCall = TypedAst.Expr.ApplyDef(handlerDefSymUse, List(innerLambda), List(innerLambda.tpe), handlerArrowType, defn.spec.retTpe, eff, ApplyPosition.NonTail, expLoc)
     defn.copy(spec = spec, exp = handlerCall)
@@ -1511,11 +1500,10 @@ object SpecializeAndLower {
     * (rewritten) as the returned node's own type.
     *
     * `sym` is almost always non-generic (Datalog/PredSym/etc. runtime AST nodes); the two
-    * actually-generic exceptions are `Enums.List.FList` (`mkNil`/`mkCons`) and `Enums.Fixpoint.Ast.Shared.Denotation`
-    * (`mkDenotation`'s `Relational` case), whose instantiations `ConstraintCollection` predicts.
-    * Because `mkTag` synthesizes its own `AtomicOp.Tag` node directly instead of going through
-    * `visitExp`'s Tag case, it must perform the case-sym lookup and the enum/struct-type rewrite
-    * itself. The lookup is strict: a miss is a real constraint-generator gap.
+    * actually-generic exceptions are `Enums.List.List` (`mkNil`/`mkCons`) and
+    * `Enums.Fixpoint.Ast.Shared.Denotation` (`mkDenotation`'s `Relational` case). Synthesizes its
+    * own `AtomicOp.Tag` node directly instead of going through `visitExp`'s Tag case, so it must
+    * do its own strict case-sym lookup and enum/struct-type rewrite.
     */
   private def mkTag(sym: Symbol.EnumSym, tag: String, exps: List[MonoAst.Expr], tpe: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
     val caseSym0 = findCaseSym(sym, tag)
