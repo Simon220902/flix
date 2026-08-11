@@ -93,7 +93,7 @@ object Specialize {
     * - Parametric defs: must be in `defTable` (pre-populated from the solver solution); a miss
     *   crashes with "Solver gap", identifying a constraint-generator gap.
     *
-    * Package-visible: [[SpecializeAndLower.lookup]] also calls this directly to resolve
+    * Package-visible: [[SpecializeAndLower]] also calls this directly to resolve
     * lowering-synthesized calls (e.g. channel support functions).
     */
   private[monomorph2] def lookupSym(sym: Symbol.DefnSym, it: Type)
