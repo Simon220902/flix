@@ -171,7 +171,8 @@ object Specialize {
     }
   }
 
-  // StrictSubstitution and RegionInstantiation below are verbatim from Specialization.scala.
+  // Forked from [[ca.uwaterloo.flix.language.phase.monomorph.Specialization]]; StrictSubstitution
+  // and RegionInstantiation below are intentionally kept textually in sync with it.
 
   /** The effect that all [[TypeConstructor.Region]] are instantiated to. */
   private val RegionInstantiation: TypeConstructor.Effect =
@@ -215,7 +216,8 @@ object Specialize {
     def nonStrict: Substitution = s
   }
 
-  // The helpers below are verbatim from Specialization.scala.
+  // Forked from [[ca.uwaterloo.flix.language.phase.monomorph.Specialization]]; the helpers below
+  // are intentionally kept textually in sync with it.
 
   /** Simplifies the types embedded in `field`. */
   private def visitStructField(field: TypedAst.StructField)(implicit root: TypedAst.Root, flix: Flix): TypedAst.StructField =
