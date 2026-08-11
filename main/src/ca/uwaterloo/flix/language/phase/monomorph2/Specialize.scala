@@ -34,9 +34,10 @@ import scala.jdk.CollectionConverters.*
   * restrictable-enum in a single parallel pass.
   *
   * `run` is the entry point and owns the `SharedContext` lookup tables (`defTable`/`enumTable`/
-  * `structTable`). The per-def specialize+lower walk itself lives in [[SpecializeAndLower.visitDef]],
-  * which calls back into `lookupSym`/`lookupCaseSym`/`lookupStructSym`/`resolveSigSym` here to
-  * resolve each call/tag/struct site.
+  * `structTable`/`restrictableEnumTable`). The per-def specialize+lower walk itself lives in
+  * [[SpecializeAndLower.visitDef]], which calls back into `lookupSym`/`lookupCaseSym`/
+  * `lookupRestrictableCaseSym`/`lookupStructSym`/`resolveSigSym` here to resolve each call/tag/
+  * struct site.
   */
 object Specialize {
 
