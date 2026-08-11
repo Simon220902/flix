@@ -65,27 +65,27 @@ object Specialize {
     // helper) solely for the fused walk's ApplySig case, which calls resolveSigSym.
     val instances: Map[(Symbol.TraitSym, TypeConstructor), Instance]
   ) {
-    private val specializedDefs: ConcurrentLinkedQueue[(Symbol.DefnSym, MonoAst.Def)] = new ConcurrentLinkedQueue()
+    private val specializedDefsQueue: ConcurrentLinkedQueue[(Symbol.DefnSym, MonoAst.Def)] = new ConcurrentLinkedQueue()
 
     /** Records `defn` under its fresh specialized `sym`. */
     def addSpecializedDef(sym: Symbol.DefnSym, defn: MonoAst.Def): Unit =
-      specializedDefs.add((sym, defn))
+      specializedDefsQueue.add((sym, defn))
 
     /** Returns all specialized defs recorded so far. */
-    def getSpecializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
-      specializedDefs.asScala.toMap
+    def specializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
+      specializedDefsQueue.asScala.toMap
 
     // Diagnostic only, for `MonomorphBench`'s `Xmonobench` table: which of "regularDefs"/
     // "instanceDefs"/"defaultSigImpls" each specialized def came from.
-    private val defCategoryCounts: ConcurrentLinkedQueue[String] = new ConcurrentLinkedQueue()
+    private val defCategoryCountsQueue: ConcurrentLinkedQueue[String] = new ConcurrentLinkedQueue()
 
     /** Increments the count for `category` (one of "regularDefs"/"instanceDefs"/"defaultSigImpls"). */
     def incrementDefCategory(category: String): Unit =
-      defCategoryCounts.add(category)
+      defCategoryCountsQueue.add(category)
 
     /** Returns the per-category specialized-def counts. */
-    def getDefCategoryCounts: Map[String, Int] =
-      defCategoryCounts.asScala.groupMapReduce(identity)(_ => 1)(_ + _)
+    def defCategoryCounts: Map[String, Int] =
+      defCategoryCountsQueue.asScala.groupMapReduce(identity)(_ => 1)(_ + _)
   }
 
   /**
@@ -601,10 +601,10 @@ object Specialize {
     // Diagnostic only (see SharedContext.defCategoryCounts) — no equivalent exists for the
     // demand-driven baseline (Specialization.scala), so MonomorphBench must treat this as
     // this-pipeline-only data, not something to expect from every run.
-    flix.emitEvent(FlixEvent.AfterMonomorphCategories(sctx.getDefCategoryCounts))
+    flix.emitEvent(FlixEvent.AfterMonomorphCategories(sctx.defCategoryCounts))
 
     MonoAst.Root(
-      sctx.getSpecializedDefs,
+      sctx.specializedDefs,
       enums ++ specializedEnums ++ specializedRestrictableEnums,
       structs ++ specializedStructs,
       effects,
