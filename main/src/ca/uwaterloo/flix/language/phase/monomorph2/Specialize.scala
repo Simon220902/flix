@@ -40,8 +40,8 @@ import scala.jdk.CollectionConverters.*
 object Specialize {
 
   /**
-    * Accumulates specialized defs; unlike `Specialization.SharedContext` there is no work queue,
-    * since every specialization is known upfront.
+    * Accumulates specialized defs; unlike `Specialization.Context`'s `defQueue` there is no work
+    * queue, since every specialization is known upfront.
     *
     * `defTable` maps (original sym, instantiated type) → fresh sym. `enumTable`/`structTable`/
     * `restrictableEnumTable` mirror it for enums/structs/restrictable enums, keyed by (original
