@@ -30,25 +30,20 @@ import ca.uwaterloo.flix.util.{InternalCompilerException, JvmUtils, Result}
 import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
 
 /**
-  * Fuses specialization and lowering into a single AST walk: for each solver-solution
-  * `(def, subst)` pair, [[visitDef]] both instantiates the def's types/symbols to their concrete
-  * (ground) form and lowers Datalog, channel, and other high-level constructs to their runtime
-  * primitives in one pass, avoiding materializing an intermediate specialized-but-not-yet-lowered
-  * `TypedAst`.
+  * Fuses specialization and lowering into a single AST walk: [[visitDef]] both instantiates a
+  * def's types/symbols to their concrete (ground) form and lowers Datalog, channel, and other
+  * high-level constructs to runtime primitives, avoiding an intermediate specialized-but-not-yet-
+  * lowered `TypedAst`.
   *
-  * Concretely, lowering here:
-  *   - translates the Datalog subset into `Fixpoint.Ast.Datalog` values (ordinary Flix values),
-  *     so the Datalog engine can be implemented as an ordinary Flix program,
-  *   - translates Schema types to enum types and boxes values via `Boxable`,
-  *   - translates channel expressions and `Sender`/`Receiver` types to the channel enum encoding.
+  * Lowering here translates the Datalog subset into `Fixpoint.Ast.Datalog` values, Schema types
+  * into enum types (boxing values via `Boxable`), and channel expressions and `Sender`/`Receiver`
+  * types into the channel enum encoding.
   *
-  * Forked from [[ca.uwaterloo.flix.language.phase.monomorph.Lowering]] with specialization fused
-  * in; the pure helpers shared with that phase (`mkCast`, Java box/unbox, the `subst*` suite, etc.)
-  * are intentionally kept textually in sync with it.
+  * Forked from [[ca.uwaterloo.flix.language.phase.monomorph.Lowering]]; `mkCast`, Java box/unbox,
+  * and the `subst*` suite are intentionally kept textually in sync with it.
   *
-  * `ConstraintCollection` predicts the def-lookup keys and specialized symbols that this phase's
-  * synthesized calls (channels, `par`/`select`, Datalog) resolve against; changes to what is
-  * synthesized here must stay in sync with what is collected there.
+  * `ConstraintGen` predicts every def-lookup key and specialized symbol synthesized here — keep
+  * the two in sync.
   */
 object SpecializeAndLower {
 
@@ -1975,51 +1970,47 @@ object SpecializeAndLower {
   }
 
   /**
-    * Returns a `Fixpoint/Ast/Datalog.BodyPredicate.GuardX`.
+    * Freshens every symbol in `vars`, substitutes them into `exp`, and curries the result into a
+    * lambda per var (outermost var first). Shared by [[mkGuard]]/[[mkFunctional]]/[[mkAppTerm]],
+    * which each then lift the result to operate on boxed values.
+    */
+  private def curryFreshLambda(vars: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, loc: SourceLocation)(implicit sctx: SharedContext, flix: Flix): MonoAst.Expr = {
+    val freshVars = vars.foldLeft(Map.empty[Symbol.VarSym, Symbol.VarSym]) {
+      case (acc, (oldSym, _)) => acc + (oldSym -> Symbol.freshVarSym(oldSym))
+    }
+    val freshExp = substExp(exp, freshVars)
+    vars.foldRight(freshExp) {
+      case ((oldSym, tpe), acc) =>
+        val freshSym = freshVars(oldSym)
+        // tpe is RAW (correct as the liftX/liftXY lookup-key component) but this FormalParam/
+        // Lambda's own type fields need the enum/struct rewrite for consistency.
+        val rewrittenTpe = Specialize.rewriteEnumStructType(tpe)
+        val fparam = MonoAst.FormalParam(freshSym, rewrittenTpe, Occur.Unknown, loc)
+        val lambdaType = Type.mkPureArrow(rewrittenTpe, acc.tpe, loc)
+        MonoAst.Expr.Lambda(fparam, acc, lambdaType, loc)
+    }
+  }
+
+  /**
+    * Returns a `Fixpoint/Ast/Datalog.BodyPredicate.GuardX`. At most 5 free variables are supported.
     */
   private def mkGuard(fvs: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
-    // Compute the number of free variables.
     val arity = fvs.length
-
-    // Check that we have <= 5 free variables.
     if (arity > 5) {
       throw InternalCompilerException("Cannot lift functions with more than 5 free variables.", loc)
     }
 
-    // Special case: No free variables.
+    // No `lift0b`, so a nullary guard is a plain thunk instead of a lifted call.
     if (fvs.isEmpty) {
       val sym = Symbol.freshVarSym("_unit", BoundBy.FormalParam, loc)(RegionScope.Top, flix)
-      // Construct a lambda that takes the unit argument.
       val fparam = MonoAst.FormalParam(sym, Type.Unit, Occur.Unknown, loc)
       val tpe = Type.mkPureArrow(Type.Unit, exp.tpe, loc)
       val lambdaExp = MonoAst.Expr.Lambda(fparam, exp, tpe, loc)
       return mkTag(Enums.Fixpoint.Ast.Datalog.BodyPredicate, s"Guard0", List(lambdaExp), Types.Fixpoint.Ast.Datalog.BodyPredicate, loc)
     }
 
-    // Introduce a fresh variable for each free variable.
-    val freshVars = fvs.foldLeft(Map.empty[Symbol.VarSym, Symbol.VarSym]) {
-      case (acc, (oldSym, _)) => acc + (oldSym -> Symbol.freshVarSym(oldSym))
-    }
-
-    // Substitute every symbol in `exp` for its fresh equivalent.
-    val freshExp = substExp(exp, freshVars)
-
-    // Curry `freshExp` in a lambda expression for each free variable.
-    val lambdaExp = fvs.foldRight(freshExp) {
-      case ((oldSym, tpe), acc) =>
-        val freshSym = freshVars(oldSym)
-        // tpe is RAW (correct as the liftX/liftXY lookup-key component below) but this
-        // FormalParam/Lambda's own type fields need the enum/struct rewrite for consistency.
-        val rewrittenTpe = Specialize.rewriteEnumStructType(tpe)
-        val fparam = MonoAst.FormalParam(freshSym, rewrittenTpe, Occur.Unknown, loc)
-        val lambdaType = Type.mkPureArrow(rewrittenTpe, acc.tpe, loc)
-        MonoAst.Expr.Lambda(fparam, acc, lambdaType, loc)
-    }
-
-    // Lift the lambda expression to operate on boxed values.
+    val lambdaExp = curryFreshLambda(fvs, exp, loc)
     val liftedExp = liftXb(lambdaExp, fvs.map(_._2))
-
-    // Construct the `Fixpoint/Ast/Datalog.BodyPredicate` value.
     val varExps = fvs.map(kv => mkVarSym(kv._1))
     val innerExp = liftedExp :: varExps
     mkTag(Enums.Fixpoint.Ast.Datalog.BodyPredicate, s"Guard$arity", innerExp, Types.Fixpoint.Ast.Datalog.BodyPredicate, loc)
@@ -2029,45 +2020,20 @@ object SpecializeAndLower {
     * Returns a `Fixpoint/Ast/Datalog.BodyPredicate.Functional`.
     */
   private def mkFunctional(outVars: List[Symbol.VarSym], inVars: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, rawResultTpe: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
-    // Compute the number of in and out variables.
-    val numberOfInVars = inVars.length
-    val numberOfOutVars = outVars.length
-
-    if (numberOfInVars > 5) {
+    if (inVars.length > 5) {
       throw InternalCompilerException("Does not support more than 5 in variables.", loc)
     }
-    if (numberOfOutVars == 0) {
+    if (outVars.isEmpty) {
       throw InternalCompilerException("Requires at least one out variable.", loc)
     }
-    if (numberOfOutVars > 5) {
+    if (outVars.length > 5) {
       throw InternalCompilerException("Does not support more than 5 out variables.", loc)
     }
 
-    // Introduce a fresh variable for each in variable.
-    val freshVars = inVars.foldLeft(Map.empty[Symbol.VarSym, Symbol.VarSym]) {
-      case (acc, (oldSym, _)) => acc + (oldSym -> Symbol.freshVarSym(oldSym))
-    }
-
-    // Substitute every symbol in `exp` for its fresh equivalent.
-    val freshExp = substExp(exp, freshVars)
-
-    // Curry `freshExp` in a lambda expression for each free variable.
-    val lambdaExp = inVars.foldRight(freshExp) {
-      case ((oldSym, tpe), acc) =>
-        val freshSym = freshVars(oldSym)
-        // tpe is RAW (correct as the liftX/liftXY lookup-key component below) but this
-        // FormalParam/Lambda's own type fields need the enum/struct rewrite for consistency.
-        val rewrittenTpe = Specialize.rewriteEnumStructType(tpe)
-        val fparam = MonoAst.FormalParam(freshSym, rewrittenTpe, Occur.Unknown, loc)
-        val lambdaType = Type.mkPureArrow(rewrittenTpe, acc.tpe, loc)
-        MonoAst.Expr.Lambda(fparam, acc, lambdaType, loc)
-    }
-
-    // Lift the lambda expression to operate on boxed values.
-    // NB: rawResultTpe (not exp.tpe, already enum/struct-rewritten) — see box's doc comment.
+    val lambdaExp = curryFreshLambda(inVars, exp, loc)
+    // rawResultTpe, not exp.tpe (already enum/struct-rewritten) — see box's doc comment.
     val liftedExp = liftXY(outVars, lambdaExp, inVars.map(_._2), rawResultTpe, exp.loc)
 
-    // Construct the `Fixpoint/Ast/Datalog.BodyPredicate` value.
     val boundVarVector = mkVector(outVars.map(mkVarSym), Types.Fixpoint.Ast.Datalog.VarSym, loc)
     val freeVarVector = mkVector(inVars.map(kv => mkVarSym(kv._1)), Types.Fixpoint.Ast.Datalog.VarSym, loc)
     val innerExp = List(boundVarVector, liftedExp, freeVarVector)
@@ -2078,39 +2044,15 @@ object SpecializeAndLower {
     * Returns a `Fixpoint/Ast/Datalog.HeadTerm.AppX`.
     */
   private def mkAppTerm(fvs: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, rawResultTpe: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
-    // Compute the number of free variables.
     val arity = fvs.length
-
-    // Check that we have <= 5 free variables.
     if (arity > 5) {
       throw InternalCompilerException("Cannot lift functions with more than 5 free variables.", loc)
     }
 
-    // Introduce a fresh variable for each free variable.
-    val freshVars = fvs.foldLeft(Map.empty[Symbol.VarSym, Symbol.VarSym]) {
-      case (acc, (oldSym, _)) => acc + (oldSym -> Symbol.freshVarSym(oldSym))
-    }
-
-    // Substitute every symbol in `exp` for its fresh equivalent.
-    val freshExp = substExp(exp, freshVars)
-
-    // Curry `freshExp` in a lambda expression for each free variable.
-    val lambdaExp = fvs.foldRight(freshExp) {
-      case ((oldSym, tpe), acc) =>
-        val freshSym = freshVars(oldSym)
-        // tpe is RAW (correct as the liftX/liftXY lookup-key component below) but this
-        // FormalParam/Lambda's own type fields need the enum/struct rewrite for consistency.
-        val rewrittenTpe = Specialize.rewriteEnumStructType(tpe)
-        val fparam = MonoAst.FormalParam(freshSym, rewrittenTpe, Occur.Unknown, loc)
-        val lambdaType = Type.mkPureArrow(rewrittenTpe, acc.tpe, loc)
-        MonoAst.Expr.Lambda(fparam, acc, lambdaType, loc)
-    }
-
-    // Lift the lambda expression to operate on boxed values.
-    // NB: rawResultTpe (not exp.tpe, already enum/struct-rewritten) — see box's doc comment.
+    val lambdaExp = curryFreshLambda(fvs, exp, loc)
+    // rawResultTpe, not exp.tpe (already enum/struct-rewritten) — see box's doc comment.
     val liftedExp = liftX(lambdaExp, fvs.map(_._2), rawResultTpe)
 
-    // Construct the `Fixpoint/Ast/Datalog.BodyPredicate` value.
     val varExps = fvs.map(kv => mkVarSym(kv._1))
     val innerExp = liftedExp :: varExps
     mkTag(Enums.Fixpoint.Ast.Datalog.HeadTerm, s"App$arity", innerExp, Types.Fixpoint.Ast.Datalog.HeadTerm, loc)
