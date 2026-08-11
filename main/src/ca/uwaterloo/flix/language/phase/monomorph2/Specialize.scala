@@ -359,11 +359,16 @@ object Specialize {
   private def rewriteEffect(eff: MonoAst.Effect)(implicit sctx: SharedContext): MonoAst.Effect =
     eff.copy(ops = eff.ops.map(op => op.copy(spec = rewriteSpec(op.spec))))
 
-  /** Specializes `root` per `solution`, the constraint solver's output from Phase 3. */
-  def run(root: TypedAst.Root, solution: Solution)(implicit flix: Flix): MonoAst.Root = flix.phase("Monomorpher") {
-    implicit val r: TypedAst.Root = root
-    val is: Map[(Symbol.TraitSym, TypeConstructor), Instance] = MonomorphHelpers.mkInstanceMap(root.instances)
-
+  /**
+    * Returns every def reachable from `root` — top-level, instance, and default-sig-impl — plus
+    * the side tables [[mkDefEntries]] needs to reconstruct each one's declared type parameters.
+    *
+    * Instance defs live in `root.instances`, not `root.defs`, and default-sig impls don't exist as
+    * `TypedAst.Def` at all (`sig.exp` defines the body at the trait level) — both are synthesized
+    * into ordinary `TypedAst.Def` entries here, using the same sym formula as `ConstraintGen`, so
+    * `lookupSym` can treat every def uniformly.
+    */
+  private def mkAllDefs(root: TypedAst.Root): (Map[Symbol.DefnSym, TypedAst.Def], Map[Symbol.DefnSym, TypedAst.Instance], Map[Symbol.DefnSym, TypedAst.Def], Map[Symbol.DefnSym, List[TypedAst.TypeParam]]) = {
     // Instance defs live in root.instances, not root.defs — merge for unified lookup.
     // Also track which instance each def belongs to, so we can use inst.tparams when building subst.
     val allInstanceDefs: Map[Symbol.DefnSym, TypedAst.Def] =
@@ -375,7 +380,7 @@ object Specialize {
     // Build synthetic TypedAst.Def entries using the same sym formula as ConstraintCollection/Solver.
     // Also track each default-sig-sym → the trait's own tparams (not in sig.spec.tparams).
     // The solver tuple for a default sig impl is [traitType, ...sig-own args], so the trait
-    // tparams must be prepended when building the substMap in entries below.
+    // tparams must be prepended when building the substMap in mkDefEntries.
     val defaultSigDefs: Map[Symbol.DefnSym, TypedAst.Def] =
       root.sigs.values.flatMap {
         sig =>
@@ -398,131 +403,155 @@ object Specialize {
           }
       }.toMap
 
-    val allDefs: Map[Symbol.DefnSym, TypedAst.Def] = root.defs ++ allInstanceDefs ++ defaultSigDefs
+    (root.defs ++ allInstanceDefs ++ defaultSigDefs, defToInst, defaultSigDefs, defaultSigTraitTparams)
+  }
 
-    // Build entries: one per (sym, tuple) pair from the solution for parametric defs.
-    //
-    // Solver tuple ordering for instance defs:
-    //   [inst.tparams values..., sig-own tparams values...]
-    // where the prefix covers the instance's tparams (free vars in spec.declaredScheme.base)
-    // and the suffix covers spec.tparams (the def's own declared tparams).
-    // A speculative tuple the solver proposes (e.g. a stray Star var defaulted to AnyType) can
-    // require an instance that doesn't exist (e.g. Coerce[AnyType]) — StrictSubstitution.mk or
-    // subst(declaredScheme.base) then throws InternalCompilerException while reducing an
-    // associated type. Compute both here, together, and drop just this one (sym, tuple) pair on
-    // failure rather than letting the exception propagate out of the for-comprehension and abort
-    // every other def's entries — same outcome as "the solver never proposed this tuple," just
-    // reached by attempting the real reduction instead of predicting it up front.
-    val entries: List[(Symbol.DefnSym, TypedAst.Def, StrictSubstitution, Type)] =
-      for {
-        (sym, tuples)  <- solution.defs.toList
-        defn           <- allDefs.get(sym).toList
-        tuple          <- tuples.map(_.args)
-        instTparams     = defToInst.get(sym).map(_.tparams).getOrElse(Nil)
-        // For default sig impls the trait's tparam(s) are prepended in the solver tuple
-        // but NOT in defn.spec.tparams; recover them from defaultSigTraitTparams.
-        traitTparams    = defaultSigTraitTparams.getOrElse(sym, Nil)
-        // inst.tparams are free vars in the scheme — pair with the tuple prefix.
-        // traitTparams cover the trait's own params (default sigs only).
-        // spec.tparams are the def's own generics — pair with the tuple suffix.
-        prefixTparams   = instTparams ++ traitTparams
-        substMap        = (prefixTparams.zip(tuple) ++ defn.spec.tparams.zip(tuple.drop(prefixTparams.length)))
-                            .map { case (tp, ty) => tp.sym -> ty }.toMap
-        if defn.spec.tparams.nonEmpty || instTparams.nonEmpty || traitTparams.nonEmpty
-        freshSym        = Symbol.freshDefnSym(defn.sym)
-        (subst, it)     <- try {
-                             val s = StrictSubstitution.mk(Substitution(substMap))
-                             List((s, s(defn.spec.declaredScheme.base)))
-                           } catch {
-                             case _: InternalCompilerException => Nil
-                           }
-      } yield (freshSym, defn, subst, it)
+  /**
+    * Returns one `(freshSym, defn, subst, instantiatedType)` entry per `(sym, tuple)` pair the
+    * solver found reachable, for every parametric def (top-level, instance, or default-sig-impl).
+    *
+    * Solver tuple ordering for instance defs:
+    *   [inst.tparams values..., sig-own tparams values...]
+    * where the prefix covers the instance's tparams (free vars in spec.declaredScheme.base)
+    * and the suffix covers spec.tparams (the def's own declared tparams).
+    * A speculative tuple the solver proposes (e.g. a stray Star var defaulted to AnyType) can
+    * require an instance that doesn't exist (e.g. Coerce[AnyType]) — StrictSubstitution.mk or
+    * subst(declaredScheme.base) then throws InternalCompilerException while reducing an
+    * associated type. Compute both here, together, and drop just this one (sym, tuple) pair on
+    * failure rather than letting the exception propagate out of the for-comprehension and abort
+    * every other def's entries — same outcome as "the solver never proposed this tuple," just
+    * reached by attempting the real reduction instead of predicting it up front.
+    */
+  private def mkDefEntries(
+    solution: Solution,
+    allDefs: Map[Symbol.DefnSym, TypedAst.Def],
+    defToInst: Map[Symbol.DefnSym, TypedAst.Instance],
+    defaultSigTraitTparams: Map[Symbol.DefnSym, List[TypedAst.TypeParam]]
+  )(implicit root: TypedAst.Root, flix: Flix): List[(Symbol.DefnSym, TypedAst.Def, StrictSubstitution, Type)] =
+    for {
+      (sym, tuples)  <- solution.defs.toList
+      defn           <- allDefs.get(sym).toList
+      tuple          <- tuples.map(_.args)
+      instTparams     = defToInst.get(sym).map(_.tparams).getOrElse(Nil)
+      // For default sig impls the trait's tparam(s) are prepended in the solver tuple
+      // but NOT in defn.spec.tparams; recover them from defaultSigTraitTparams.
+      traitTparams    = defaultSigTraitTparams.getOrElse(sym, Nil)
+      // inst.tparams are free vars in the scheme — pair with the tuple prefix.
+      // traitTparams cover the trait's own params (default sigs only).
+      // spec.tparams are the def's own generics — pair with the tuple suffix.
+      prefixTparams   = instTparams ++ traitTparams
+      substMap        = (prefixTparams.zip(tuple) ++ defn.spec.tparams.zip(tuple.drop(prefixTparams.length)))
+                          .map { case (tp, ty) => tp.sym -> ty }.toMap
+      if defn.spec.tparams.nonEmpty || instTparams.nonEmpty || traitTparams.nonEmpty
+      freshSym        = Symbol.freshDefnSym(defn.sym)
+      (subst, it)     <- try {
+                           val s = StrictSubstitution.mk(Substitution(substMap))
+                           List((s, s(defn.spec.declaredScheme.base)))
+                         } catch {
+                           case _: InternalCompilerException => Nil
+                         }
+    } yield (freshSym, defn, subst, it)
 
+  /**
+    * Returns one `(sym, tuple, freshSym, newEnum)` entry per `(sym, tuple)` pair the solver found
+    * reachable, for every enum with a nonempty tparams list (non-generic ones need no
+    * specialization at all — see `lookupCaseSym`'s "argTypes.isEmpty" case, which keeps the
+    * original sym). Same speculative-tuple tolerance as [[mkDefEntries]] (drop on
+    * InternalCompilerException rather than crash the whole computation), even though it's less
+    * likely to matter here (enum case field types rarely carry trait constraints the way def
+    * signatures do).
+    */
+  private def mkEnumEntries(solution: Solution)(implicit root: TypedAst.Root, flix: Flix): List[(Symbol.EnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
+    for {
+      (sym, tuples) <- solution.enums.toList
+      enm           <- root.enums.get(sym).toList
+      if enm.tparams.nonEmpty
+      tuple         <- tuples.map(_.args)
+      substMap       = enm.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
+      freshSym       = Symbol.freshEnumSym(enm.sym)
+      subst         <- try {
+                         List(StrictSubstitution.mk(Substitution(substMap)))
+                       } catch {
+                         case _: InternalCompilerException => Nil
+                       }
+    } yield {
+      val newCases = enm.cases.map { case (caseSym, TypedAst.Case(_, tpes, sc, cloc)) =>
+        val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, caseSym.ordinal, caseSym.loc)
+        newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
+      }
+      (sym, tuple, freshSym, TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc))
+    }
+
+  /**
+    * Same shape as [[mkEnumEntries]], except: (a) the tuple is zipped against `index :: tparams`
+    * (the case-set index is always the first solved type argument — see `ConstraintGen`'s
+    * `visitRestrictableEnum`), and (b) the built declaration is an ordinary `TypedAst.Enum`, not a
+    * `TypedAst.RestrictableEnum` — restrictable enums lower to regular enums, so their specialized
+    * copies can go straight through the same [[SpecializeAndLower.lowerEnum]] as regular enums.
+    */
+  private def mkRestrictableEnumEntries(solution: Solution)(implicit root: TypedAst.Root, flix: Flix): List[(Symbol.RestrictableEnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
+    for {
+      (sym, tuples) <- solution.restrictableEnums.toList
+      enm           <- root.restrictableEnums.get(sym).toList
+      tuple         <- tuples.map(_.args)
+      substMap       = (enm.index :: enm.tparams).zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
+      freshSym       = Symbol.freshEnumSym(SpecializeAndLower.lowerRestrictableEnumSym(sym))
+      subst         <- try {
+                         List(StrictSubstitution.mk(Substitution(substMap)))
+                       } catch {
+                         case _: InternalCompilerException => Nil
+                       }
+    } yield {
+      val newCases = enm.cases.map { case (caseSym, TypedAst.RestrictableCase(_, tpes, sc, cloc)) =>
+        val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, -1, caseSym.loc)
+        newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
+      }
+      (sym, tuple, freshSym, TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc))
+    }
+
+  /** Same shape as [[mkEnumEntries]], for structs. */
+  private def mkStructEntries(solution: Solution)(implicit root: TypedAst.Root, flix: Flix): List[(Symbol.StructSym, List[Type], Symbol.StructSym, TypedAst.Struct)] =
+    for {
+      (sym, tuples) <- solution.structs.toList
+      struct        <- root.structs.get(sym).toList
+      if struct.tparams.nonEmpty
+      tuple         <- tuples.map(_.args)
+      substMap       = struct.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
+      freshSym       = Symbol.freshStructSym(struct.sym)
+      subst         <- try {
+                         List(StrictSubstitution.mk(Substitution(substMap)))
+                       } catch {
+                         case _: InternalCompilerException => Nil
+                       }
+    } yield {
+      val newFields = struct.fields.map { case (fieldSym, TypedAst.StructField(_, tpe, floc)) =>
+        val newFieldSym = new Symbol.StructFieldSym(freshSym, fieldSym.name, fieldSym.loc)
+        newFieldSym -> TypedAst.StructField(newFieldSym, subst(tpe), floc)
+      }
+      (sym, tuple, freshSym, TypedAst.Struct(struct.doc, struct.ann, struct.mod, freshSym, Nil, struct.sc, newFields, struct.loc))
+    }
+
+  /** Specializes `root` per `solution`, the constraint solver's output from Phase 3. */
+  def run(root: TypedAst.Root, solution: Solution)(implicit flix: Flix): MonoAst.Root = flix.phase("Monomorpher") {
+    implicit val r: TypedAst.Root = root
+    val is: Map[(Symbol.TraitSym, TypeConstructor), Instance] = MonomorphHelpers.mkInstanceMap(root.instances)
+
+    val (allDefs, defToInst, defaultSigDefs, defaultSigTraitTparams) = mkAllDefs(root)
+
+    val entries = mkDefEntries(solution, allDefs, defToInst, defaultSigTraitTparams)
     // defTable: (original sym, instantiated arrow type) → fresh specialized sym.
     val defTableMap: Map[(Symbol.DefnSym, Type), Symbol.DefnSym] =
       entries.map { case (freshSym, defn, _, it) => (defn.sym, it) -> freshSym }.toMap
 
-    // Build enum/struct entries: one per (sym, tuple) pair from the solution, for enums/structs
-    // with a nonempty tparams list (non-generic ones need no specialization at all — see
-    // lookupCaseSym/lookupStructSym's "argTypes.isEmpty" case, which keeps the original sym).
-    // Much simpler than defs' entries above: no instance-tparam-prefix / default-sig-tparam
-    // complexity, just the declaration's own tparams zipped with the solved tuple. Same
-    // speculative-tuple tolerance as defs (drop on InternalCompilerException rather than crash
-    // the whole computation) for consistency, even though it's less likely to matter here (enum
-    // case field types rarely carry trait constraints the way def signatures do).
-    val enumEntries: List[(Symbol.EnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
-      for {
-        (sym, tuples) <- solution.enums.toList
-        enm           <- root.enums.get(sym).toList
-        if enm.tparams.nonEmpty
-        tuple         <- tuples.map(_.args)
-        substMap       = enm.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
-        freshSym       = Symbol.freshEnumSym(enm.sym)
-        subst         <- try {
-                           List(StrictSubstitution.mk(Substitution(substMap)))
-                         } catch {
-                           case _: InternalCompilerException => Nil
-                         }
-      } yield {
-        val newCases = enm.cases.map { case (caseSym, TypedAst.Case(_, tpes, sc, cloc)) =>
-          val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, caseSym.ordinal, caseSym.loc)
-          newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
-        }
-        (sym, tuple, freshSym, TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc))
-      }
-
+    val enumEntries = mkEnumEntries(solution)
     val enumTableMap: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym] =
       enumEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
 
-    // Same shape as enumEntries, except: (a) the tuple is zipped against `index :: tparams` (the
-    // case-set index is always the first solved type argument — see ConstraintCollection's
-    // fromRestrictableEnums), and (b) the built declaration is an ordinary TypedAst.Enum, not a
-    // TypedAst.RestrictableEnum — restrictable enums lower to regular enums, so their specialized
-    // copies can go straight through the same [[SpecializeAndLower.lowerEnum]] as regular enums.
-    val restrictableEnumEntries: List[(Symbol.RestrictableEnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
-      for {
-        (sym, tuples) <- solution.restrictableEnums.toList
-        enm           <- root.restrictableEnums.get(sym).toList
-        tuple         <- tuples.map(_.args)
-        substMap       = (enm.index :: enm.tparams).zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
-        freshSym       = Symbol.freshEnumSym(SpecializeAndLower.lowerRestrictableEnumSym(sym))
-        subst         <- try {
-                           List(StrictSubstitution.mk(Substitution(substMap)))
-                         } catch {
-                           case _: InternalCompilerException => Nil
-                         }
-      } yield {
-        val newCases = enm.cases.map { case (caseSym, TypedAst.RestrictableCase(_, tpes, sc, cloc)) =>
-          val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, -1, caseSym.loc)
-          newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
-        }
-        (sym, tuple, freshSym, TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc))
-      }
-
+    val restrictableEnumEntries = mkRestrictableEnumEntries(solution)
     val restrictableEnumTableMap: Map[(Symbol.RestrictableEnumSym, List[Type]), Symbol.EnumSym] =
       restrictableEnumEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
 
-    val structEntries: List[(Symbol.StructSym, List[Type], Symbol.StructSym, TypedAst.Struct)] =
-      for {
-        (sym, tuples) <- solution.structs.toList
-        struct        <- root.structs.get(sym).toList
-        if struct.tparams.nonEmpty
-        tuple         <- tuples.map(_.args)
-        substMap       = struct.tparams.zip(tuple).map { case (tp, ty) => tp.sym -> ty }.toMap
-        freshSym       = Symbol.freshStructSym(struct.sym)
-        subst         <- try {
-                           List(StrictSubstitution.mk(Substitution(substMap)))
-                         } catch {
-                           case _: InternalCompilerException => Nil
-                         }
-      } yield {
-        val newFields = struct.fields.map { case (fieldSym, TypedAst.StructField(_, tpe, floc)) =>
-          val newFieldSym = new Symbol.StructFieldSym(freshSym, fieldSym.name, fieldSym.loc)
-          newFieldSym -> TypedAst.StructField(newFieldSym, subst(tpe), floc)
-        }
-        (sym, tuple, freshSym, TypedAst.Struct(struct.doc, struct.ann, struct.mod, freshSym, Nil, struct.sc, newFields, struct.loc))
-      }
-
+    val structEntries = mkStructEntries(solution)
     val structTableMap: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym] =
       structEntries.map { case (sym, tuple, freshSym, _) => (sym, tuple) -> freshSym }.toMap
 
