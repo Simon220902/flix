@@ -242,12 +242,12 @@ object SpecializeAndLower {
       val t = visitType(tpe, subst)
       MonoAst.Expr.ApplyClo(e1, e2, t, subst(eff), loc)
 
-    case TypedAst.Expr.ApplyDef(symUse, exps, _, itpe, tpe, eff, _, loc) =>
+    case TypedAst.Expr.ApplyDef(symUse, exps, _, itpe0, tpe, eff, _, loc) =>
       // The instantiated arrow type is the solver-solution lookup key: keyed PRE-lowering.
-      val it = subst(itpe)
-      val newSym = lookupSym(symUse.sym, it)
+      val groundArrowTpe = subst(itpe0)
+      val newSym = lookupSym(symUse.sym, groundArrowTpe)
       val es = exps.map(visitExp(_, env0, subst))
-      MonoAst.Expr.ApplyDef(newSym, es, visitTypeSubstituted(it), visitType(tpe, subst), subst(eff), loc)
+      MonoAst.Expr.ApplyDef(newSym, es, visitTypeSubstituted(groundArrowTpe), visitType(tpe, subst), subst(eff), loc)
 
     case TypedAst.Expr.ApplyLocalDef(symUse, exps, _, tpe, eff, _, loc) =>
       val es = exps.map(visitExp(_, env0, subst))
@@ -743,13 +743,13 @@ object SpecializeAndLower {
       // Synthesizes Fixpoint solver projectInto calls.
       lowerInjectInto(exps, predsAndArities, loc, env0, subst)
 
-    case TypedAst.Expr.ApplySig(symUse, exps, _, _, itpe, tpe, eff, _, loc) =>
+    case TypedAst.Expr.ApplySig(symUse, exps, _, _, itpe0, tpe, eff, _, loc) =>
       // Resolve the sig to its concrete instance def (or default impl), then emit as ApplyDef.
-      val it = subst(itpe)
-      val resolvedDef = resolveSigSym(symUse.sym, it)(sctx.instances, root, flix)
-      val newSym = lookupSym(resolvedDef.sym, it)
+      val groundArrowTpe = subst(itpe0)
+      val resolvedDef = resolveSigSym(symUse.sym, groundArrowTpe)(sctx.instances, root, flix)
+      val newSym = lookupSym(resolvedDef.sym, groundArrowTpe)
       val es = exps.map(visitExp(_, env0, subst))
-      MonoAst.Expr.ApplyDef(newSym, es, visitTypeSubstituted(it), visitType(tpe, subst), subst(eff), loc)
+      MonoAst.Expr.ApplyDef(newSym, es, visitTypeSubstituted(groundArrowTpe), visitType(tpe, subst), subst(eff), loc)
 
     case TypedAst.Expr.Error(m, _, _) =>
       throw InternalCompilerException(s"Unexpected error expression near", m.loc)
@@ -1191,22 +1191,22 @@ object SpecializeAndLower {
     * a call to `Concurrent/Channel.newChannel(10)`. `tpe` is the specialized type of the result.
     */
   private def lowerNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
-    // itpe is the def-lookup key: computed and used raw (un-rewritten), matching every other
-    // lookup-key position in the fused walk — only the node's own field positions get rewritten.
-    val itpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
-    val defnSym = lookupSym(Defs.Concurrent.Channel.NewChannelTuple, itpe)
-    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(itpe), visitTypeSubstituted(tpe), eff, loc)
+    // groundArrowTpe is the def-lookup key: computed and used raw (un-rewritten), matching every
+    // other lookup-key position in the fused walk — only the node's own field positions get rewritten.
+    val groundArrowTpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
+    val defnSym = lookupSym(Defs.Concurrent.Channel.NewChannelTuple, groundArrowTpe)
+    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(groundArrowTpe), visitTypeSubstituted(tpe), eff, loc)
   }
 
   /** Returns a channel get expression: `<- c` becomes a call to `Concurrent/Channel.get(c)`. */
   private def mkGetChannel(exp: MonoAst.Expr, chanTpe: Type, tpe: Type, eff: Type, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
-    // itpe is the def-lookup key: built from `chanTpe`, the caller's RAW (un-rewritten) substituted
-    // channel type — NOT `exp.tpe`, which is already enum/struct-rewritten by the time `exp` (the
-    // already-visited channel expression) reaches here. Only the node's own field positions below
-    // get the rewrite.
-    val itpe = lowerType(Type.mkIoArrow(chanTpe, tpe, loc))
-    val defnSym = lookupSym(Defs.Concurrent.Channel.Get, itpe)
-    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(itpe), visitTypeSubstituted(tpe), eff, loc)
+    // groundArrowTpe is the def-lookup key: built from `chanTpe`, the caller's RAW (un-rewritten)
+    // substituted channel type — NOT `exp.tpe`, which is already enum/struct-rewritten by the time
+    // `exp` (the already-visited channel expression) reaches here. Only the node's own field
+    // positions below get the rewrite.
+    val groundArrowTpe = lowerType(Type.mkIoArrow(chanTpe, tpe, loc))
+    val defnSym = lookupSym(Defs.Concurrent.Channel.Get, groundArrowTpe)
+    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(groundArrowTpe), visitTypeSubstituted(tpe), eff, loc)
   }
 
   /**
@@ -1219,16 +1219,16 @@ object SpecializeAndLower {
     * See https://github.com/flix/flix/issues/10378.
     */
   private def mkPutChannel(exp1: MonoAst.Expr, exp2: MonoAst.Expr, chanTpe: Type, valTpe: Type, eff: Type, loc: SourceLocation)(implicit sctx: SharedContext, flix: Flix): MonoAst.Expr = {
-    // itpe is the def-lookup key: built from the caller's RAW (un-rewritten) substituted
+    // groundArrowTpe is the def-lookup key: built from the caller's RAW (un-rewritten) substituted
     // chanTpe/valTpe — see mkGetChannel's doc comment for why `exp1.tpe`/`exp2.tpe` can't be used
     // directly (already enum/struct-rewritten by the time the visited exprs reach here).
-    val itpe = lowerType(Type.mkIoUncurriedArrow(List(valTpe, chanTpe), Type.Unit, loc))
-    val defnSym = lookupSym(Defs.Concurrent.Channel.Put, itpe)
+    val groundArrowTpe = lowerType(Type.mkIoUncurriedArrow(List(valTpe, chanTpe), Type.Unit, loc))
+    val defnSym = lookupSym(Defs.Concurrent.Channel.Put, groundArrowTpe)
     val chanSym = mkLetSym("chan", loc)
     val valueSym = mkLetSym("value", loc)
     val chanVar = MonoAst.Expr.Var(chanSym, exp1.tpe, loc)
     val valueVar = MonoAst.Expr.Var(valueSym, exp2.tpe, loc)
-    val putExp = MonoAst.Expr.ApplyDef(defnSym, List(valueVar, chanVar), Specialize.rewriteEnumStructType(itpe), Type.Unit, eff, loc)
+    val putExp = MonoAst.Expr.ApplyDef(defnSym, List(valueVar, chanVar), Specialize.rewriteEnumStructType(groundArrowTpe), Type.Unit, eff, loc)
     // The channel binding is the outermost let, so the channel is evaluated before the value.
     val valueLet = MonoAst.Expr.Let(valueSym, exp2, putExp, Type.Unit, eff, Occur.Unknown, loc)
     MonoAst.Expr.Let(chanSym, exp1, valueLet, Type.Unit, eff, Occur.Unknown, loc)
@@ -1283,10 +1283,10 @@ object SpecializeAndLower {
   private def mkChannelAdminList(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
     val admins = ListOps.zip(rs, channels) map {
       case ((_, _, _, rawChanTpe), (chanSym, _)) =>
-        // itpe/lookup key built from the RAW channel type — see SelectChannel case's doc comment.
-        val itpe = lowerType(Type.mkPureArrow(rawChanTpe, Types.Concurrent.Channel.MpmcAdmin, loc))
-        val defnSym = lookupSym(Defs.Concurrent.Channel.MpmcAdmin, itpe)
-        MonoAst.Expr.ApplyDef(defnSym, List(MonoAst.Expr.Var(chanSym, visitTypeSubstituted(rawChanTpe), loc)), Specialize.rewriteEnumStructType(itpe), Types.Concurrent.Channel.MpmcAdmin, Type.Pure, loc)
+        // groundArrowTpe/lookup key built from the RAW channel type — see SelectChannel case's doc comment.
+        val groundArrowTpe = lowerType(Type.mkPureArrow(rawChanTpe, Types.Concurrent.Channel.MpmcAdmin, loc))
+        val defnSym = lookupSym(Defs.Concurrent.Channel.MpmcAdmin, groundArrowTpe)
+        MonoAst.Expr.ApplyDef(defnSym, List(MonoAst.Expr.Var(chanSym, visitTypeSubstituted(rawChanTpe), loc)), Specialize.rewriteEnumStructType(groundArrowTpe), Types.Concurrent.Channel.MpmcAdmin, Type.Pure, loc)
     }
     mkList(admins, Types.Concurrent.Channel.MpmcAdmin, loc)
   }
@@ -1302,13 +1302,13 @@ object SpecializeAndLower {
     val locksType = Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc)
 
     val selectRetTpe = Type.mkTuple(List(Type.Int32, locksType), loc)
-    val itpe = Type.mkIoUncurriedArrow(List(admins.tpe, Type.Bool), selectRetTpe, loc)
+    val groundArrowTpe = Type.mkIoUncurriedArrow(List(admins.tpe, Type.Bool), selectRetTpe, loc)
     val blocking = default match {
       case Some(_) => MonoAst.Expr.Cst(Constant.Bool(false), Type.Bool, loc)
       case None => MonoAst.Expr.Cst(Constant.Bool(true), Type.Bool, loc)
     }
-    val defnSym = lookupSym(Defs.Concurrent.Channel.SelectFrom, itpe)
-    MonoAst.Expr.ApplyDef(defnSym, List(admins, blocking), Specialize.rewriteEnumStructType(lowerType(itpe)), Specialize.rewriteEnumStructType(selectRetTpe), Type.IO, loc)
+    val defnSym = lookupSym(Defs.Concurrent.Channel.SelectFrom, groundArrowTpe)
+    MonoAst.Expr.ApplyDef(defnSym, List(admins, blocking), Specialize.rewriteEnumStructType(lowerType(groundArrowTpe)), Specialize.rewriteEnumStructType(selectRetTpe), Type.IO, loc)
   }
 
   /**
@@ -1330,12 +1330,12 @@ object SpecializeAndLower {
       case (((sym, _, exp, rawChanTpe), (chSym, _)), i) =>
         val locksSym = mkLetSym("locks", loc)
         val pat = mkTuplePattern(Nel(MonoAst.Pattern.Cst(Constant.Int32(i), Type.Int32, loc), List(MonoAst.Pattern.Var(locksSym, locksType, Occur.Unknown, loc))), loc)
-        // getTpe/itpe/lookup key built from the RAW channel type — see SelectChannel's doc comment.
+        // getTpe/groundArrowTpe/lookup key built from the RAW channel type — see SelectChannel's doc comment.
         val getTpe = extractChannelTpe(rawChanTpe)
-        val itpe = lowerType(Type.mkIoUncurriedArrow(List(rawChanTpe, locksTypeRaw), getTpe, loc))
+        val groundArrowTpe = lowerType(Type.mkIoUncurriedArrow(List(rawChanTpe, locksTypeRaw), getTpe, loc))
         val args = List(MonoAst.Expr.Var(chSym, visitTypeSubstituted(rawChanTpe), loc), MonoAst.Expr.Var(locksSym, locksType, loc))
-        val defnSym = lookupSym(Defs.Concurrent.Channel.UnsafeGetAndUnlock, itpe)
-        val getExp = MonoAst.Expr.ApplyDef(defnSym, args, Specialize.rewriteEnumStructType(itpe), visitTypeSubstituted(getTpe), eff, loc)
+        val defnSym = lookupSym(Defs.Concurrent.Channel.UnsafeGetAndUnlock, groundArrowTpe)
+        val getExp = MonoAst.Expr.ApplyDef(defnSym, args, Specialize.rewriteEnumStructType(groundArrowTpe), visitTypeSubstituted(getTpe), eff, loc)
         val e = MonoAst.Expr.Let(sym, getExp, exp, exp.tpe, eff, Occur.Unknown, loc)
         MonoAst.MatchRule(pat, None, e)
     }
@@ -1407,9 +1407,9 @@ object SpecializeAndLower {
 
   /** Returns a new channel expression. */
   private def mkNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
-    val itpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
-    val defnSym = lookupSym(Defs.Concurrent.Channel.NewChannel, itpe)
-    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(itpe), Specialize.rewriteEnumStructType(tpe), eff, loc)
+    val groundArrowTpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
+    val defnSym = lookupSym(Defs.Concurrent.Channel.NewChannel, groundArrowTpe)
+    MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(groundArrowTpe), Specialize.rewriteEnumStructType(tpe), eff, loc)
   }
 
   /**
@@ -1580,9 +1580,9 @@ object SpecializeAndLower {
     val preds = predicatesOfExtVar(extVarType, loc)
     val lambdaExp = mkExtVarLambda(preds, extVarType, loc)
     val argExps = goalPredSym :: goalTerms :: withPredSyms :: lambdaExp :: mergedExp :: Nil
-    val itpe = Types.Fixpoint.Solver.mkProvenanceOf(extVarType, loc)
-    val defn = lookupSym(Defs.Fixpoint.Solver.ProvenanceOf, itpe)
-    MonoAst.Expr.ApplyDef(defn, argExps, Specialize.rewriteEnumStructType(itpe), Specialize.rewriteEnumStructType(tpe), eff, loc)
+    val groundArrowTpe = Types.Fixpoint.Solver.mkProvenanceOf(extVarType, loc)
+    val defn = lookupSym(Defs.Fixpoint.Solver.ProvenanceOf, groundArrowTpe)
+    MonoAst.Expr.ApplyDef(defn, argExps, Specialize.rewriteEnumStructType(groundArrowTpe), Specialize.rewriteEnumStructType(tpe), eff, loc)
   }
 
   /** Lowers a Datalog query-with-select to Fixpoint solver solve+facts calls. `tpe`/`eff` must arrive already substituted from the caller (fused walk). */
@@ -1791,8 +1791,8 @@ object SpecializeAndLower {
         val resultType = Types.Fixpoint.Ast.Datalog.Datalog
         val defn = lookupSym(Defs.Fixpoint.Solver.Union, resultType)
         val argExps = exp :: acc :: Nil
-        val itpe = Types.Fixpoint.Solver.MergeType
-        MonoAst.Expr.ApplyDef(defn, argExps, itpe, resultType, exp.eff, loc)
+        val groundArrowTpe = Types.Fixpoint.Solver.MergeType
+        MonoAst.Expr.ApplyDef(defn, argExps, groundArrowTpe, resultType, exp.eff, loc)
     }
 
   /**
@@ -1803,8 +1803,8 @@ object SpecializeAndLower {
     val resultType = Types.Fixpoint.Ast.Datalog.Datalog
     val defn = lookupSym(Defs.Fixpoint.Solver.ProjectSym, resultType)
     val argExps = predSymExp :: datalogExp :: Nil
-    val itpe = Types.Fixpoint.Solver.FilterType
-    MonoAst.Expr.ApplyDef(defn, argExps, itpe, resultType, datalogExp.eff, loc)
+    val groundArrowTpe = Types.Fixpoint.Solver.FilterType
+    MonoAst.Expr.ApplyDef(defn, argExps, groundArrowTpe, resultType, datalogExp.eff, loc)
   }
 
   /**
@@ -2437,22 +2437,22 @@ object SpecializeAndLower {
     * where `"terms" == termsVar.text`.
     */
   private def mkUnboxedTerm(termsVar: Symbol.VarSym, tpe: Type, i: Int, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
-    val outerItpe = Type.mkPureUncurriedArrow(List(Types.Fixpoint.Boxed), tpe, loc)
-    val innerItpe = Type.mkPureUncurriedArrow(List(Type.Int32, Types.Fixpoint.VectorOfBoxed), Types.Fixpoint.Boxed, loc)
+    val outerGroundArrowTpe = Type.mkPureUncurriedArrow(List(Types.Fixpoint.Boxed), tpe, loc)
+    val innerGroundArrowTpe = Type.mkPureUncurriedArrow(List(Type.Int32, Types.Fixpoint.VectorOfBoxed), Types.Fixpoint.Boxed, loc)
     MonoAst.Expr.ApplyDef(
-      sym = lookupSym(Defs.Fixpoint.Boxable.Unbox, outerItpe),
+      sym = lookupSym(Defs.Fixpoint.Boxable.Unbox, outerGroundArrowTpe),
       exps = List(
         MonoAst.Expr.ApplyDef(
-          sym = lookupSym(Symbol.mkDefnSym(s"Vector.get"), innerItpe),
+          sym = lookupSym(Symbol.mkDefnSym(s"Vector.get"), innerGroundArrowTpe),
           exps = List(
             MonoAst.Expr.Cst(Constant.Int32(i), Type.Int32, loc),
             MonoAst.Expr.Var(termsVar, Types.Fixpoint.VectorOfBoxed, loc)
           ),
-          itpe = innerItpe,
+          itpe = innerGroundArrowTpe,
           tpe = Types.Fixpoint.Boxed, eff = Type.Pure, loc = loc
         )
       ),
-      itpe = Specialize.rewriteEnumStructType(outerItpe),
+      itpe = Specialize.rewriteEnumStructType(outerGroundArrowTpe),
       tpe = Specialize.rewriteEnumStructType(tpe), eff = Type.Pure, loc = loc
     )
   }

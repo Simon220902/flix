@@ -30,24 +30,21 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import scala.jdk.CollectionConverters.*
 
 /**
-  * Solution-driven specialization: uses the solver's solution to specialize every def/enum/
+  * Solution-driven specialization uses [[ConstraintSolver]]'s solution to specialize every def/enum/
   * struct/restrictable-enum in a single parallel pass.
   *
-  * `run` builds the `SharedContext` lookup tables; [[SpecializeAndLower.visitDef]] does the actual
-  * per-def specialize+lower walk, resolving each call/tag/struct site via `lookupSym`/
-  * `lookupCaseSym`/`lookupRestrictableCaseSym`/`lookupStructSym`/`resolveSigSym`.
+  * `run` builds the `SharedContext` lookup tables.
+  *
+  * [[SpecializeAndLower.visitDef]] does the actual per-def specialize+lower walk, resolving each
+  * call/tag/struct site via `lookupSym`/`lookupCaseSym`/`lookupRestrictableCaseSym`/
+  * `lookupStructSym`/`resolveSigSym`.
   */
 object Specialize {
 
   /**
-    * Accumulates specialized defs; unlike `Specialization.Context`'s `defQueue` there is no work
-    * queue, since every specialization is known upfront.
+    * The mutable data used throughout specialization.
     *
-    * `defTable` maps (original sym, instantiated type) → fresh sym. `enumTable`/`structTable`/
-    * `restrictableEnumTable` mirror it for enums/structs/restrictable enums, keyed by (original
-    * sym, ground type-arg tuple) — see `lookupCaseSym`/`lookupStructSym`/`lookupRestrictableCaseSym`.
-    * `restrictableEnumTable` maps to a regular `EnumSym`, since restrictable enums lower to
-    * regular enums.
+    * This class is thread-safe.
     */
   private[monomorph2] class SharedContext(
     val defTable: Map[(Symbol.DefnSym, Type), Symbol.DefnSym],
@@ -55,7 +52,6 @@ object Specialize {
     val enumTable: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym],
     val structTable: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym],
     val restrictableEnumTable: Map[(Symbol.RestrictableEnumSym, List[Type]), Symbol.EnumSym],
-    // Needed only by resolveSigSym (the fused walk's ApplySig case).
     val instances: Map[(Symbol.TraitSym, TypeConstructor), Instance]
   ) {
     private val specializedDefsQueue: ConcurrentLinkedQueue[(Symbol.DefnSym, MonoAst.Def)] = new ConcurrentLinkedQueue()
@@ -68,7 +64,7 @@ object Specialize {
     def specializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
       specializedDefsQueue.asScala.toMap
 
-    // Diagnostic only, for MonomorphBench's Xmonobench table.
+    /** Diagnostic only, for MonomorphBench's Xmonobench table. */
     private val defCategoryCountsQueue: ConcurrentLinkedQueue[String] = new ConcurrentLinkedQueue()
 
     /** Increments the count for `category` (one of "regularDefs"/"instanceDefs"/"defaultSigImpls"). */
@@ -81,71 +77,75 @@ object Specialize {
   }
 
   /**
-    * Returns the sym to use for a call to `sym` instantiated at `it`.
-    * - Non-parametric defs: keep the original sym.
-    * - Parametric defs: must be in `defTable`; a miss crashes with "Solver gap".
+    * Returns the sym to use for a call to `sym` at ground arrow type `groundArrowTpe`.
     */
-  private[monomorph2] def lookupSym(sym: Symbol.DefnSym, it: Type)
+  private[monomorph2] def lookupSym(sym: Symbol.DefnSym, groundArrowTpe: Type)
                        (implicit sctx: SharedContext): Symbol.DefnSym = {
     val defn = sctx.allDefs.getOrElse(sym, throw InternalCompilerException(s"lookupSym: sym not in allDefs: $sym", sym.loc))
-    // defTable first: instance/default-sig defs can have empty spec.tparams but still need specialization.
-    sctx.defTable.get((sym, it)) match {
+    // instance/default-sig defs can have empty spec.tparams but still need specialization
+    // therefore we first look it up in `sctx.defTable`
+    sctx.defTable.get((sym, groundArrowTpe)) match {
       case Some(specializedSym) => specializedSym
-      case None if defn.spec.tparams.isEmpty => defn.sym  // truly non-parametric
       case None =>
-        throw InternalCompilerException(
-          s"Solver gap: no specialization for $sym at type $it. " +
-          "Extend the constraint generator to cover this call site.", sym.loc)
+        if (defn.spec.tparams.isEmpty) {
+          defn.sym
+        } else {
+          throw InternalCompilerException(
+            s"Solver gap: no specialization for $sym at type $groundArrowTpe. " +
+              "Extend the constraint generator to cover this call site.", sym.loc)
+        }
     }
   }
 
   /**
     * Returns the case sym to use for a `Tag`/`Pattern.Tag` at ground enum type `groundEnumTpe`.
-    * - Non-generic enums: keep the original case sym.
-    * - Generic enums: must be in `enumTable`; a miss always crashes with "Solver gap", even for
-    *   `AnyType`-defaulted pattern-only instantiations.
     */
   private[monomorph2] def lookupCaseSym(caseSym: Symbol.CaseSym, groundEnumTpe: Type)(implicit sctx: SharedContext): Symbol.CaseSym = {
     val argTypes = groundEnumTpe.typeArguments
     sctx.enumTable.get((caseSym.enumSym, argTypes)) match {
       case Some(freshEnumSym) => new Symbol.CaseSym(freshEnumSym, caseSym.name, caseSym.ordinal, caseSym.loc)
-      case None if argTypes.isEmpty => caseSym
-      case None =>
-        throw InternalCompilerException(
-          s"Solver gap: no enum specialization for ${caseSym.enumSym} at $argTypes. " +
-          "Extend the constraint generator to cover this call site.", caseSym.loc)
+      case None  =>
+        if (argTypes.isEmpty) {
+          caseSym
+        } else {
+          throw InternalCompilerException(
+            s"Solver gap: no enum specialization for ${caseSym.enumSym} at $argTypes. " +
+              "Extend the constraint generator to cover this call site.", caseSym.loc)
+        }
     }
   }
 
   /**
-    * Returns the (regular) case sym for a restrictable tag/pattern at ground type `groundEnumTpe`.
-    * Always looked up in `restrictableEnumTable` — a restrictable enum's type args always include
-    * its case-set index, so there is no "non-generic" case.
+    * Returns the (regular) case sym for a restrictable tag/pattern at ground restrictable-enum
+    * type `groundRestrictableEnumTpe`.
     */
-  private[monomorph2] def lookupRestrictableCaseSym(caseSym: Symbol.RestrictableCaseSym, groundEnumTpe: Type)(implicit sctx: SharedContext): Symbol.CaseSym = {
-    val argTypes = groundEnumTpe.typeArguments
+  private[monomorph2] def lookupRestrictableCaseSym(caseSym: Symbol.RestrictableCaseSym, groundRestrictableEnumTpe: Type)(implicit sctx: SharedContext): Symbol.CaseSym = {
+    val argTypes = groundRestrictableEnumTpe.typeArguments
     sctx.restrictableEnumTable.get((caseSym.enumSym, argTypes)) match {
       case Some(freshEnumSym) => new Symbol.CaseSym(freshEnumSym, caseSym.name, -1, caseSym.loc)
       case None =>
         throw InternalCompilerException(
           s"Solver gap: no restrictable enum specialization for ${caseSym.enumSym} at $argTypes. " +
-          "Extend the constraint generator to cover this call site.", caseSym.loc)
+            "Extend the constraint generator to cover this call site.", caseSym.loc)
     }
   }
 
   /**
     * Returns the struct sym for a `StructNew`/`StructGet`/`StructPut` at ground type
-    * `groundStructTpe`. Same shape as `lookupCaseSym`.
+    * `groundStructTpe`.
     */
   private[monomorph2] def lookupStructSym(sym: Symbol.StructSym, groundStructTpe: Type)(implicit sctx: SharedContext): Symbol.StructSym = {
     val argTypes = groundStructTpe.typeArguments
     sctx.structTable.get((sym, argTypes)) match {
       case Some(freshStructSym) => freshStructSym
-      case None if argTypes.isEmpty => sym
       case None =>
-        throw InternalCompilerException(
-          s"Solver gap: no struct specialization for $sym at $argTypes. " +
-          "Extend the constraint generator to cover this call site.", groundStructTpe.loc)
+        if (argTypes.isEmpty) {
+          sym
+        } else {
+          throw InternalCompilerException(
+            s"Solver gap: no struct specialization for $sym at $argTypes. " +
+              "Extend the constraint generator to cover this call site.", groundStructTpe.loc)
+        }
     }
   }
 
