@@ -263,17 +263,14 @@ object Specialize {
     (TypedAst.FormalParam(Binder(freshSym, subst0(bnd.tpe)), subst0(tpe), src, decreasing, loc), Map(bnd.sym -> freshSym))
   }
 
-  // Must run after lookupCaseSym/lookupStructSym build their lookup keys from the raw type — the
-  // keys would already be rewritten and never match otherwise.
-
-  /**
-    * Structurally rewrites `tpe`: any `Enum`/`Struct`/`RestrictableEnum` sub-type whose
-    * `(sym, args)` is a key in `sctx.enumTable`/`structTable`/`restrictableEnumTable` becomes the
-    * fully-specialized `Enum(freshSym, Nil)`/`Struct(freshSym, Nil)` (a `RestrictableEnum`
-    * becomes a plain `Enum`); everything else recurses into its sub-parts unchanged.
+  /** Rewrites any specialized `Enum`/`Struct`/`RestrictableEnum` reference in `tpe` to its fresh sym.
+    * `tpe` must already be substituted and lowered (i.e. only ever called via `visitType`/
+    * `visitTypeSubstituted`).
     */
   private[monomorph2] def rewriteEnumStructType(tpe: Type)(implicit sctx: SharedContext): Type = tpe match {
-    case Type.Apply(_, _, loc) =>
+    case Type.Cst(_, _)                    => tpe
+
+    case Type.Apply(_, _, loc)             =>
       val args = tpe.typeArguments
       tpe.baseType match {
         case Type.Cst(TypeConstructor.Enum(sym, _), _) if sctx.enumTable.contains((sym, args)) =>
@@ -285,9 +282,15 @@ object Specialize {
         case _ =>
           Type.mkApply(rewriteEnumStructType(tpe.baseType), args.map(rewriteEnumStructType), loc)
       }
+
     case Type.Alias(sym, args, inner, loc) =>
       Type.Alias(sym, args.map(rewriteEnumStructType), rewriteEnumStructType(inner), loc)
-    case _ => tpe // Var, other Cst, AssocType, etc. — nothing to rewrite.
+
+    case Type.Var(_, loc)                  => throw InternalCompilerException("Unexpected type variable", loc)
+    case Type.AssocType(_, _, _, loc)      => throw InternalCompilerException("Unexpected associated type", loc)
+    case Type.JvmToType(_, loc)            => throw InternalCompilerException("Unexpected JVM type", loc)
+    case Type.JvmToEff(_, loc)             => throw InternalCompilerException("Unexpected JVM eff", loc)
+    case Type.UnresolvedJvmType(_, loc)    => throw InternalCompilerException("Unexpected JVM type", loc)
   }
 
   /** Applies [[rewriteEnumStructType]] to every type embedded in `spec`. */
