@@ -169,14 +169,14 @@ object Specialize {
   private[monomorph2] case class StrictSubstitution(s: Substitution) {
     /** Applies this substitution to `tpe0`, defaulting any free type variable to its kind's default type. */
     def apply(tpe0: Type)(implicit root: TypedAst.Root, flix: Flix): Type = tpe0 match {
-      case v@Type.Var(sym, _)                       => s.m.get(sym) match {
-        case None    => Canonicalization.default(v)
+      case Type.Var(sym, _)                         => s.m.get(sym) match {
+        case None    => Canonicalization.default(tpe0)
         case Some(t) => t
       }
 
       case Type.Cst(TypeConstructor.Region(_), loc) => Type.Cst(RegionInstantiation, loc)
 
-      case cst@Type.Cst(_, _)                       => cst
+      case Type.Cst(_, _)                           => tpe0
 
       case app@Type.Apply(_, _, _)                  => Canonicalization.normalizeApply(apply, app, isGround = true)
 
@@ -223,12 +223,12 @@ object Specialize {
         TypedAst.Op(sym, spec, loc)
     }
 
-  /** Returns the `def` that implements signature `sym` for the instance at arrow-type `tpe`, or its trait-level default. */
-  private[monomorph2] def resolveSigSym(sym: Symbol.SigSym, tpe: Type)
+  /** Returns the `def` that implements signature `sym` for the instance at ground arrow type `groundArrowTpe`, or its trait-level default. */
+  private[monomorph2] def resolveSigSym(sym: Symbol.SigSym, groundArrowTpe: Type)
                             (implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): TypedAst.Def = {
     val sig = root.sigs(sym)
     val trt = root.traits(sym.trt)
-    val subst = ConstraintSolver2.fullyUnify(sig.spec.declaredScheme.base, tpe, RegionScope.Top, RigidityEnv.empty)(root.eqEnv, flix).get
+    val subst = ConstraintSolver2.fullyUnify(sig.spec.declaredScheme.base, groundArrowTpe, RegionScope.Top, RigidityEnv.empty)(root.eqEnv, flix).get
     val traitType = subst.m(trt.tparam.sym)
     val tyCon = traitType.typeConstructor.get
     val instance = sctx.instances((sym.trt, tyCon))
