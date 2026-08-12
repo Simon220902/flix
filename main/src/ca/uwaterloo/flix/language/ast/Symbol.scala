@@ -592,8 +592,8 @@ object Symbol {
   }
 
   object CaseSym {
-    /** `RestrictableCaseSym` has no ordinal of its own to carry over when it is rebuilt as a `CaseSym`.
-      * Must be used consistently, since ordinal is part of `CaseSym`'s equality.
+    /** The `ordinal` to use for a `CaseSym` that has no real one. Must be used consistently,
+      * since `ordinal` is part of `CaseSym`'s equality.
       */
     val NoOrdinal: Int = -1
   }
