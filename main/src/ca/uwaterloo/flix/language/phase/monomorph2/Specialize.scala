@@ -277,9 +277,9 @@ object Specialize {
     (TypedAst.FormalParam(Binder(freshSym, subst0(bnd.tpe)), subst0(tpe), src, decreasing, loc), Map(bnd.sym -> freshSym))
   }
 
-  /** Rewrites any specialized `Enum`/`Struct`/`RestrictableEnum` reference in `tpe` to its fresh sym.
-    * `tpe` must already be substituted and lowered (i.e. only ever called via `visitType`/
-    * `visitTypeSubstituted`).
+  /**
+    * Rewrites any specialized `Enum`/`Struct`/`RestrictableEnum` reference in `tpe` to its fresh sym.
+    * `tpe` must already be substituted and lowered (i.e. only ever called via `visitType`/`visitTypeSubstituted`).
     */
   private[monomorph2] def rewriteEnumStructType(tpe: Type)(implicit tables: LookupTables): Type = tpe match {
     case Type.Cst(_, _)                    => tpe
@@ -307,25 +307,9 @@ object Specialize {
     case Type.UnresolvedJvmType(_, loc)    => throw InternalCompilerException("Unexpected JVM type", loc)
   }
 
-  /** Applies [[rewriteEnumStructType]] to every type embedded in `spec`. */
-  private def rewriteSpec(spec: MonoAst.Spec)(implicit tables: LookupTables): MonoAst.Spec =
-    spec.copy(
-      fparams = spec.fparams.map(rewriteFormalParam),
-      functionType = rewriteEnumStructType(spec.functionType),
-      retTpe = rewriteEnumStructType(spec.retTpe),
-      eff = rewriteEnumStructType(spec.eff)
-    )
-
   /** Applies [[rewriteEnumStructType]] to `fp`'s type. */
   private[monomorph2] def rewriteFormalParam(fp: MonoAst.FormalParam)(implicit tables: LookupTables): MonoAst.FormalParam =
     fp.copy(tpe = rewriteEnumStructType(fp.tpe))
-
-  /**
-    * Applies [[rewriteEnumStructType]] to every op's `Spec` in `eff` — op specs skip
-    * [[SpecializeAndLower.visitType]]'s inline rewrite entirely, so this is the only pass they get.
-    */
-  private def rewriteEffect(eff: MonoAst.Effect)(implicit tables: LookupTables): MonoAst.Effect =
-    eff.copy(ops = eff.ops.map(op => op.copy(spec = rewriteSpec(op.spec))))
 
   /**
     * Returns every def reachable from `root` — top-level, instance, and default-sig-impl — plus
@@ -528,7 +512,7 @@ object Specialize {
     val effects = ParOps.parMapValues(root.effects) {
       case TypedAst.Effect(doc, ann, mod, sym, targs, ops0, loc) =>
         val ops = ops0.map(visitEffectOp)
-        rewriteEffect(SpecializeAndLower.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc)))
+        SpecializeAndLower.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc))
     }
 
     // Generic originals are dropped: every reachable instantiation already has a specialized copy

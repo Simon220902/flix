@@ -158,7 +158,7 @@ object SpecializeAndLower {
   /**
     * Lowers the given `effect`.
     */
-  protected[monomorph2] def lowerEffect(effect: TypedAst.Effect): MonoAst.Effect = effect match {
+  protected[monomorph2] def lowerEffect(effect: TypedAst.Effect)(implicit tables: LookupTables): MonoAst.Effect = effect match {
     case TypedAst.Effect(doc, ann, mod, sym, _, ops0, loc) =>
       // TODO EFFECT-TPARAMS use tparams
       val ops = ops0.map(lowerOp)
@@ -181,21 +181,23 @@ object SpecializeAndLower {
   /**
     * Lowers the given `op`.
     */
-  private def lowerOp(op: TypedAst.Op): MonoAst.Op = op match {
+  private def lowerOp(op: TypedAst.Op)(implicit tables: LookupTables): MonoAst.Op = op match {
     case TypedAst.Op(sym, spec0, loc) =>
       val spec = lowerSpec(spec0)
       MonoAst.Op(sym, spec, loc)
   }
 
   /**
-    * Lowers the given `spec0`.
+    * Lowers the given `spec0`. Every embedded type goes through [[visitTypeSubstituted]] — see
+    * [[lowerEnum]]'s doc comment for why bare [[lowerType]] is not enough here.
     */
-  private def lowerSpec(spec0: TypedAst.Spec): MonoAst.Spec = spec0 match {
+  private def lowerSpec(spec0: TypedAst.Spec)(implicit tables: LookupTables): MonoAst.Spec = spec0 match {
     case TypedAst.Spec(doc, ann, mod, _, fparams0, declaredScheme, retTpe, eff, _, _) =>
-      val fs = fparams0.map(lowerFormalParam)
-      val fType = lowerType(declaredScheme.base)
-      val rType = lowerType(retTpe)
-      MonoAst.Spec(doc, ann, mod, fs, fType, rType, eff, DefContext.Unknown)
+      val fs = fparams0.map(lowerFormalParam).map(Specialize.rewriteFormalParam)
+      val fType = visitTypeSubstituted(declaredScheme.base)
+      val rType = visitTypeSubstituted(retTpe)
+      val e = visitTypeSubstituted(eff)
+      MonoAst.Spec(doc, ann, mod, fs, fType, rType, e, DefContext.Unknown)
   }
 
   /**
