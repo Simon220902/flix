@@ -743,7 +743,7 @@ object SpecializeAndLower {
     case TypedAst.Expr.ApplySig(symUse, exps, _, _, itpe0, tpe, eff, _, loc) =>
       // Resolve the sig to its concrete instance def (or default impl), then emit as ApplyDef.
       val groundArrowTpe = subst(itpe0)
-      val resolvedDef = resolveSigSym(symUse.sym, groundArrowTpe)(sctx.instances, root, flix)
+      val resolvedDef = resolveSigSym(symUse.sym, groundArrowTpe)
       val newSym = lookupSym(resolvedDef.sym, groundArrowTpe)
       val es = exps.map(visitExp(_, env0, subst))
       MonoAst.Expr.ApplyDef(newSym, es, visitTypeSubstituted(groundArrowTpe), visitType(tpe, subst), subst(eff), loc)
