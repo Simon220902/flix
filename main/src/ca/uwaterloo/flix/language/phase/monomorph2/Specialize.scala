@@ -192,9 +192,6 @@ object Specialize {
       case Type.JvmToEff(_, loc)                    => throw InternalCompilerException("unexpected JVM eff", loc)
       case Type.UnresolvedJvmType(_, loc)           => throw InternalCompilerException("unexpected JVM type", loc)
     }
-
-    /** Returns the non-strict version of this substitution. */
-    def nonStrict: Substitution = s
   }
 
   /** Simplifies the types embedded in `field`. */
@@ -226,7 +223,7 @@ object Specialize {
         TypedAst.Op(sym, spec, loc)
     }
 
-  /** Returns the `def` that implements signature `sym` for the instance at `tpe`, or its trait-level default. */
+  /** Returns the `def` that implements signature `sym` for the instance at arrow-type `tpe`, or its trait-level default. */
   private[monomorph2] def resolveSigSym(sym: Symbol.SigSym, tpe: Type)
                             (implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): TypedAst.Def = {
     val sig = root.sigs(sym)
