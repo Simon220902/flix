@@ -115,16 +115,19 @@ object Specialize {
     }
   }
 
+  /** `RestrictableCaseSym` has no ordinal of its own to carry over when it is rebuilt as a `CaseSym`.
+    * But we must use this same value, since ordinal is part of `CaseSym`'s equality.
+    */
+  private val NoOrdinal: Int = -1
+
   /**
     * Returns the (regular) case sym for a restrictable tag/pattern at ground restrictable-enum
     * type `groundRestrictableEnumTpe`.
-    *
-    * N.B. Ordinal is -1 because restrictable enums do not have fixed ordinals.
     */
   private[monomorph2] def lookupRestrictableCaseSym(caseSym: Symbol.RestrictableCaseSym, groundRestrictableEnumTpe: Type)(implicit sctx: SharedContext): Symbol.CaseSym = {
     val argTypes = groundRestrictableEnumTpe.typeArguments
     sctx.restrictableEnumTable.get((caseSym.enumSym, argTypes)) match {
-      case Some(freshEnumSym) => new Symbol.CaseSym(freshEnumSym, caseSym.name, -1, caseSym.loc)
+      case Some(freshEnumSym) => new Symbol.CaseSym(freshEnumSym, caseSym.name, NoOrdinal, caseSym.loc)
       case None =>
         throw InternalCompilerException(
           s"Solver gap: no restrictable enum specialization for ${caseSym.enumSym} at $argTypes. " +
@@ -432,8 +435,7 @@ object Specialize {
                        }
     } yield {
       val newCases = enm.cases.map { case (caseSym, TypedAst.RestrictableCase(_, tpes, sc, cloc)) =>
-        // N.B. Ordinal is -1 because restrictable enums do not have fixed ordinals.
-        val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, -1, caseSym.loc)
+        val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, NoOrdinal, caseSym.loc)
         newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
       }
       (sym, tuple, freshSym, TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc))
