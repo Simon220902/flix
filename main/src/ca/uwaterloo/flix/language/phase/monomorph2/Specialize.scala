@@ -169,22 +169,28 @@ object Specialize {
   private[monomorph2] case class StrictSubstitution(s: Substitution) {
     /** Applies this substitution to `tpe0`, defaulting any free type variable to its kind's default type. */
     def apply(tpe0: Type)(implicit root: TypedAst.Root, flix: Flix): Type = tpe0 match {
-      case v@Type.Var(sym, _) => s.m.get(sym) match {
+      case v@Type.Var(sym, _)                       => s.m.get(sym) match {
         case None    => Canonicalization.default(v)
         case Some(t) => t
       }
+
       case Type.Cst(TypeConstructor.Region(_), loc) => Type.Cst(RegionInstantiation, loc)
+
       case cst@Type.Cst(_, _)                       => cst
+
       case app@Type.Apply(_, _, _)                  => Canonicalization.normalizeApply(apply, app, isGround = true)
+
       case Type.Alias(_, _, t, _)                   => apply(t)
-      case Type.AssocType(symUse, arg0, kind, loc) =>
+
+      case Type.AssocType(symUse, arg0, kind, loc)  =>
         val arg = apply(arg0)
         val assoc = Type.AssocType(symUse, arg, kind, loc)
         val reducedType = Canonicalization.reduceAssocType(assoc)
         Canonicalization.simplify(reducedType, isGround = true)
-      case Type.JvmToType(_, loc)          => throw InternalCompilerException("unexpected JVM type", loc)
-      case Type.JvmToEff(_, loc)           => throw InternalCompilerException("unexpected JVM eff", loc)
-      case Type.UnresolvedJvmType(_, loc)  => throw InternalCompilerException("unexpected JVM type", loc)
+
+      case Type.JvmToType(_, loc)                   => throw InternalCompilerException("unexpected JVM type", loc)
+      case Type.JvmToEff(_, loc)                    => throw InternalCompilerException("unexpected JVM eff", loc)
+      case Type.UnresolvedJvmType(_, loc)           => throw InternalCompilerException("unexpected JVM type", loc)
     }
 
     /** Returns the non-strict version of this substitution. */
