@@ -118,6 +118,8 @@ object Specialize {
   /**
     * Returns the (regular) case sym for a restrictable tag/pattern at ground restrictable-enum
     * type `groundRestrictableEnumTpe`.
+    *
+    * N.B. Ordinal is -1 because restrictable enums do not have fixed ordinals.
     */
   private[monomorph2] def lookupRestrictableCaseSym(caseSym: Symbol.RestrictableCaseSym, groundRestrictableEnumTpe: Type)(implicit sctx: SharedContext): Symbol.CaseSym = {
     val argTypes = groundRestrictableEnumTpe.typeArguments
@@ -430,6 +432,7 @@ object Specialize {
                        }
     } yield {
       val newCases = enm.cases.map { case (caseSym, TypedAst.RestrictableCase(_, tpes, sc, cloc)) =>
+        // N.B. Ordinal is -1 because restrictable enums do not have fixed ordinals.
         val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, -1, caseSym.loc)
         newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
       }
