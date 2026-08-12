@@ -27,6 +27,7 @@ import ca.uwaterloo.flix.util.collection.MapOps
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.LongAdder
 import scala.jdk.CollectionConverters.*
 
 /**
@@ -64,16 +65,22 @@ object Specialize {
     def specializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
       specializedDefsQueue.asScala.toMap
 
-    /** Diagnostic only, for MonomorphBench's Xmonobench table. */
-    private val defCategoryCountsQueue: ConcurrentLinkedQueue[String] = new ConcurrentLinkedQueue()
+    // Diagnostic only, for MonomorphBench's Xmonobench table. Three fixed counters rather than a
+    // queue of per-def category strings, since the category set is fixed and small.
+    private val regularDefsCount: LongAdder = new LongAdder()
+    private val instanceDefsCount: LongAdder = new LongAdder()
+    private val defaultSigImplsCount: LongAdder = new LongAdder()
 
-    /** Increments the count for `category` (one of "regularDefs"/"instanceDefs"/"defaultSigImpls"). */
-    def incrementDefCategory(category: String): Unit =
-      defCategoryCountsQueue.add(category)
+    def incrementRegularDefs(): Unit = regularDefsCount.increment()
+    def incrementInstanceDefs(): Unit = instanceDefsCount.increment()
+    def incrementDefaultSigImpls(): Unit = defaultSigImplsCount.increment()
 
     /** Returns the per-category specialized-def counts. */
-    def defCategoryCounts: Map[String, Int] =
-      defCategoryCountsQueue.asScala.groupMapReduce(identity)(_ => 1)(_ + _)
+    def defCategoryCounts: Map[String, Int] = Map(
+      "regularDefs" -> regularDefsCount.sum().toInt,
+      "instanceDefs" -> instanceDefsCount.sum().toInt,
+      "defaultSigImpls" -> defaultSigImplsCount.sum().toInt
+    )
   }
 
   /**
@@ -500,7 +507,7 @@ object Specialize {
       !defaultSigDefs.contains(sym)
     }, sortBy = (p: (Symbol.DefnSym, TypedAst.Def)) => sortBySize(p._2)) {
       case (sym, defn) => flix.profile(defn.sym, defn.loc) {
-        sctx.incrementDefCategory(if (defToInst.contains(sym)) "instanceDefs" else "regularDefs")
+        if (defToInst.contains(sym)) sctx.incrementInstanceDefs() else sctx.incrementRegularDefs()
         sctx.addSpecializedDef(sym, SpecializeAndLower.visitDef(sym, defn, StrictSubstitution.empty))
       }
     }
@@ -508,11 +515,9 @@ object Specialize {
     // Parametric specializations — one parallel pass, no worklist loop.
     ParOps.parMapWithPriority(entries, sortBy = (e: (Symbol.DefnSym, TypedAst.Def, StrictSubstitution, Type)) => sortBySize(e._2)) { case (freshSym, defn, subst, _) =>
       flix.profile(defn.sym, defn.loc) {
-        val category =
-          if (defToInst.contains(defn.sym)) "instanceDefs"
-          else if (defaultSigDefs.contains(defn.sym)) "defaultSigImpls"
-          else "regularDefs"
-        sctx.incrementDefCategory(category)
+        if (defToInst.contains(defn.sym)) sctx.incrementInstanceDefs()
+        else if (defaultSigDefs.contains(defn.sym)) sctx.incrementDefaultSigImpls()
+        else sctx.incrementRegularDefs()
         sctx.addSpecializedDef(freshSym, SpecializeAndLower.visitDef(freshSym, defn, subst))
       }
     }
