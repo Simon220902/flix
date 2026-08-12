@@ -219,9 +219,8 @@ object Specialize {
           case TypedAst.FormalParam(varSym, tpe, src, decreasing, fpLoc) =>
             TypedAst.FormalParam(varSym, StrictSubstitution.empty(tpe), src, decreasing, fpLoc)
         }
-        // declaredScheme.base needs the same canonicalization as fparams/retTpe/eff: its consumer
-        // ([[SpecializeAndLower.lowerSpec]]) matches it against enumTable/structTable keys, which
-        // are canonicalized.
+        // declaredScheme.base needs the same canonicalization as fparams/retTpe/eff because
+        // enumTable/structTable lookups are keyed on canonicalized types.
         val canonScheme = declaredScheme.copy(base = StrictSubstitution.empty(declaredScheme.base))
         val spec = TypedAst.Spec(doc, ann, mod, tparams, fparams, canonScheme, StrictSubstitution.empty(retTpe), StrictSubstitution.empty(eff), tconstrs, econstrs)
         TypedAst.Op(sym, spec, loc)
