@@ -24,7 +24,7 @@ import ca.uwaterloo.flix.language.ast.ops.TypedAstOps
 import ca.uwaterloo.flix.language.ast.TypedAst.ApplyPosition
 import ca.uwaterloo.flix.language.ast.shared.{BoundBy, Constant, Decreasing, Denotation, Fixity, Mutability, Polarity, PredicateAndArity, RegionScope, SolveMode, SymUse, TypeSource}
 import ca.uwaterloo.flix.language.ast.{AtomicOp, MonoAst, Name, SemanticOp, SourceLocation, Symbol, Type, TypeConstructor, TypedAst}
-import ca.uwaterloo.flix.language.phase.monomorph2.Specialize.{SharedContext, StrictSubstitution, lookupCaseSym, lookupRestrictableCaseSym, lookupStructSym, lookupSym, resolveSigSym, specializeFormalParam, specializeFormalParams}
+import ca.uwaterloo.flix.language.phase.monomorph2.Specialize.{LookupTables, StrictSubstitution, lookupCaseSym, lookupRestrictableCaseSym, lookupStructSym, lookupSym, resolveSigSym, specializeFormalParam, specializeFormalParams}
 import ca.uwaterloo.flix.language.phase.monomorph2.Symbols.{Defs, Enums, Types}
 import ca.uwaterloo.flix.util.{InternalCompilerException, JvmUtils, Result}
 import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
@@ -90,15 +90,15 @@ object SpecializeAndLower {
   }
 
   /** Composes `subst`, lowering, and [[Specialize.rewriteEnumStructType]] — the single call every type in the fused walk goes through. */
-  private def visitType(t: Type, subst: StrictSubstitution)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): Type =
+  private def visitType(t: Type, subst: StrictSubstitution)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): Type =
     Specialize.rewriteEnumStructType(lowerType(subst(t)))
 
   /** Same as [[visitType]], for call sites where `t` has already been substituted (only lowering + the rewrite remain). */
-  private def visitTypeSubstituted(t: Type)(implicit sctx: SharedContext): Type =
+  private def visitTypeSubstituted(t: Type)(implicit tables: LookupTables): Type =
     Specialize.rewriteEnumStructType(lowerType(t))
 
   /** Specializes and lowers `defn0` under `subst` into the `MonoAst.Def` for the specialized symbol `freshSym`. */
-  protected[monomorph2] def visitDef(freshSym: Symbol.DefnSym, defn0: TypedAst.Def, subst: StrictSubstitution)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Def = {
+  protected[monomorph2] def visitDef(freshSym: Symbol.DefnSym, defn0: TypedAst.Def, subst: StrictSubstitution)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): MonoAst.Def = {
     implicit val lctx: LocalContext = LocalContext.empty
     // If `defn0` is an entry point, wrap it with its required default handlers before the rest of
     // lowering, e.g. `def f(): Unit \ Assert = e` becomes `def f(): Unit \ IO = Assert.runWithIO(_ -> e)`.
@@ -144,7 +144,7 @@ object SpecializeAndLower {
     * to its own specialized sym too — otherwise a specialized declaration's fields would still
     * point at generic originals that Step 1 stopped emitting.
     */
-  protected[monomorph2] def lowerEnum(enum0: TypedAst.Enum)(implicit sctx: SharedContext): MonoAst.Enum = enum0 match {
+  protected[monomorph2] def lowerEnum(enum0: TypedAst.Enum)(implicit tables: LookupTables): MonoAst.Enum = enum0 match {
     case TypedAst.Enum(doc, ann, mod, sym, tparams0, _, cases0, loc) =>
       val tparams = tparams0.map(lowerTypeParam)
       val cases = cases0.map {
@@ -169,7 +169,7 @@ object SpecializeAndLower {
     * Lowers the given struct `struct0`. Field types go through [[visitTypeSubstituted]] — see
     * [[lowerEnum]]'s doc comment for why bare [[lowerType]] is not enough here.
     */
-  protected[monomorph2] def lowerStruct(struct0: TypedAst.Struct)(implicit sctx: SharedContext): MonoAst.Struct = struct0 match {
+  protected[monomorph2] def lowerStruct(struct0: TypedAst.Struct)(implicit tables: LookupTables): MonoAst.Struct = struct0 match {
     case TypedAst.Struct(doc, ann, mod, sym, tparams0, _, fields0, loc) =>
       val tparams = tparams0.map(lowerTypeParam)
       val fields = fields0.map {
@@ -206,7 +206,7 @@ object SpecializeAndLower {
     *     a "Solver gap" crash),
     *   - types are lowered and channel/fixpoint expressions are lowered to the primitives.
     */
-  private def visitExp(exp0: TypedAst.Expr, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = exp0 match {
+  private def visitExp(exp0: TypedAst.Expr, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = exp0 match {
     case TypedAst.Expr.Cst(cst, tpe, loc) => MonoAst.Expr.Cst(cst, visitType(tpe, subst), loc)
 
     case TypedAst.Expr.Var(sym, tpe, loc) => MonoAst.Expr.Var(env0(sym), visitType(tpe, subst), loc)
@@ -756,7 +756,7 @@ object SpecializeAndLower {
   /**
     * Specializes and lowers the given catch rule `rule0` (fresh binder, like every other binder).
     */
-  private def visitCatchRule(rule: TypedAst.CatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.CatchRule = rule match {
+  private def visitCatchRule(rule: TypedAst.CatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.CatchRule = rule match {
     case TypedAst.CatchRule(bnd, clazz, exp, _) =>
       val freshSym = Symbol.freshVarSym(bnd.sym)
       val env1 = env0 + (bnd.sym -> freshSym)
@@ -767,7 +767,7 @@ object SpecializeAndLower {
   /**
     * Specializes and lowers the given handler rule `rule0` (fresh formal params).
     */
-  private def visitHandlerRule(rule0: TypedAst.HandlerRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.HandlerRule = rule0 match {
+  private def visitHandlerRule(rule0: TypedAst.HandlerRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.HandlerRule = rule0 match {
     case TypedAst.HandlerRule(opSymUse, fparams0, body0, _) =>
       val (fparams1, env1) = specializeFormalParams(fparams0, subst)
       val fparams = fparams1.map(lowerFormalParam).map(Specialize.rewriteFormalParam)
@@ -779,7 +779,7 @@ object SpecializeAndLower {
     * Specializes and lowers the given match rule `rule0`. The pattern's fresh binders extend the
     * env for both the guard and the body.
     */
-  private def visitMatchRule(rule0: TypedAst.MatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.MatchRule = rule0 match {
+  private def visitMatchRule(rule0: TypedAst.MatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.MatchRule = rule0 match {
     case TypedAst.MatchRule(pat, guard, body, _) =>
       val (p, env1) = visitPat(pat, Map.empty, subst)
       val extendedEnv = env0 ++ env1
@@ -792,7 +792,7 @@ object SpecializeAndLower {
     * Specializes and lowers the given pattern `pat0`, returning the fresh-binder env extension
     * alongside.
     */
-  private def visitPat(pat0: TypedAst.Pattern, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): (MonoAst.Pattern, Map[Symbol.VarSym, Symbol.VarSym]) = pat0 match {
+  private def visitPat(pat0: TypedAst.Pattern, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): (MonoAst.Pattern, Map[Symbol.VarSym, Symbol.VarSym]) = pat0 match {
     case TypedAst.Pattern.Wild(tpe, loc) =>
       (MonoAst.Pattern.Wild(visitType(tpe, subst), loc), env0)
 
@@ -832,7 +832,7 @@ object SpecializeAndLower {
   /**
     * Specializes and lowers `ps`, threading the env through left-to-right binder freshening.
     */
-  private def visitPats(ps: List[TypedAst.Pattern], env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): (List[MonoAst.Pattern], Map[Symbol.VarSym, Symbol.VarSym]) =
+  private def visitPats(ps: List[TypedAst.Pattern], env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): (List[MonoAst.Pattern], Map[Symbol.VarSym, Symbol.VarSym]) =
     ps.foldRight((Nil: List[MonoAst.Pattern], env0)) {
       case (pat0, (res, env1)) =>
         val (pat, env) = visitPat(pat0, env1, subst)
@@ -842,7 +842,7 @@ object SpecializeAndLower {
   /**
     * Specializes and lowers the given restrictable choice rule `rule0` to a match rule.
     */
-  private def visitRestrictableChooseRule(rule0: TypedAst.RestrictableChooseRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.MatchRule = rule0 match {
+  private def visitRestrictableChooseRule(rule0: TypedAst.RestrictableChooseRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.MatchRule = rule0 match {
     case TypedAst.RestrictableChooseRule(pat, exp) =>
       pat match {
         case TypedAst.RestrictableChoosePattern.Tag(symUse, pat0, tpe, loc) =>
@@ -867,7 +867,7 @@ object SpecializeAndLower {
       }
   }
 
-  private def visitExtPat(pat0: TypedAst.ExtPattern, subst: StrictSubstitution)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): (MonoAst.ExtPattern, Map[Symbol.VarSym, Symbol.VarSym]) = pat0 match {
+  private def visitExtPat(pat0: TypedAst.ExtPattern, subst: StrictSubstitution)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): (MonoAst.ExtPattern, Map[Symbol.VarSym, Symbol.VarSym]) = pat0 match {
     case TypedAst.ExtPattern.Default(loc) =>
       (MonoAst.ExtPattern.Default(loc), Map.empty)
 
@@ -879,7 +879,7 @@ object SpecializeAndLower {
       throw InternalCompilerException("unexpected error ext pattern", loc)
   }
 
-  private def visitExtTagPat(pat0: TypedAst.ExtTagPattern, subst: StrictSubstitution)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): (MonoAst.ExtTagPattern, Map[Symbol.VarSym, Symbol.VarSym]) = pat0 match {
+  private def visitExtTagPat(pat0: TypedAst.ExtTagPattern, subst: StrictSubstitution)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): (MonoAst.ExtTagPattern, Map[Symbol.VarSym, Symbol.VarSym]) = pat0 match {
     case TypedAst.ExtTagPattern.Wild(tpe, loc) =>
       (MonoAst.ExtTagPattern.Wild(visitType(tpe, subst), loc), Map.empty)
 
@@ -894,7 +894,7 @@ object SpecializeAndLower {
       throw InternalCompilerException("unexpected error ext pattern", loc)
   }
 
-  private def visitExtMatchRule(rule0: TypedAst.ExtMatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.ExtMatchRule = rule0 match {
+  private def visitExtMatchRule(rule0: TypedAst.ExtMatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.ExtMatchRule = rule0 match {
     case TypedAst.ExtMatchRule(pat, exp, loc) =>
       val (p, env1) = visitExtPat(pat, subst)
       val e = visitExp(exp, env0 ++ env1, subst)
@@ -1187,7 +1187,7 @@ object SpecializeAndLower {
     * Returns a new channel tuple (sender, receiver) expression: `%%CHANNEL_NEW%%(m)` becomes
     * a call to `Concurrent/Channel.newChannel(10)`. `tpe` is the specialized type of the result.
     */
-  private def lowerNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
+  private def lowerNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
     // groundArrowTpe is the def-lookup key: computed and used raw (un-rewritten), matching every
     // other lookup-key position in the fused walk — only the node's own field positions get rewritten.
     val groundArrowTpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
@@ -1196,7 +1196,7 @@ object SpecializeAndLower {
   }
 
   /** Returns a channel get expression: `<- c` becomes a call to `Concurrent/Channel.get(c)`. */
-  private def mkGetChannel(exp: MonoAst.Expr, chanTpe: Type, tpe: Type, eff: Type, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
+  private def mkGetChannel(exp: MonoAst.Expr, chanTpe: Type, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
     // groundArrowTpe is the def-lookup key: built from `chanTpe`, the caller's RAW (un-rewritten)
     // substituted channel type — NOT `exp.tpe`, which is already enum/struct-rewritten by the time
     // `exp` (the already-visited channel expression) reaches here. Only the node's own field
@@ -1215,7 +1215,7 @@ object SpecializeAndLower {
     * in source order so reordering them into the argument list doesn't change evaluation order.
     * See https://github.com/flix/flix/issues/10378.
     */
-  private def mkPutChannel(exp1: MonoAst.Expr, exp2: MonoAst.Expr, chanTpe: Type, valTpe: Type, eff: Type, loc: SourceLocation)(implicit sctx: SharedContext, flix: Flix): MonoAst.Expr = {
+  private def mkPutChannel(exp1: MonoAst.Expr, exp2: MonoAst.Expr, chanTpe: Type, valTpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables, flix: Flix): MonoAst.Expr = {
     // groundArrowTpe is the def-lookup key: built from the caller's RAW (un-rewritten) substituted
     // chanTpe/valTpe — see mkGetChannel's doc comment for why `exp1.tpe`/`exp2.tpe` can't be used
     // directly (already enum/struct-rewritten by the time the visited exprs reach here).
@@ -1256,7 +1256,7 @@ object SpecializeAndLower {
     * }}}
     * Note: match is not exhaustive: we're relying on the simplifier to handle this for us
     */
-  private def mkSelectChannel(rules: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], default: Option[MonoAst.Expr], tpe: Type, eff: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def mkSelectChannel(rules: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], default: Option[MonoAst.Expr], tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val t = lowerType(tpe)
 
     val channels = rules.map { case (_, c, _, _) => (mkLetSym("chan", loc), c) }
@@ -1277,7 +1277,7 @@ object SpecializeAndLower {
     * generates
     * {{{ mpmcAdmin(x) }}}
     */
-  private def mkChannelAdminList(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
+  private def mkChannelAdminList(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     val admins = ListOps.zip(rs, channels) map {
       case ((_, _, _, rawChanTpe), (chanSym, _)) =>
         // groundArrowTpe/lookup key built from the RAW channel type — see SelectChannel case's doc comment.
@@ -1295,7 +1295,7 @@ object SpecializeAndLower {
     * {{{ selectFrom(mpmcAdmin(ch1) :: mpmcAdmin(ch2) :: ... :: Nil, false) }}}
     * `false` is `true` instead when `default` is `Some`.
     */
-  private def mkChannelSelect(admins: MonoAst.Expr, default: Option[MonoAst.Expr], loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
+  private def mkChannelSelect(admins: MonoAst.Expr, default: Option[MonoAst.Expr], loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
     val locksType = Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc)
 
     val selectRetTpe = Type.mkTuple(List(Type.Int32, locksType), loc)
@@ -1318,7 +1318,7 @@ object SpecializeAndLower {
     *   ?handlech1
     * }}}
     */
-  private def mkChannelCases(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], eff: Type, loc: SourceLocation)(implicit sctx: SharedContext, flix: Flix): List[MonoAst.MatchRule] = {
+  private def mkChannelCases(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], eff: Type, loc: SourceLocation)(implicit tables: LookupTables, flix: Flix): List[MonoAst.MatchRule] = {
     // RAW (lookup-key form) and rewritten (node-field form) both needed — see doc comment above.
     val locksTypeRaw = Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc)
     val locksType = Specialize.rewriteEnumStructType(locksTypeRaw)
@@ -1343,7 +1343,7 @@ object SpecializeAndLower {
     * {{{ case (-1, _) => ?default }}}
     * No unlock is needed here — that's handled inside `Concurrent/Channel.selectFrom`.
     */
-  private def mkSelectDefaultCase(default: Option[MonoAst.Expr], loc: SourceLocation)(implicit sctx: SharedContext): List[MonoAst.MatchRule] = {
+  private def mkSelectDefaultCase(default: Option[MonoAst.Expr], loc: SourceLocation)(implicit tables: LookupTables): List[MonoAst.MatchRule] = {
     default match {
       case Some(defaultExp) =>
         val locksType = Specialize.rewriteEnumStructType(Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc))
@@ -1358,7 +1358,7 @@ object SpecializeAndLower {
   /**
     * Returns a desugared [[TypedAst.Expr.ParYield]] expression as a nested match-expression.
     */
-  private def mkParYield(frags: List[(MonoAst.Pattern, MonoAst.Expr, Type, SourceLocation)], exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit sctx: SharedContext, flix: Flix): MonoAst.Expr = {
+  private def mkParYield(frags: List[(MonoAst.Pattern, MonoAst.Expr, Type, SourceLocation)], exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables, flix: Flix): MonoAst.Expr = {
     // Only generate channels for n-1 fragments; the last fragment runs on the current thread.
     val fs = frags.init
     val last = frags.last
@@ -1381,7 +1381,7 @@ object SpecializeAndLower {
     * mkPutChannel/mkNewChannel's own def-lookup keys (see mkGetChannel's doc comment for why
     * `e.tpe` alone, already enum/struct-rewritten, isn't safe to reuse here).
     */
-  private def mkParChannels(exp: MonoAst.Expr, chanSymsWithExps: List[(Symbol.VarSym, MonoAst.Expr, Type)])(implicit sctx: SharedContext, flix: Flix): MonoAst.Expr = {
+  private def mkParChannels(exp: MonoAst.Expr, chanSymsWithExps: List[(Symbol.VarSym, MonoAst.Expr, Type)])(implicit tables: LookupTables, flix: Flix): MonoAst.Expr = {
     // Builds `spawn ch <- exp` for each fragment.
     val spawns = chanSymsWithExps.foldRight(exp: MonoAst.Expr) {
       case ((sym, e, rawTpe), acc) =>
@@ -1403,7 +1403,7 @@ object SpecializeAndLower {
   }
 
   /** Returns a new channel expression. */
-  private def mkNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
+  private def mkNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
     val groundArrowTpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
     val defnSym = lookupSym(Defs.Concurrent.Channel.NewChannel, groundArrowTpe)
     MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(groundArrowTpe), Specialize.rewriteEnumStructType(tpe), eff, loc)
@@ -1422,7 +1422,7 @@ object SpecializeAndLower {
     *   exp
     * }}}
     */
-  private def mkBoundParWaits(patSymExps: List[(MonoAst.Pattern, Symbol.VarSym, MonoAst.Expr, Type)], exp: MonoAst.Expr)(implicit sctx: SharedContext): MonoAst.Expr =
+  private def mkBoundParWaits(patSymExps: List[(MonoAst.Pattern, Symbol.VarSym, MonoAst.Expr, Type)], exp: MonoAst.Expr)(implicit tables: LookupTables): MonoAst.Expr =
     patSymExps.map {
       case (p, sym, e, rawTpe) =>
         val loc = e.loc.asSynthetic
@@ -1460,12 +1460,12 @@ object SpecializeAndLower {
     * (which rewrites its own return type) — otherwise the let-bound value and every subsequent
     * reference to `sym` disagree on the channel's type (fresh sym vs. original).
     */
-  private def mkChannelExp(sym: Symbol.VarSym, tpe: Type, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
+  private def mkChannelExp(sym: Symbol.VarSym, tpe: Type, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
     MonoAst.Expr.Var(sym, Specialize.rewriteEnumStructType(mkChannelTpe(tpe, loc)), loc)
   }
 
   /** Returns a list expression constructed from `exps` with type list of `elmType` (assumed specialized and lowered). */
-  private def mkList(exps: List[MonoAst.Expr], elmType: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
+  private def mkList(exps: List[MonoAst.Expr], elmType: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     val nil = mkNil(elmType, loc)
     exps.foldRight(nil) {
       case (e, acc) => mkCons(e, acc, elmType, loc)
@@ -1473,7 +1473,7 @@ object SpecializeAndLower {
   }
 
   /** Returns a `Nil` expression with type list of `elmType` (assumed specialized and lowered). */
-  private def mkNil(elmType: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
+  private def mkNil(elmType: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     mkTag(Enums.List.List, "Nil", Nil, Types.List.mkList(elmType, loc), loc)
   }
 
@@ -1486,7 +1486,7 @@ object SpecializeAndLower {
     * vacuously hit the "non-generic, keep original" branch and silently tag `Cons` with the wrong
     * (unspecialized) case sym while `Nil` got the fresh one.
     */
-  private def mkCons(hd: MonoAst.Expr, tail: MonoAst.Expr, elmType: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
+  private def mkCons(hd: MonoAst.Expr, tail: MonoAst.Expr, elmType: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     mkTag(Enums.List.List, "Cons", List(hd, tail), Types.List.mkList(elmType, loc), loc)
   }
 
@@ -1501,7 +1501,7 @@ object SpecializeAndLower {
     * own `AtomicOp.Tag` node directly instead of going through `visitExp`'s Tag case, so it must
     * do its own strict case-sym lookup and enum/struct-type rewrite.
     */
-  private def mkTag(sym: Symbol.EnumSym, tag: String, exps: List[MonoAst.Expr], tpe: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
+  private def mkTag(sym: Symbol.EnumSym, tag: String, exps: List[MonoAst.Expr], tpe: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     val caseSym0 = findCaseSym(sym, tag)
     val caseSym = Specialize.lookupCaseSym(caseSym0, tpe)
     val t = Specialize.rewriteEnumStructType(tpe)
@@ -1547,7 +1547,7 @@ object SpecializeAndLower {
     */
 
   /** Constructs a `Fixpoint/Ast/Datalog.Datalog` value from the Datalog constraints `cs`. */
-  private def lowerConstraintSet(cs: List[TypedAst.Constraint], loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def lowerConstraintSet(cs: List[TypedAst.Constraint], loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val factExps = cs.filter(c => c.body.isEmpty).map(lowerConstraint(_, env0, subst))
     val ruleExps = cs.filter(c => c.body.nonEmpty).map(lowerConstraint(_, env0, subst))
 
@@ -1564,7 +1564,7 @@ object SpecializeAndLower {
     */
   // NB (fused walk): `tpe0`/`eff` must arrive already substituted from the caller; `env0`/`subst`
   // are only for the TypedAst sub-expressions visited here.
-  private def lowerQueryWithProvenance(exps: List[TypedAst.Expr], select: Predicate.Head, withh: List[Name.Pred], tpe0: Type, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def lowerQueryWithProvenance(exps: List[TypedAst.Expr], select: Predicate.Head, withh: List[Name.Pred], tpe0: Type, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val tpe = lowerType(tpe0)
     val mergedExp = mergeExps(exps.map(visitExp(_, env0, subst)), loc)
     val (goalPredSym, goalTerms) = select match {
@@ -1583,7 +1583,7 @@ object SpecializeAndLower {
   }
 
   /** Lowers a Datalog query-with-select to Fixpoint solver solve+facts calls. `tpe`/`eff` must arrive already substituted from the caller (fused walk). */
-  private def lowerQueryWithSelect(exps: List[TypedAst.Expr], queryExp: TypedAst.Expr, selects: List[TypedAst.Expr], pred: Name.Pred, tpe: Type, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def lowerQueryWithSelect(exps: List[TypedAst.Expr], queryExp: TypedAst.Expr, selects: List[TypedAst.Expr], pred: Name.Pred, tpe: Type, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val loweredExps = exps.map(visitExp(_, env0, subst))
     val loweredQueryExp = visitExp(queryExp, env0, subst)
 
@@ -1616,7 +1616,7 @@ object SpecializeAndLower {
     * }}}
     * `eff` must arrive already substituted from the caller (fused walk).
     */
-  private def lowerSolveWithProject(exps0: List[TypedAst.Expr], optPreds: Option[List[Name.Pred]], mode: SolveMode, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def lowerSolveWithProject(exps0: List[TypedAst.Expr], optPreds: Option[List[Name.Pred]], mode: SolveMode, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val defn = mode match {
       case SolveMode.Default => lookupSym(Defs.Fixpoint.Solver.RunSolver, Types.Fixpoint.Ast.Datalog.Datalog)
       case SolveMode.WithProvenance => lookupSym(Defs.Fixpoint.Solver.RunSolverWithProvenance, Types.Fixpoint.Ast.Datalog.Datalog)
@@ -1639,7 +1639,7 @@ object SpecializeAndLower {
   }
 
   /** Lowers a Datalog inject-into to Fixpoint solver `projectInto` calls, one per predicate in `predsAndArities`. */
-  private def lowerInjectInto(exps: List[TypedAst.Expr], predsAndArities: List[PredicateAndArity], loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def lowerInjectInto(exps: List[TypedAst.Expr], predsAndArities: List[PredicateAndArity], loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val loweredExps = exps.zip(predsAndArities).map {
       case (exp, PredicateAndArity(pred, arity)) =>
         // The exp's own type/eff are TypedAst-level reads: substitute before use (fused walk).
@@ -1659,7 +1659,7 @@ object SpecializeAndLower {
   /**
     * Specializes and lowers the given constraint `c0`.
     */
-  private def lowerConstraint(c0: TypedAst.Constraint, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = c0 match {
+  private def lowerConstraint(c0: TypedAst.Constraint, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = c0 match {
     case TypedAst.Constraint(cparams, head, body, loc) =>
       // Freshen the constraint params (the quantified vars) up front — head and body must share
       // this env.
@@ -1677,7 +1677,7 @@ object SpecializeAndLower {
   /**
     * Lowers the given head predicate `p0`.
     */
-  private def lowerHeadPred(cparams0: List[TypedAst.ConstraintParam], p0: TypedAst.Predicate.Head, env: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = p0 match {
+  private def lowerHeadPred(cparams0: List[TypedAst.ConstraintParam], p0: TypedAst.Predicate.Head, env: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = p0 match {
     case TypedAst.Predicate.Head.Atom(pred, den, terms, _, loc) =>
       val predSymExp = mkPredSym(pred)
       val denotationExp = mkDenotation(den, terms.lastOption.map(t => subst(t.tpe)), loc)
@@ -1689,7 +1689,7 @@ object SpecializeAndLower {
   /**
     * Lowers the given body predicate `p0`.
     */
-  private def lowerBodyPred(cparams0: List[TypedAst.ConstraintParam], p0: TypedAst.Predicate.Body, env: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = p0 match {
+  private def lowerBodyPred(cparams0: List[TypedAst.ConstraintParam], p0: TypedAst.Predicate.Body, env: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = p0 match {
     case TypedAst.Predicate.Body.Atom(pred, den, polarity, fixity, terms, _, loc) =>
       val predSymExp = mkPredSym(pred)
       val denotationExp = mkDenotation(den, terms.lastOption.map(t => subst(t.tpe)), loc)
@@ -1723,7 +1723,7 @@ object SpecializeAndLower {
     * variables is reduced to a (boxed) value `Lit`; one with quantified variables becomes an
     * application term.
     */
-  private def lowerHeadTerm(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, env: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def lowerHeadTerm(cparams0: List[TypedAst.ConstraintParam], exp0: TypedAst.Expr, env: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     exp0 match {
       case TypedAst.Expr.Var(sym, _, _) =>
         if (MonomorphHelpers.isQuantifiedVar(sym, cparams0)) {
@@ -1749,7 +1749,7 @@ object SpecializeAndLower {
   /**
     * Lowers the given body term `pat0`.
     */
-  private def lowerBodyTerm(cparams0: List[TypedAst.ConstraintParam], pat0: TypedAst.Pattern, env: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = pat0 match {
+  private def lowerBodyTerm(cparams0: List[TypedAst.ConstraintParam], pat0: TypedAst.Pattern, env: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = pat0 match {
     case TypedAst.Pattern.Wild(_, loc) =>
       mkBodyTermWild(loc)
 
@@ -1782,7 +1782,7 @@ object SpecializeAndLower {
   /**
     * Returns an expression merging `exps` using `Defs.Fixpoint.Solver.Merge`.
     */
-  private def mergeExps(exps: List[MonoAst.Expr], loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr =
+  private def mergeExps(exps: List[MonoAst.Expr], loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr =
     exps.reduceRight {
       (exp, acc) =>
         val resultType = Types.Fixpoint.Ast.Datalog.Datalog
@@ -1796,7 +1796,7 @@ object SpecializeAndLower {
     * Returns a new `Datalog` from `datalogExp` containing only facts from the predicate given by the `PredSym` `predSymExp`
     * using `Defs.Fixpoint.Solver.Filter`.
     */
-  private def projectSym(predSymExp: MonoAst.Expr, datalogExp: MonoAst.Expr, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
+  private def projectSym(predSymExp: MonoAst.Expr, datalogExp: MonoAst.Expr, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
     val resultType = Types.Fixpoint.Ast.Datalog.Datalog
     val defn = lookupSym(Defs.Fixpoint.Solver.ProjectSym, resultType)
     val argExps = predSymExp :: datalogExp :: Nil
@@ -1808,7 +1808,7 @@ object SpecializeAndLower {
     * Lifts `exp0: a -> b -> c -> resultType` (curried) to a call `liftN(exp0): Boxed -> ... -> Boxed`
     * (also curried). `liftX` and `liftXb` are similar and should probably be maintained together.
     */
-  private def liftX(exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type)(implicit sctx: SharedContext): MonoAst.Expr = {
+  private def liftX(exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type)(implicit tables: LookupTables): MonoAst.Expr = {
 
     val argType = Type.mkPureCurriedArrow(argTypes, resultType, exp0.loc)
 
@@ -1822,7 +1822,7 @@ object SpecializeAndLower {
   }
 
   /** Lifts `exp0: a -> b -> c -> Bool` (curried) to a call `liftNb(exp0): Boxed -> ... -> Bool` (curried). */
-  private def liftXb(exp0: MonoAst.Expr, argTypes: List[Type])(implicit sctx: SharedContext): MonoAst.Expr = {
+  private def liftXb(exp0: MonoAst.Expr, argTypes: List[Type])(implicit tables: LookupTables): MonoAst.Expr = {
 
     val argType = Type.mkPureCurriedArrow(argTypes, Type.Bool, exp0.loc)
 
@@ -1840,7 +1840,7 @@ object SpecializeAndLower {
     * `liftInVarsXOutVars(exp0): Vector[Boxed] -> Vector[Vector[Boxed]]`, e.g. `lift3X2` for three
     * inputs producing a Vector of pairs.
     */
-  private def liftXY(outVars: List[Symbol.VarSym], exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
+  private def liftXY(outVars: List[Symbol.VarSym], exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
 
     val argType = Type.mkPureCurriedArrow(argTypes, resultType, loc)
 
@@ -1859,7 +1859,7 @@ object SpecializeAndLower {
   /**
     * Constructs a `Fixpoint/Ast/Datalog.HeadTerm.Var` from the given variable symbol `sym`.
     */
-  private def mkHeadTermVar(sym: Symbol.VarSym)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
+  private def mkHeadTermVar(sym: Symbol.VarSym)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     val innerExp = List(mkVarSym(sym))
     mkTag(Enums.Fixpoint.Ast.Datalog.HeadTerm, "Var", innerExp, Types.Fixpoint.Ast.Datalog.HeadTerm, sym.loc)
   }
@@ -1867,21 +1867,21 @@ object SpecializeAndLower {
   /**
     * Constructs a `Fixpoint/Ast/Datalog.HeadTerm.Lit` value which wraps the given expression `exp`.
     */
-  private def mkHeadTermLit(exp: MonoAst.Expr)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
+  private def mkHeadTermLit(exp: MonoAst.Expr)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     mkTag(Enums.Fixpoint.Ast.Datalog.HeadTerm, "Lit", List(exp), Types.Fixpoint.Ast.Datalog.HeadTerm, exp.loc)
   }
 
   /**
     * Constructs a `Fixpoint/Ast/Datalog.BodyTerm.Wild` from the given source location `loc`.
     */
-  private def mkBodyTermWild(loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
+  private def mkBodyTermWild(loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     mkTag(Enums.Fixpoint.Ast.Datalog.BodyTerm, "Wild", Nil, Types.Fixpoint.Ast.Datalog.BodyTerm, loc)
   }
 
   /**
     * Constructs a `Fixpoint/Ast/Datalog.BodyTerm.Var` from the given variable symbol `sym`.
     */
-  private def mkBodyTermVar(sym: Symbol.VarSym)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
+  private def mkBodyTermVar(sym: Symbol.VarSym)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     val innerExp = List(mkVarSym(sym))
     mkTag(Enums.Fixpoint.Ast.Datalog.BodyTerm, "Var", innerExp, Types.Fixpoint.Ast.Datalog.BodyTerm, sym.loc)
   }
@@ -1889,14 +1889,14 @@ object SpecializeAndLower {
   /**
     * Constructs a `Fixpoint/Ast/Datalog.BodyTerm.Lit` from the given expression `exp0`.
     */
-  private def mkBodyTermLit(exp: MonoAst.Expr)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
+  private def mkBodyTermLit(exp: MonoAst.Expr)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     mkTag(Enums.Fixpoint.Ast.Datalog.BodyTerm, "Lit", List(exp), Types.Fixpoint.Ast.Datalog.BodyTerm, exp.loc)
   }
 
   /**
     * Constructs a `Fixpoint/Ast/Datalog.VarSym` from the given variable symbol `sym`.
     */
-  private def mkVarSym(sym: Symbol.VarSym)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = {
+  private def mkVarSym(sym: Symbol.VarSym)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     val nameExp = MonoAst.Expr.Cst(Constant.Str(sym.text), Type.Str, sym.loc)
     mkTag(Enums.Fixpoint.Ast.Datalog.VarSym, "VarSym", List(nameExp), Types.Fixpoint.Ast.Datalog.VarSym, sym.loc)
   }
@@ -1905,7 +1905,7 @@ object SpecializeAndLower {
     * Constructs a `Fixpoint/Ast/Shared.Denotation` from the given denotation `d` and type `tpeOpt`
     * (which must be the optional type of the last term).
     */
-  private def mkDenotation(d: Denotation, tpeOpt: Option[Type], loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = d match {
+  private def mkDenotation(d: Denotation, tpeOpt: Option[Type], loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = d match {
     case Denotation.Relational =>
       mkTag(Enums.Fixpoint.Ast.Shared.Denotation, "Relational", Nil, Types.Fixpoint.Ast.Shared.Denotation, loc)
 
@@ -1934,7 +1934,7 @@ object SpecializeAndLower {
   /**
     * Constructs a `Fixpoint/Ast/Datalog.Polarity` from the given polarity `p`.
     */
-  private def mkPolarity(p: Polarity, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = p match {
+  private def mkPolarity(p: Polarity, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = p match {
     case Polarity.Positive =>
       mkTag(Enums.Fixpoint.Ast.Datalog.Polarity, "Positive", Nil, Types.Fixpoint.Ast.Datalog.Polarity, loc)
 
@@ -1945,7 +1945,7 @@ object SpecializeAndLower {
   /**
     * Constructs a `Fixpoint/Ast/Datalog.Fixity` from the given fixity `f`.
     */
-  private def mkFixity(f: Fixity, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = f match {
+  private def mkFixity(f: Fixity, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = f match {
     case Fixity.Loose =>
       mkTag(Enums.Fixpoint.Ast.Datalog.Fixity, "Loose", Nil, Types.Fixpoint.Ast.Datalog.Fixity, loc)
 
@@ -1958,7 +1958,7 @@ object SpecializeAndLower {
     * lambda per var (outermost var first). Shared by [[mkGuard]]/[[mkFunctional]]/[[mkAppTerm]],
     * which each then lift the result to operate on boxed values.
     */
-  private def curryFreshLambda(vars: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, loc: SourceLocation)(implicit sctx: SharedContext, flix: Flix): MonoAst.Expr = {
+  private def curryFreshLambda(vars: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, loc: SourceLocation)(implicit tables: LookupTables, flix: Flix): MonoAst.Expr = {
     val freshVars = vars.foldLeft(Map.empty[Symbol.VarSym, Symbol.VarSym]) {
       case (acc, (oldSym, _)) => acc + (oldSym -> Symbol.freshVarSym(oldSym))
     }
@@ -1978,7 +1978,7 @@ object SpecializeAndLower {
   /**
     * Returns a `Fixpoint/Ast/Datalog.BodyPredicate.GuardX`. At most 5 free variables are supported.
     */
-  private def mkGuard(fvs: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def mkGuard(fvs: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val arity = fvs.length
     if (arity > 5) {
       throw InternalCompilerException("Cannot lift functions with more than 5 free variables.", loc)
@@ -2003,7 +2003,7 @@ object SpecializeAndLower {
   /**
     * Returns a `Fixpoint/Ast/Datalog.BodyPredicate.Functional`.
     */
-  private def mkFunctional(outVars: List[Symbol.VarSym], inVars: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, rawResultTpe: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def mkFunctional(outVars: List[Symbol.VarSym], inVars: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, rawResultTpe: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     if (inVars.length > 5) {
       throw InternalCompilerException("Does not support more than 5 in variables.", loc)
     }
@@ -2027,7 +2027,7 @@ object SpecializeAndLower {
   /**
     * Returns a `Fixpoint/Ast/Datalog.HeadTerm.AppX`.
     */
-  private def mkAppTerm(fvs: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, rawResultTpe: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def mkAppTerm(fvs: List[(Symbol.VarSym, Type)], exp: MonoAst.Expr, rawResultTpe: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val arity = fvs.length
     if (arity > 5) {
       throw InternalCompilerException("Cannot lift functions with more than 5 free variables.", loc)
@@ -2045,7 +2045,7 @@ object SpecializeAndLower {
   /**
     * Constructs a `Fixpoint/Ast/Shared.PredSym` from the given predicate `pred`.
     */
-  private def mkPredSym(pred: Name.Pred)(implicit sctx: SharedContext, root: TypedAst.Root): MonoAst.Expr = pred match {
+  private def mkPredSym(pred: Name.Pred)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = pred match {
     case Name.Pred(sym, loc) =>
       val nameExp = MonoAst.Expr.Cst(Constant.Str(sym), Type.Str, loc)
       val idExp = MonoAst.Expr.Cst(Constant.Int64(0), Type.Int64, loc)
@@ -2059,7 +2059,7 @@ object SpecializeAndLower {
     * is used as `Boxable.box`'s def-lookup key; see mkGetChannel's doc comment for why the
     * already-rewritten `.tpe` can't be reused for this.
     */
-  private def box(exp: MonoAst.Expr, rawTpe: Type)(implicit sctx: SharedContext): MonoAst.Expr = {
+  private def box(exp: MonoAst.Expr, rawTpe: Type)(implicit tables: LookupTables): MonoAst.Expr = {
     val loc = exp.loc
     val tpe = Type.mkPureArrow(rawTpe, Types.Fixpoint.Boxed, loc)
     MonoAst.Expr.ApplyDef(lookupSym(Defs.Fixpoint.Boxable.Box, tpe), List(exp), Specialize.rewriteEnumStructType(tpe), Types.Fixpoint.Boxed, Type.Pure, loc)
@@ -2335,7 +2335,7 @@ object SpecializeAndLower {
     * }}}
     * where `P1, P2, ...` are in `preds` with their respective term types.
     */
-  private def mkExtVarLambda(preds: List[(Name.Pred, List[Type])], tpe: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def mkExtVarLambda(preds: List[(Name.Pred, List[Type])], tpe: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val predSymVar = Symbol.freshVarSym("predSym", BoundBy.FormalParam, loc)(RegionScope.Top, flix)
     val termsVar = Symbol.freshVarSym("terms", BoundBy.FormalParam, loc)(RegionScope.Top, flix)
     mkLambdaExp(predSymVar, Types.Fixpoint.Ast.Shared.PredSym,
@@ -2376,7 +2376,7 @@ object SpecializeAndLower {
     * where `P1, P2, ...` are in `preds` with their respective term types, `"predSym" == predSymVar.text`
     * and `"terms" == termsVar.text`.
     */
-  private def mkExtVarBody(preds: List[(Name.Pred, List[Type])], predSymVar: Symbol.VarSym, termsVar: Symbol.VarSym, tpe: Type, loc: SourceLocation)(implicit sctx: SharedContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def mkExtVarBody(preds: List[(Name.Pred, List[Type])], predSymVar: Symbol.VarSym, termsVar: Symbol.VarSym, tpe: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val nameVar = Symbol.freshVarSym(Name.Ident("name", loc), BoundBy.Pattern)(RegionScope.Top, flix)
     MonoAst.Expr.Match(
       exp = MonoAst.Expr.Var(predSymVar, Types.Fixpoint.Ast.Shared.PredSym, loc),
@@ -2411,7 +2411,7 @@ object SpecializeAndLower {
     * }}}
     * where `"P" == p.name`
     */
-  private def mkProvenanceMatchRule(termsVar: Symbol.VarSym, tpe: Type, p: Name.Pred, types: List[Type], loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.MatchRule = {
+  private def mkProvenanceMatchRule(termsVar: Symbol.VarSym, tpe: Type, p: Name.Pred, types: List[Type], loc: SourceLocation)(implicit tables: LookupTables): MonoAst.MatchRule = {
     val termsExps = types.zipWithIndex.map {
       case (tpe1, i) => mkUnboxedTerm(termsVar, tpe1, i, loc)
     }
@@ -2433,7 +2433,7 @@ object SpecializeAndLower {
     * }}}
     * where `"terms" == termsVar.text`.
     */
-  private def mkUnboxedTerm(termsVar: Symbol.VarSym, tpe: Type, i: Int, loc: SourceLocation)(implicit sctx: SharedContext): MonoAst.Expr = {
+  private def mkUnboxedTerm(termsVar: Symbol.VarSym, tpe: Type, i: Int, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
     val outerGroundArrowTpe = Type.mkPureUncurriedArrow(List(Types.Fixpoint.Boxed), tpe, loc)
     val innerGroundArrowTpe = Type.mkPureUncurriedArrow(List(Type.Int32, Types.Fixpoint.VectorOfBoxed), Types.Fixpoint.Boxed, loc)
     MonoAst.Expr.ApplyDef(
