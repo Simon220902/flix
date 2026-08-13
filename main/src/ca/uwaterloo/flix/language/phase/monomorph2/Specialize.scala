@@ -351,9 +351,6 @@ object Specialize {
   /**
     * Returns one `(freshSym, defn, subst, instantiatedType)` entry per solved `GroundInstantiation`
     * of a parametric def. Instance/default-sig args are `[inst.tparams..., sig-own tparams...]`.
-    *
-    * N.B. Instantiations that fail to reduce (e.g. a defaulted `AnyType` needing a nonexistent instance)
-    * are dropped since such failures only arise for unreachable/speculative instantiations.
     */
   private def mkDefEntries(
     solution: Solution,
@@ -369,20 +366,12 @@ object Specialize {
                           .map { case (tp, ty) => tp.sym -> ty }.toMap
       if defn.spec.tparams.nonEmpty || prefixTparams.nonEmpty
       freshSym        = Symbol.freshDefnSym(defn.sym)
-      s = StrictSubstitution.mk(Substitution(substMap))
-      (subst, it)     <- try {
-                           List((s, s(defn.spec.declaredScheme.base)))
-                         } catch {
-                           case _: InternalCompilerException => Nil
-                         }
-    } yield (freshSym, defn, subst, it)
+      subst           = StrictSubstitution.mk(Substitution(substMap))
+    } yield (freshSym, defn, subst, subst(defn.spec.declaredScheme.base))
 
   /**
     * Returns one `(sym, args, freshSym, newEnum)` entry per solved `GroundInstantiation` of a
     * parametric enum.
-    *
-    * N.B. Instantiations that fail to reduce (e.g. a defaulted `AnyType` needing a nonexistent instance)
-    * are dropped since such failures only arise for unreachable/speculative instantiations.
     */
   private def mkEnumEntries(solution: Solution)(implicit root: TypedAst.Root, flix: Flix): List[(Symbol.EnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
     for {
@@ -393,24 +382,17 @@ object Specialize {
       substMap       = enm.tparams.zip(args).map { case (tp, ty) => tp.sym -> ty }.toMap
       freshSym       = Symbol.freshEnumSym(enm.sym)
       subst          = StrictSubstitution.mk(Substitution(substMap))
-      newEnum       <- try {
-                         val newCases = enm.cases.map { case (caseSym, TypedAst.Case(_, tpes, sc, cloc)) =>
-                           val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, caseSym.ordinal, caseSym.loc)
-                           newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
-                         }
-                         List(TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc))
-                       } catch {
-                         case _: InternalCompilerException => Nil
-                       }
+      newCases       = enm.cases.map { case (caseSym, TypedAst.Case(_, tpes, sc, cloc)) =>
+                          val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, caseSym.ordinal, caseSym.loc)
+                          newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
+                        }
+      newEnum        = TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc)
     } yield (sym, args, freshSym, newEnum)
 
   /**
     * Returns one `(sym, args, freshSym, newEnum)` entry per solved `GroundInstantiation` of a
     * restrictable enum. Restrictable enums lower to regular enums, so the result is a plain
     * `TypedAst.Enum`.
-    *
-    * N.B. Instantiations that fail to reduce (e.g. a defaulted `AnyType` needing a nonexistent instance)
-    * are dropped since such failures only arise for unreachable/speculative instantiations.
     */
   private def mkRestrictableEnumEntries(solution: Solution)(implicit root: TypedAst.Root, flix: Flix): List[(Symbol.RestrictableEnumSym, List[Type], Symbol.EnumSym, TypedAst.Enum)] =
     for {
@@ -420,23 +402,16 @@ object Specialize {
       substMap       = (enm.index :: enm.tparams).zip(args).map { case (tp, ty) => tp.sym -> ty }.toMap
       freshSym       = Symbol.freshEnumSym(SpecializeAndLower.lowerRestrictableEnumSym(sym))
       subst          = StrictSubstitution.mk(Substitution(substMap))
-      newEnum       <- try {
-                         val newCases = enm.cases.map { case (caseSym, TypedAst.RestrictableCase(_, tpes, sc, cloc)) =>
-                           val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, Symbol.CaseSym.NoOrdinal, caseSym.loc)
-                           newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
-                         }
-                         List(TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc))
-                       } catch {
-                         case _: InternalCompilerException => Nil
-                       }
+      newCases       = enm.cases.map { case (caseSym, TypedAst.RestrictableCase(_, tpes, sc, cloc)) =>
+                          val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, Symbol.CaseSym.NoOrdinal, caseSym.loc)
+                          newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
+                        }
+      newEnum        = TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc)
     } yield (sym, args, freshSym, newEnum)
 
   /**
     * Returns one `(sym, args, freshSym, newEnum)` entry per solved `GroundInstantiation` of a
     * parametric struct.
-    *
-    * N.B. Instantiations that fail to reduce (e.g. a defaulted `AnyType` needing a nonexistent instance)
-    * are dropped since such failures only arise for unreachable/speculative instantiations.
     */
   private def mkStructEntries(solution: Solution)(implicit root: TypedAst.Root, flix: Flix): List[(Symbol.StructSym, List[Type], Symbol.StructSym, TypedAst.Struct)] =
     for {
@@ -447,15 +422,11 @@ object Specialize {
       substMap       = struct.tparams.zip(args).map { case (tp, ty) => tp.sym -> ty }.toMap
       freshSym       = Symbol.freshStructSym(struct.sym)
       subst          = StrictSubstitution.mk(Substitution(substMap))
-      newStruct     <- try {
-                         val newFields = struct.fields.map { case (fieldSym, TypedAst.StructField(_, tpe, floc)) =>
-                           val newFieldSym = new Symbol.StructFieldSym(freshSym, fieldSym.name, fieldSym.loc)
-                           newFieldSym -> TypedAst.StructField(newFieldSym, subst(tpe), floc)
-                         }
-                         List(TypedAst.Struct(struct.doc, struct.ann, struct.mod, freshSym, Nil, struct.sc, newFields, struct.loc))
-                       } catch {
-                         case _: InternalCompilerException => Nil
-                       }
+      newFields      = struct.fields.map { case (fieldSym, TypedAst.StructField(_, tpe, floc)) =>
+                          val newFieldSym = new Symbol.StructFieldSym(freshSym, fieldSym.name, fieldSym.loc)
+                          newFieldSym -> TypedAst.StructField(newFieldSym, subst(tpe), floc)
+                        }
+      newStruct      = TypedAst.Struct(struct.doc, struct.ann, struct.mod, freshSym, Nil, struct.sc, newFields, struct.loc)
     } yield (sym, args, freshSym, newStruct)
 
   /** Specializes `root` per `solution`, the constraint solver's output from Phase 3. */
