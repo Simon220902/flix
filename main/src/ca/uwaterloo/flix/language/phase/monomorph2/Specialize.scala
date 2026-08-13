@@ -175,7 +175,7 @@ object Specialize {
     /** Applies this substitution to `tpe0`, defaulting any free type variable to its kind's default type. */
     def apply(tpe0: Type)(implicit root: TypedAst.Root, flix: Flix): Type = applySubst(MonomorphHelpers.rewriteRegionToIO(tpe0))
 
-    /** N.B. `tpe0` must already have every `Region` rewritten to `IO` (see [[apply]]) — none should reach here. */
+    /** N.B. `tpe0` must already have every `Region` rewritten to `IO`. */
     private def applySubst(tpe0: Type)(implicit root: TypedAst.Root, flix: Flix): Type = tpe0 match {
       case Type.Var(sym, _)                         => s.m.get(sym) match {
         case None    => Canonicalization.default(tpe0)
