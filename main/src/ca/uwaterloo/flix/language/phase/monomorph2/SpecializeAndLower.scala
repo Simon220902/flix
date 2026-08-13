@@ -229,9 +229,9 @@ object SpecializeAndLower {
       visitExp(exp, env0, subst)
 
     case TypedAst.Expr.Lambda(fparam, exp, tpe, loc) =>
-      val (fp, env1) = specializeFormalParam(fparam, subst)
+      val (fp, binding) = specializeFormalParam(fparam, subst)
       val p = Specialize.rewriteFormalParam(lowerFormalParam(fp))
-      val e = visitExp(exp, env0 ++ env1, subst)
+      val e = visitExp(exp, env0 + binding, subst)
       val t = visitType(tpe, subst)
       MonoAst.Expr.Lambda(p, e, t, loc)
 
