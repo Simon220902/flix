@@ -34,7 +34,7 @@ import scala.jdk.CollectionConverters.*
   * Solution-driven specialization uses [[ConstraintSolver]]'s solution to specialize every def/enum/
   * struct/restrictable-enum in a single parallel pass.
   *
-  * `run` builds the `LookupTables`.
+  * `run` builds the [[SpecializationTables]].
   *
   * [[SpecializeAndLower.visitDef]] does the actual per-def specialize+lower walk, resolving each
   * call/tag/struct site via `lookupSym`/`lookupCaseSym`/`lookupRestrictableCaseSym`/
