@@ -745,8 +745,7 @@ object SpecializeAndLower {
     case TypedAst.Expr.ApplySig(symUse, exps, _, _, itpe0, tpe, eff, _, loc) =>
       // Resolve the sig to its concrete instance def (or default impl), then emit as ApplyDef.
       val groundArrowTpe = subst(itpe0)
-      val resolvedDef = resolveSigSym(symUse.sym, groundArrowTpe)
-      val newSym = lookupSym(resolvedDef.sym, groundArrowTpe)
+      val newSym = resolveSigSym(symUse.sym, groundArrowTpe)
       val es = exps.map(visitExp(_, env0, subst))
       MonoAst.Expr.ApplyDef(newSym, es, visitTypeSubstituted(groundArrowTpe), visitType(tpe, subst), subst(eff), loc)
 
@@ -1189,7 +1188,7 @@ object SpecializeAndLower {
     * Returns a new channel tuple (sender, receiver) expression: `%%CHANNEL_NEW%%(m)` becomes
     * a call to `Concurrent/Channel.newChannel(10)`. `tpe` is the specialized type of the result.
     */
-  private def lowerNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
+  private def lowerNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     // groundArrowTpe is the def-lookup key: computed and used raw (un-rewritten), matching every
     // other lookup-key position in the fused walk — only the node's own field positions get rewritten.
     val groundArrowTpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
@@ -1198,7 +1197,7 @@ object SpecializeAndLower {
   }
 
   /** Returns a channel get expression: `<- c` becomes a call to `Concurrent/Channel.get(c)`. */
-  private def mkGetChannel(exp: MonoAst.Expr, chanTpe: Type, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
+  private def mkGetChannel(exp: MonoAst.Expr, chanTpe: Type, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     // groundArrowTpe is the def-lookup key: built from `chanTpe`, the caller's RAW (un-rewritten)
     // substituted channel type — NOT `exp.tpe`, which is already enum/struct-rewritten by the time
     // `exp` (the already-visited channel expression) reaches here. Only the node's own field
@@ -1217,7 +1216,7 @@ object SpecializeAndLower {
     * in source order so reordering them into the argument list doesn't change evaluation order.
     * See https://github.com/flix/flix/issues/10378.
     */
-  private def mkPutChannel(exp1: MonoAst.Expr, exp2: MonoAst.Expr, chanTpe: Type, valTpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables, flix: Flix): MonoAst.Expr = {
+  private def mkPutChannel(exp1: MonoAst.Expr, exp2: MonoAst.Expr, chanTpe: Type, valTpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     // groundArrowTpe is the def-lookup key: built from the caller's RAW (un-rewritten) substituted
     // chanTpe/valTpe — see mkGetChannel's doc comment for why `exp1.tpe`/`exp2.tpe` can't be used
     // directly (already enum/struct-rewritten by the time the visited exprs reach here).
@@ -1297,7 +1296,7 @@ object SpecializeAndLower {
     * {{{ selectFrom(mpmcAdmin(ch1) :: mpmcAdmin(ch2) :: ... :: Nil, false) }}}
     * `false` is `true` instead when `default` is `Some`.
     */
-  private def mkChannelSelect(admins: MonoAst.Expr, default: Option[MonoAst.Expr], loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
+  private def mkChannelSelect(admins: MonoAst.Expr, default: Option[MonoAst.Expr], loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     val locksType = Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc)
 
     val selectRetTpe = Type.mkTuple(List(Type.Int32, locksType), loc)
@@ -1320,7 +1319,7 @@ object SpecializeAndLower {
     *   ?handlech1
     * }}}
     */
-  private def mkChannelCases(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], eff: Type, loc: SourceLocation)(implicit tables: LookupTables, flix: Flix): List[MonoAst.MatchRule] = {
+  private def mkChannelCases(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], eff: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): List[MonoAst.MatchRule] = {
     // RAW (lookup-key form) and rewritten (node-field form) both needed — see doc comment above.
     val locksTypeRaw = Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc)
     val locksType = Specialize.rewriteEnumStructType(locksTypeRaw)
@@ -1360,7 +1359,7 @@ object SpecializeAndLower {
   /**
     * Returns a desugared [[TypedAst.Expr.ParYield]] expression as a nested match-expression.
     */
-  private def mkParYield(frags: List[(MonoAst.Pattern, MonoAst.Expr, Type, SourceLocation)], exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables, flix: Flix): MonoAst.Expr = {
+  private def mkParYield(frags: List[(MonoAst.Pattern, MonoAst.Expr, Type, SourceLocation)], exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     // Only generate channels for n-1 fragments; the last fragment runs on the current thread.
     val fs = frags.init
     val last = frags.last
@@ -1383,7 +1382,7 @@ object SpecializeAndLower {
     * mkPutChannel/mkNewChannel's own def-lookup keys (see mkGetChannel's doc comment for why
     * `e.tpe` alone, already enum/struct-rewritten, isn't safe to reuse here).
     */
-  private def mkParChannels(exp: MonoAst.Expr, chanSymsWithExps: List[(Symbol.VarSym, MonoAst.Expr, Type)])(implicit tables: LookupTables, flix: Flix): MonoAst.Expr = {
+  private def mkParChannels(exp: MonoAst.Expr, chanSymsWithExps: List[(Symbol.VarSym, MonoAst.Expr, Type)])(implicit tables: LookupTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     // Builds `spawn ch <- exp` for each fragment.
     val spawns = chanSymsWithExps.foldRight(exp: MonoAst.Expr) {
       case ((sym, e, rawTpe), acc) =>
@@ -1405,7 +1404,7 @@ object SpecializeAndLower {
   }
 
   /** Returns a new channel expression. */
-  private def mkNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
+  private def mkNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     val groundArrowTpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
     val defnSym = lookupSym(Defs.Concurrent.Channel.NewChannel, groundArrowTpe)
     MonoAst.Expr.ApplyDef(defnSym, exp :: Nil, Specialize.rewriteEnumStructType(groundArrowTpe), Specialize.rewriteEnumStructType(tpe), eff, loc)
@@ -1424,7 +1423,7 @@ object SpecializeAndLower {
     *   exp
     * }}}
     */
-  private def mkBoundParWaits(patSymExps: List[(MonoAst.Pattern, Symbol.VarSym, MonoAst.Expr, Type)], exp: MonoAst.Expr)(implicit tables: LookupTables): MonoAst.Expr =
+  private def mkBoundParWaits(patSymExps: List[(MonoAst.Pattern, Symbol.VarSym, MonoAst.Expr, Type)], exp: MonoAst.Expr)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr =
     patSymExps.map {
       case (p, sym, e, rawTpe) =>
         val loc = e.loc.asSynthetic
@@ -1784,7 +1783,7 @@ object SpecializeAndLower {
   /**
     * Returns an expression merging `exps` using `Defs.Fixpoint.Solver.Merge`.
     */
-  private def mergeExps(exps: List[MonoAst.Expr], loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr =
+  private def mergeExps(exps: List[MonoAst.Expr], loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr =
     exps.reduceRight {
       (exp, acc) =>
         val resultType = Types.Fixpoint.Ast.Datalog.Datalog
@@ -1798,7 +1797,7 @@ object SpecializeAndLower {
     * Returns a new `Datalog` from `datalogExp` containing only facts from the predicate given by the `PredSym` `predSymExp`
     * using `Defs.Fixpoint.Solver.Filter`.
     */
-  private def projectSym(predSymExp: MonoAst.Expr, datalogExp: MonoAst.Expr, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
+  private def projectSym(predSymExp: MonoAst.Expr, datalogExp: MonoAst.Expr, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     val resultType = Types.Fixpoint.Ast.Datalog.Datalog
     val defn = lookupSym(Defs.Fixpoint.Solver.ProjectSym, resultType)
     val argExps = predSymExp :: datalogExp :: Nil
@@ -1810,7 +1809,7 @@ object SpecializeAndLower {
     * Lifts `exp0: a -> b -> c -> resultType` (curried) to a call `liftN(exp0): Boxed -> ... -> Boxed`
     * (also curried). `liftX` and `liftXb` are similar and should probably be maintained together.
     */
-  private def liftX(exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type)(implicit tables: LookupTables): MonoAst.Expr = {
+  private def liftX(exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
 
     val argType = Type.mkPureCurriedArrow(argTypes, resultType, exp0.loc)
 
@@ -1824,7 +1823,7 @@ object SpecializeAndLower {
   }
 
   /** Lifts `exp0: a -> b -> c -> Bool` (curried) to a call `liftNb(exp0): Boxed -> ... -> Bool` (curried). */
-  private def liftXb(exp0: MonoAst.Expr, argTypes: List[Type])(implicit tables: LookupTables): MonoAst.Expr = {
+  private def liftXb(exp0: MonoAst.Expr, argTypes: List[Type])(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
 
     val argType = Type.mkPureCurriedArrow(argTypes, Type.Bool, exp0.loc)
 
@@ -1842,7 +1841,7 @@ object SpecializeAndLower {
     * `liftInVarsXOutVars(exp0): Vector[Boxed] -> Vector[Vector[Boxed]]`, e.g. `lift3X2` for three
     * inputs producing a Vector of pairs.
     */
-  private def liftXY(outVars: List[Symbol.VarSym], exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
+  private def liftXY(outVars: List[Symbol.VarSym], exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
 
     val argType = Type.mkPureCurriedArrow(argTypes, resultType, loc)
 
@@ -2061,7 +2060,7 @@ object SpecializeAndLower {
     * is used as `Boxable.box`'s def-lookup key; see mkGetChannel's doc comment for why the
     * already-rewritten `.tpe` can't be reused for this.
     */
-  private def box(exp: MonoAst.Expr, rawTpe: Type)(implicit tables: LookupTables): MonoAst.Expr = {
+  private def box(exp: MonoAst.Expr, rawTpe: Type)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     val loc = exp.loc
     val tpe = Type.mkPureArrow(rawTpe, Types.Fixpoint.Boxed, loc)
     MonoAst.Expr.ApplyDef(lookupSym(Defs.Fixpoint.Boxable.Box, tpe), List(exp), Specialize.rewriteEnumStructType(tpe), Types.Fixpoint.Boxed, Type.Pure, loc)
@@ -2413,7 +2412,7 @@ object SpecializeAndLower {
     * }}}
     * where `"P" == p.name`
     */
-  private def mkProvenanceMatchRule(termsVar: Symbol.VarSym, tpe: Type, p: Name.Pred, types: List[Type], loc: SourceLocation)(implicit tables: LookupTables): MonoAst.MatchRule = {
+  private def mkProvenanceMatchRule(termsVar: Symbol.VarSym, tpe: Type, p: Name.Pred, types: List[Type], loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.MatchRule = {
     val termsExps = types.zipWithIndex.map {
       case (tpe1, i) => mkUnboxedTerm(termsVar, tpe1, i, loc)
     }
@@ -2435,7 +2434,7 @@ object SpecializeAndLower {
     * }}}
     * where `"terms" == termsVar.text`.
     */
-  private def mkUnboxedTerm(termsVar: Symbol.VarSym, tpe: Type, i: Int, loc: SourceLocation)(implicit tables: LookupTables): MonoAst.Expr = {
+  private def mkUnboxedTerm(termsVar: Symbol.VarSym, tpe: Type, i: Int, loc: SourceLocation)(implicit tables: LookupTables, root: TypedAst.Root): MonoAst.Expr = {
     val outerGroundArrowTpe = Type.mkPureUncurriedArrow(List(Types.Fixpoint.Boxed), tpe, loc)
     val innerGroundArrowTpe = Type.mkPureUncurriedArrow(List(Type.Int32, Types.Fixpoint.VectorOfBoxed), Types.Fixpoint.Boxed, loc)
     MonoAst.Expr.ApplyDef(
