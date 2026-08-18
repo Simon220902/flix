@@ -26,10 +26,6 @@ import ca.uwaterloo.flix.language.phase.unification.Substitution
 import ca.uwaterloo.flix.util.collection.MapOps
 import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps}
 
-import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.atomic.LongAdder
-import scala.jdk.CollectionConverters.*
-
 /**
   * Solution-driven specialization uses [[ConstraintSolver]]'s solution to specialize every def/enum/
   * struct/restrictable-enum in a single parallel pass.
@@ -41,6 +37,7 @@ import scala.jdk.CollectionConverters.*
   * `lookupStructSym`/`resolveSigSym`.
   */
 object Specialize {
+
   /**
     * Lookup tables mapping each parametric def/enum/struct/restrictable-enum's original sym,
     * at a given ground instantiation, to its fresh specialized sym.
@@ -58,39 +55,6 @@ object Specialize {
     restrictableEnumTable: Map[(Symbol.RestrictableEnumSym, List[Type]), Symbol.EnumSym],
     instances: Map[(Symbol.TraitSym, TypeConstructor), Instance]
   )
-
-  /**
-    * The mutable data used throughout specialization.
-    *
-    * This class is thread-safe.
-    */
-  private[monomorph2] class SharedContext {
-    private val specializedDefsQueue: ConcurrentLinkedQueue[(Symbol.DefnSym, MonoAst.Def)] = new ConcurrentLinkedQueue()
-
-    /** Records `defn` under its fresh specialized `sym`. */
-    def addSpecializedDef(sym: Symbol.DefnSym, defn: MonoAst.Def): Unit =
-      specializedDefsQueue.add((sym, defn))
-
-    /** Returns all specialized defs recorded so far. */
-    def specializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
-      specializedDefsQueue.asScala.toMap
-
-    // Diagnostic only, for MonomorphBench's Xmonobench table.
-    private val regularDefsCount: LongAdder = new LongAdder()
-    private val instanceDefsCount: LongAdder = new LongAdder()
-    private val defaultSigImplsCount: LongAdder = new LongAdder()
-
-    def incrementRegularDefs(): Unit = regularDefsCount.increment()
-    def incrementInstanceDefs(): Unit = instanceDefsCount.increment()
-    def incrementDefaultSigImpls(): Unit = defaultSigImplsCount.increment()
-
-    /** Returns the per-category specialized-def counts. */
-    def defCategoryCounts: Map[String, Int] = Map(
-      "regularDefs" -> regularDefsCount.sum().toInt,
-      "instanceDefs" -> instanceDefsCount.sum().toInt,
-      "defaultSigImpls" -> defaultSigImplsCount.sum().toInt
-    )
-  }
 
   /**
     * Returns the sym to use for a call to `sym` at ground arrow type `groundArrowTpe`.
@@ -231,8 +195,6 @@ object Specialize {
                             (implicit tables: SpecializationTables, root: TypedAst.Root, flix: Flix): Symbol.DefnSym = {
     val sig = root.sigs(sym)
     val trt = root.traits(sym.trt)
-    // groundArrowTpe comes from an already-solved, reachable call site, so it must unify with
-    // the sig's own declared scheme.
     val subst = ConstraintSolver2.fullyUnify(sig.spec.declaredScheme.base, groundArrowTpe, RegionScope.Top, RigidityEnv.empty)(root.eqEnv, flix).get
     val traitType = subst.m(trt.tparam.sym)
     // traitType is ground (groundArrowTpe has no free vars), so it always has a type constructor.
@@ -281,9 +243,12 @@ object Specialize {
     case Type.Apply(_, _, loc)             =>
       val args = tpe.typeArguments
       tpe.baseType match {
-        case Type.Cst(TypeConstructor.Enum(sym, _), _) => Type.mkEnum(tables.enumTable((sym, args)), Nil, loc)
-        case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) => Type.mkEnum(tables.restrictableEnumTable((sym, args)), Nil, loc)
-        case Type.Cst(TypeConstructor.Struct(sym, _), _) => Type.mkStruct(tables.structTable((sym, args)), Nil, loc)
+        case Type.Cst(TypeConstructor.Enum(sym, _), _) =>
+          Type.mkEnum(tables.enumTable((sym, args)), Nil, loc)
+        case Type.Cst(TypeConstructor.RestrictableEnum(sym, _), _) =>
+          Type.mkEnum(tables.restrictableEnumTable((sym, args)), Nil, loc)
+        case Type.Cst(TypeConstructor.Struct(sym, _), _) =>
+          Type.mkStruct(tables.structTable((sym, args)), Nil, loc)
         case _ => Type.mkApply(rewriteEnumStructType(tpe.baseType), args.map(rewriteEnumStructType), loc)
       }
 
@@ -446,7 +411,6 @@ object Specialize {
 
     val is: Map[(Symbol.TraitSym, TypeConstructor), Instance] = MonomorphHelpers.mkInstanceMap(root.instances)
 
-    implicit val sctx: SharedContext = new SharedContext()
     implicit val tables: SpecializationTables = SpecializationTables(defTableMap, enumTableMap, structTableMap, restrictableEnumTableMap, is)
 
     // Create specialized and lowered versions of the different families of declarations
@@ -454,26 +418,25 @@ object Specialize {
     // Biggest-first scheduling to preload long-tailed jobs
     def sortBySize(defn: TypedAst.Def): Int = defn.loc.startLine - defn.loc.endLine
 
-    // Non-parametric functions
-    val parametricSyms: Set[Symbol.DefnSym] = entries.map { case (_, defn, _, _) => defn.sym }.toSet
-    val nonParametricDefs = allDefs.filterNot { case (defn, _) => parametricSyms.contains(defn) }
-    ParOps.parMapWithPriority(nonParametricDefs, sortBy = (p: (Symbol.DefnSym, TypedAst.Def)) => sortBySize(p._2)) {
-      case (sym, defn) => flix.profile(defn.sym, defn.loc) {
-        if (defToInst.contains(sym)) sctx.incrementInstanceDefs() else sctx.incrementRegularDefs()
-        sctx.addSpecializedDef(sym, SpecializeAndLower.visitDef(sym, defn, StrictSubstitution.empty))
-      }
-    }
-
-    // Parametric functions
-    ParOps.parMapWithPriority(entries, sortBy = (e: (Symbol.DefnSym, TypedAst.Def, StrictSubstitution, Type)) => sortBySize(e._2)) {
-      case (freshSym, defn, subst, _) =>
-        flix.profile(defn.sym, defn.loc) {
-          if (defToInst.contains(defn.sym)) sctx.incrementInstanceDefs()
-          else if (defaultSigDefs.contains(defn.sym)) sctx.incrementDefaultSigImpls()
-          else sctx.incrementRegularDefs()
-          sctx.addSpecializedDef(freshSym, SpecializeAndLower.visitDef(freshSym, defn, subst))
+    val nonParametricDefs: Map[Symbol.DefnSym, MonoAst.Def] =
+      ParOps.parMapWithPriority(allDefs.filter {
+        case (sym, defn) =>
+          defn.spec.tparams.isEmpty &&
+            defToInst.get(sym).forall(_.tparams.isEmpty) &&
+            !defaultSigDefs.contains(sym)
+        },
+        sortBy = (p: (Symbol.DefnSym, TypedAst.Def)) => sortBySize(p._2)) {
+        case (sym, defn) => sym -> flix.profile(defn.sym, defn.loc) {
+          SpecializeAndLower.visitDef(sym, defn, StrictSubstitution.empty)
         }
-    }
+      }.toMap
+
+    val specializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
+      ParOps.parMapWithPriority(entries, sortBy = (e: (Symbol.DefnSym, TypedAst.Def, StrictSubstitution, Type)) => sortBySize(e._2)) {
+        case (freshSym, defn, subst, _) => freshSym -> flix.profile(defn.sym, defn.loc) {
+          SpecializeAndLower.visitDef(freshSym, defn, subst)
+        }
+      }.toMap
 
     val nonParametricEnums = ParOps.parMapValues(root.enums.filter { case (_, e) => e.tparams.isEmpty }) {
       case TypedAst.Enum(doc, ann, mod, sym, tparams, derives, cases, loc) =>
@@ -506,11 +469,24 @@ object Specialize {
         SpecializeAndLower.lowerEffect(TypedAst.Effect(doc, ann, mod, sym, targs, ops, loc))
     }
 
-    // Diagnostic only
-    flix.emitEvent(FlixEvent.AfterMonomorphCategories(sctx.defCategoryCounts))
+    // Diagnostic only, for MonomorphBench's Xmonobench table.
+    def defCategory(sym: Symbol.DefnSym): String =
+      if (defToInst.contains(sym)) "instanceDefs"
+      else if (defaultSigDefs.contains(sym)) "defaultSigImpls"
+      else "regularDefs"
+
+    val defCategoryCounts: Map[String, Int] = {
+      val counts = (nonParametricDefs.keysIterator ++ entries.iterator.map { case (_, defn, _, _) => defn.sym })
+        .toList
+        .groupBy(defCategory)
+        .view.mapValues(_.size)
+        .toMap
+      Map("regularDefs" -> 0, "instanceDefs" -> 0, "defaultSigImpls" -> 0) ++ counts
+    }
+    flix.emitEvent(FlixEvent.AfterMonomorphCategories(defCategoryCounts))
 
     MonoAst.Root(
-      sctx.specializedDefs,
+      nonParametricDefs ++ specializedDefs,
       nonParametricEnums ++ specializedEnums ++ specializedRestrictableEnums,
       nonParametricStructs ++ specializedStructs,
       effects,
