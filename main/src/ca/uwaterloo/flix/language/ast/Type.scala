@@ -21,7 +21,7 @@ import ca.uwaterloo.flix.language.ast.shared.*
 import ca.uwaterloo.flix.language.ast.shared.SymUse.{AssocTypeSymUse, TypeAliasSymUse}
 import ca.uwaterloo.flix.language.ast.shared.VarText.Absent
 import ca.uwaterloo.flix.language.fmt.{FormatOptions, FormatType}
-import ca.uwaterloo.flix.util.collection.CofiniteSet
+import ca.uwaterloo.flix.util.collection.{CofiniteSet, Nel}
 import ca.uwaterloo.flix.util.{InternalCompilerException, Result}
 
 import java.util.Objects
@@ -144,9 +144,9 @@ sealed trait Type {
     * }}}
     *
     */
-  def baseType: Type.BaseType = this match {
+  def baseType: Type = this match {
     case Type.Apply(t1, _, _) => t1.baseType
-    case bt: Type.BaseType => bt
+    case bt => bt
   }
 
   /**
@@ -475,15 +475,9 @@ object Type {
   /////////////////////////////////////////////////////////////////////////////
 
   /**
-    * The union of non-Apply types.
-    * Used to restrict the range of return values of [[Type.baseType]].
-    */
-  sealed trait BaseType extends Type
-
-  /**
     * A type variable.
     */
-  case class Var(sym: Symbol.KindedTypeVarSym, loc: SourceLocation) extends Type with BaseType with Ordered[Type.Var] {
+  case class Var(sym: Symbol.KindedTypeVarSym, loc: SourceLocation) extends Type with Ordered[Type.Var] {
 
     def withText(text: VarText): Var = Var(sym.withText(text), loc)
 
@@ -511,7 +505,7 @@ object Type {
   /**
     * A type represented by the type constructor `tc`.
     */
-  case class Cst(tc: TypeConstructor, loc: SourceLocation) extends Type with BaseType {
+  case class Cst(tc: TypeConstructor, loc: SourceLocation) extends Type {
     def kind: Kind = tc.kind
 
     override def hashCode(): Int = tc.hashCode()
@@ -560,14 +554,14 @@ object Type {
   /**
     * A type alias, including the arguments passed to it and the type it represents.
     */
-  case class Alias(symUse: TypeAliasSymUse, args: List[Type], tpe: Type, loc: SourceLocation) extends Type with BaseType {
+  case class Alias(symUse: TypeAliasSymUse, args: List[Type], tpe: Type, loc: SourceLocation) extends Type {
     override def kind: Kind = tpe.kind
   }
 
   /**
     * An associated type.
     */
-  case class AssocType(symUse: AssocTypeSymUse, arg: Type, kind: Kind, loc: SourceLocation) extends Type with BaseType {
+  case class AssocType(symUse: AssocTypeSymUse, arg: Type, kind: Kind, loc: SourceLocation) extends Type {
     override def equals(obj: Any): Boolean = obj match {
       case that: AssocType => this.symUse.sym == that.symUse.sym && this.arg == that.arg
       case _ => false
@@ -579,21 +573,21 @@ object Type {
   /**
     * A type which must be reduced by finding the correct JVM constructor, method, or field.
     */
-  case class JvmToType(tpe: Type, loc: SourceLocation) extends Type with BaseType {
+  case class JvmToType(tpe: Type, loc: SourceLocation) extends Type {
     override def kind: Kind = Kind.Star
   }
 
   /**
     * An effect which must be reduced by finding the correct JVM constructor or method.
     */
-  case class JvmToEff(tpe: Type, loc: SourceLocation) extends Type with BaseType {
+  case class JvmToEff(tpe: Type, loc: SourceLocation) extends Type {
     override def kind: Kind = Kind.Eff
   }
 
   /**
     * An unresolved Java type. Once the type variables are resolved, this can be reduced to a normal type.
     */
-  case class UnresolvedJvmType(member: JvmMember, loc: SourceLocation) extends Type with BaseType {
+  case class UnresolvedJvmType(member: JvmMember, loc: SourceLocation) extends Type {
     override def kind: Kind = Kind.Jvm
   }
 
@@ -660,35 +654,34 @@ object Type {
     *   or error types and hence reduces to a single Cofinite set.
     * - Returns `Err[()]` otherwise.
     */
-  def eval(eff: Type): Result[CofiniteSet[Symbol.EffSym], Unit] = eff match {
-    case Type.Cst(tc, _) => tc match {
-      case TypeConstructor.Pure => Result.Ok(CofiniteSet.empty)
-      case TypeConstructor.Univ => Result.Ok(CofiniteSet.universe)
-      case TypeConstructor.Effect(sym, _) => Result.Ok(CofiniteSet.mkSet(sym))
-      case _ => Result.Err(())
+  def eval(eff: Type): Result[CofiniteSet[Symbol.EffSym], Unit] = {
+    /** Thrown by `visit` when the effect does not reduce to a set of effect symbols. Never escapes `eval`. */
+    case object NonGroundEffect extends RuntimeException
+
+    def visit(t: Type): CofiniteSet[Symbol.EffSym] = t match {
+      case Type.Cst(tc, _) => tc match {
+        case TypeConstructor.Pure => CofiniteSet.empty
+        case TypeConstructor.Univ => CofiniteSet.universe
+        case TypeConstructor.Effect(sym, _) => CofiniteSet.mkSet(sym)
+        case _ => throw NonGroundEffect
+      }
+      case Type.Apply(Type.Cst(TypeConstructor.Complement, _), x, _) =>
+        CofiniteSet.complement(visit(x))
+      case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Union, _), x, _), y, _) =>
+        CofiniteSet.union(visit(x), visit(y))
+      case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Intersection, _), x, _), y, _) =>
+        CofiniteSet.intersection(visit(x), visit(y))
+      case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Difference, _), x, _), y, _) =>
+        CofiniteSet.difference(visit(x), visit(y))
+      case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SymmetricDiff, _), x, _), y, _) =>
+        CofiniteSet.xor(visit(x), visit(y))
+      case Type.Alias(_, _, tpe, _) => visit(tpe)
+      case _ => throw NonGroundEffect
     }
-    case Type.Apply(Type.Cst(TypeConstructor.Complement, _), x0, _) =>
-      Result.mapN(eval(x0)) {
-        case x => CofiniteSet.complement(x)
-      }
-    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Union, _), x0, _), y0, _) =>
-      Result.mapN(eval(x0), eval(y0)) {
-        case (x, y) => CofiniteSet.union(x, y)
-      }
-    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Intersection, _), x0, _), y0, _) =>
-      Result.mapN(eval(x0), eval(y0)) {
-        case (x, y) => CofiniteSet.intersection(x, y)
-      }
-    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.Difference, _), x0, _), y0, _) =>
-      Result.mapN(eval(x0), eval(y0)) {
-        case (x, y) => CofiniteSet.difference(x, y)
-      }
-    case Type.Apply(Type.Apply(Type.Cst(TypeConstructor.SymmetricDiff, _), x0, _), y0, _) =>
-      Result.mapN(eval(x0), eval(y0)) {
-        case (x, y) => CofiniteSet.xor(x, y)
-      }
-    case Type.Alias(_, _, tpe, _) => eval(tpe)
-    case _ => Result.Err(())
+
+    try Result.Ok(visit(eff)) catch {
+      case NonGroundEffect => Result.Err(())
+    }
   }
 
   /**
@@ -857,72 +850,48 @@ object Type {
 
   /**
     * Constructs the pure curried arrow type A_1 -> (A_2  -> ... -> A_n) -> B.
-    *
-    * Returns `b` if `as` is empty.
     */
-  def mkPureCurriedArrow(as: List[Type], b: Type, loc: SourceLocation): Type = mkCurriedArrowWithEffect(as, Pure, b, loc)
+  def mkPureCurriedArrow(as: Nel[Type], b: Type, loc: SourceLocation): Type = mkCurriedArrowWithEffect(as, Pure, b, loc)
 
   /**
     * Constructs the curried arrow type A_1 -> (A_2  -> ... -> A_n) -> B \ e.
-    *
-    * Returns `b` if `as` is empty.
     */
-  def mkCurriedArrowWithEffect(as: List[Type], p: Type, b: Type, loc: SourceLocation): Type = {
-    if (as.isEmpty) {
-      b
-    } else {
-      val a = as.last
-      val base = mkArrowWithEffect(a, p, b, loc)
-      as.init.foldRight(base)(mkPureArrow(_, _, loc))
-    }
+  def mkCurriedArrowWithEffect(as: Nel[Type], p: Type, b: Type, loc: SourceLocation): Type = {
+    val a = as.last
+    val base = mkArrowWithEffect(a, p, b, loc)
+    as.init.foldRight(base)(mkPureArrow(_, _, loc))
   }
 
   /**
     * Constructs the pure uncurried arrow type (A_1, ..., A_n) -> B.
-    *
-    * Returns `b` if `as` is empty.
     */
-  def mkPureUncurriedArrow(as: List[Type], b: Type, loc: SourceLocation): Type = mkUncurriedArrowWithEffect(as, Pure, b, loc)
+  def mkPureUncurriedArrow(as: Nel[Type], b: Type, loc: SourceLocation): Type = mkUncurriedArrowWithEffect(as, Pure, b, loc)
 
   /**
     * Constructs the IO uncurried arrow type (A_1, ..., A_n) -> B \ IO.
-    *
-    * Returns `b` if `as` is empty.
     */
-  def mkIoUncurriedArrow(as: List[Type], b: Type, loc: SourceLocation): Type = mkUncurriedArrowWithEffect(as, IO, b, loc)
+  def mkIoUncurriedArrow(as: Nel[Type], b: Type, loc: SourceLocation): Type = mkUncurriedArrowWithEffect(as, IO, b, loc)
 
   /**
     * Constructs the uncurried arrow type (A_1, ..., A_n) -> B \ p.
-    *
-    * Returns `b` if `as` is empty.
     */
-  def mkUncurriedArrowWithEffect(as: List[Type], p: Type, b: Type, loc: SourceLocation): Type = {
-    if (as.isEmpty) {
-      b
-    } else {
-      val arrow = mkApply(Type.Cst(TypeConstructor.Arrow(as.length + 1), loc), List(p), loc)
-      val inner = as.foldLeft(arrow: Type) {
-        case (acc, x) => Apply(acc, x, loc)
-      }
-      Apply(inner, b, loc)
+  def mkUncurriedArrowWithEffect(as: Nel[Type], p: Type, b: Type, loc: SourceLocation): Type = {
+    val arrow = mkApply(Type.Cst(TypeConstructor.Arrow(as.length + 1), loc), List(p), loc)
+    val inner = as.foldLeft(arrow: Type) {
+      case (acc, x) => Apply(acc, x, loc)
     }
+    Apply(inner, b, loc)
   }
 
   /**
     * Constructs the backend arrow type (A_1, ..., A_n) -> B.
-    *
-    * Returns `b` if `as` is empty.
     */
-  def mkArrowWithoutEffect(as: List[Type], b: Type, loc: SourceLocation): Type = {
-    if (as.isEmpty) {
-      b
-    } else {
-      val arrow = Type.Cst(TypeConstructor.ArrowWithoutEffect(as.length + 1), loc)
-      val inner = as.foldLeft(arrow: Type) {
-        case (acc, x) => Apply(acc, x, loc)
-      }
-      Apply(inner, b, loc)
+  def mkArrowWithoutEffect(as: Nel[Type], b: Type, loc: SourceLocation): Type = {
+    val arrow = Type.Cst(TypeConstructor.ArrowWithoutEffect(as.length + 1), loc)
+    val inner = as.foldLeft(arrow: Type) {
+      case (acc, x) => Apply(acc, x, loc)
     }
+    Apply(inner, b, loc)
   }
 
   /**
@@ -972,9 +941,10 @@ object Type {
   }
 
   /**
-    * Inverse of [[mkTuplish]]: deconstructs the tuple type (A, B, ...) into `List(A, B, ...)`.
+    * Inverse of [[mkTuplish]]: recovers the list of types that were combined into `tpe`.
     *
     * Returns `List(tpe)` if `arity <= 1`, since [[mkTuplish]] leaves a single value bare.
+    * Returns `tpe`'s type arguments otherwise.
     */
   def unmkTuplish(arity: Int, tpe: Type): List[Type] =
     if (arity <= 1) {

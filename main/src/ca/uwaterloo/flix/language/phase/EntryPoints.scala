@@ -22,8 +22,8 @@ import ca.uwaterloo.flix.language.ast.{Kind, SourceLocation, Symbol, Type, TypeC
 import ca.uwaterloo.flix.language.dbg.AstPrinter.*
 import ca.uwaterloo.flix.language.errors.EntryPointError
 import ca.uwaterloo.flix.runtime.shell.Shell
-import ca.uwaterloo.flix.util.collection.CofiniteSet
-import ca.uwaterloo.flix.util.{InternalCompilerException, ParOps, Result}
+import ca.uwaterloo.flix.util.collection.{CofiniteSet, Nel}
+import ca.uwaterloo.flix.util.{ParOps, Result}
 
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.atomic.AtomicBoolean
@@ -56,7 +56,7 @@ object EntryPoints {
   // We don't use regions, so we are safe to use the global scope everywhere in this phase.
   private implicit val S: RegionScope = RegionScope.Top
 
-  def run(root: TypedAst.Root)(implicit flix: Flix): (TypedAst.Root, List[EntryPointError]) = flix.phaseNew("EntryPoints") {
+  def run(root: TypedAst.Root)(implicit flix: Flix): (TypedAst.Root, List[EntryPointError]) = flix.phase("EntryPoints") {
     val (root1, errs1) = resolveMain(root)
     val (root2, errs2) = checkEntryPoints(root1)
     val root3 = findEntryPoints(root2)
@@ -306,7 +306,7 @@ object EntryPoints {
 
   /** Returns all the types in the signature of `defn`. */
   private def typesOf(defn: TypedAst.Def): List[Type] = {
-    defn.spec.fparams.map(_.tpe) ++
+    defn.spec.fparams.toList.map(_.tpe) ++
       List(defn.spec.retTpe) ++
       List(defn.spec.eff) ++
       defn.spec.tconstrs.map(_.arg) ++
@@ -317,7 +317,7 @@ object EntryPoints {
   private def checkUnitArg(defn: TypedAst.Def): Option[EntryPointError] = {
     defn.spec.fparams match {
       // One parameter of type Unit - valid.
-      case List(arg) =>
+      case Nel(arg, Nil) =>
         isUnitType(arg.tpe) match {
           case Result.Ok(true) => None
           case Result.Ok(false) =>
@@ -326,11 +326,9 @@ object EntryPoints {
             // Do not report an error, since previous phases should have done already.
             None
         }
-      // One parameter of a non-Unit type or more than two parameters - invalid.
-      case _ :: _ =>
+      // More than one parameter - invalid.
+      case _ =>
         Some(EntryPointError.IllegalRunnableEntryPointArgs(defn.sym.loc))
-      // Zero parameters.
-      case Nil => throw InternalCompilerException(s"Unexpected main with zero parameters ('${defn.sym}'", defn.sym.loc)
     }
   }
 
@@ -429,7 +427,7 @@ object EntryPoints {
 
   /** Returns an error for each type in `defn` that is not valid in Java. */
   private def checkJavaTypes(defn: TypedAst.Def)(implicit flix: Flix): List[EntryPointError] = {
-    val types = defn.spec.retTpe :: defn.spec.fparams.map(_.tpe)
+    val types = defn.spec.retTpe :: defn.spec.fparams.toList.map(_.tpe)
     types.flatMap(tpe => {
       isExportableType(tpe) match {
         case Result.Ok(true) =>

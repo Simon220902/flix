@@ -797,7 +797,7 @@ class TestWeeder extends AnyFunSuite with TestUtils {
   test("IllegalModifier.01") {
     val input =
       """
-        |lawful enum A
+        |sealed enum A
         |
         |""".stripMargin
     val result = check(input, Options.TestWithLibNix)
@@ -1996,6 +1996,19 @@ class TestWeeder extends AnyFunSuite with TestUtils {
         |""".stripMargin
     val result = check(input, Options.TestWithLibNix)
     expectError[WeederError.IllegalUnaryPlus](result)
+  }
+
+  test("MissingPredicateArity.01") {
+    val input =
+      """
+        |def f(x: Vector[Int32]): Unit = {
+        |  let _ = inject x into A/x;
+        |  ()
+        |}
+        |""".stripMargin
+    val result = check(input, Options.TestWithLibAll)
+    expectError[ParseError.UnexpectedToken](result)
+    rejectError[WeederError.IllegalPredicateArity](result)
   }
 
   test("IllegalConstantPattern.LetMatch.01") {
