@@ -353,7 +353,7 @@ object MonomorphBench {
     flix.addVirtualPath(Path.of("Empty.flix"), "")
   }
 
-  private def resultsDir(o: Options): Path = o.outputPath.resolve(ResultsDir)
+  private def resultsDir(o: Options): Path = Path.of("./build/").resolve(ResultsDir)
 
   private def resultFile(o: Options, pipeline: String): Path =
     resultsDir(o).resolve(s"$pipeline.json")

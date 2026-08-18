@@ -1220,7 +1220,7 @@ object SpecializeAndLower {
     // groundArrowTpe is the def-lookup key: built from the caller's RAW (un-rewritten) substituted
     // chanTpe/valTpe — see mkGetChannel's doc comment for why `exp1.tpe`/`exp2.tpe` can't be used
     // directly (already enum/struct-rewritten by the time the visited exprs reach here).
-    val groundArrowTpe = lowerType(Type.mkIoUncurriedArrow(List(valTpe, chanTpe), Type.Unit, loc))
+    val groundArrowTpe = lowerType(Type.mkIoUncurriedArrow(Nel.of(valTpe, chanTpe), Type.Unit, loc))
     val defnSym = lookupSym(Defs.Concurrent.Channel.Put, groundArrowTpe)
     val chanSym = mkLetSym("chan", loc)
     val valueSym = mkLetSym("value", loc)
@@ -1300,7 +1300,7 @@ object SpecializeAndLower {
     val locksType = Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc)
 
     val selectRetTpe = Type.mkTuple(List(Type.Int32, locksType), loc)
-    val groundArrowTpe = Type.mkIoUncurriedArrow(List(admins.tpe, Type.Bool), selectRetTpe, loc)
+    val groundArrowTpe = Type.mkIoUncurriedArrow(Nel.of(admins.tpe, Type.Bool), selectRetTpe, loc)
     val blocking = default match {
       case Some(_) => MonoAst.Expr.Cst(Constant.Bool(false), Type.Bool, loc)
       case None => MonoAst.Expr.Cst(Constant.Bool(true), Type.Bool, loc)
@@ -1330,7 +1330,7 @@ object SpecializeAndLower {
         val pat = mkTuplePattern(Nel(MonoAst.Pattern.Cst(Constant.Int32(i), Type.Int32, loc), List(MonoAst.Pattern.Var(locksSym, locksType, Occur.Unknown, loc))), loc)
         // getTpe/groundArrowTpe/lookup key built from the RAW channel type — see SelectChannel's doc comment.
         val getTpe = extractChannelTpe(rawChanTpe)
-        val groundArrowTpe = lowerType(Type.mkIoUncurriedArrow(List(rawChanTpe, locksTypeRaw), getTpe, loc))
+        val groundArrowTpe = lowerType(Type.mkIoUncurriedArrow(Nel.of(rawChanTpe, locksTypeRaw), getTpe, loc))
         val args = List(MonoAst.Expr.Var(chSym, visitTypeSubstituted(rawChanTpe), loc), MonoAst.Expr.Var(locksSym, locksType, loc))
         val defnSym = lookupSym(Defs.Concurrent.Channel.UnsafeGetAndUnlock, groundArrowTpe)
         val getExp = MonoAst.Expr.ApplyDef(defnSym, args, Specialize.rewriteEnumStructType(groundArrowTpe), visitTypeSubstituted(getTpe), eff, loc)
@@ -1589,7 +1589,7 @@ object SpecializeAndLower {
     val loweredQueryExp = visitExp(queryExp, env0, subst)
 
     // Define the name and type of the appropriate factsX function in Solver.flix
-    val defTpe = Type.mkPureUncurriedArrow(List(Types.Fixpoint.Ast.Shared.PredSym, Types.Fixpoint.Ast.Datalog.Datalog), tpe, loc)
+    val defTpe = Type.mkPureUncurriedArrow(Nel.of(Types.Fixpoint.Ast.Shared.PredSym, Types.Fixpoint.Ast.Datalog.Datalog), tpe, loc)
     val sym = lookupSym(Defs.Fixpoint.Solver.Facts(predArity), defTpe)
 
     // Merge and solve exps
@@ -1644,7 +1644,7 @@ object SpecializeAndLower {
         // The exp's own type/eff are TypedAst-level reads: substitute before use (fused walk).
         val expTpe = subst(exp.tpe)
 
-        val defTpe = Type.mkPureUncurriedArrow(List(Types.Fixpoint.Ast.Shared.PredSym, lowerType(expTpe)), Types.Fixpoint.Ast.Datalog.Datalog, loc)
+        val defTpe = Type.mkPureUncurriedArrow(Nel.of(Types.Fixpoint.Ast.Shared.PredSym, lowerType(expTpe)), Types.Fixpoint.Ast.Datalog.Datalog, loc)
 
         val sym = lookupSym(Defs.Fixpoint.Solver.InjectInto(arity), defTpe)
 
@@ -1807,7 +1807,7 @@ object SpecializeAndLower {
     * Lifts `exp0: a -> b -> c -> resultType` (curried) to a call `liftN(exp0): Boxed -> ... -> Boxed`
     * (also curried). `liftX` and `liftXb` are similar and should probably be maintained together.
     */
-  private def liftX(exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type)(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
+  private def liftX(exp0: MonoAst.Expr, argTypes: Nel[Type], resultType: Type)(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
 
     val argType = Type.mkPureCurriedArrow(argTypes, resultType, exp0.loc)
 
@@ -1821,7 +1821,7 @@ object SpecializeAndLower {
   }
 
   /** Lifts `exp0: a -> b -> c -> Bool` (curried) to a call `liftNb(exp0): Boxed -> ... -> Bool` (curried). */
-  private def liftXb(exp0: MonoAst.Expr, argTypes: List[Type])(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
+  private def liftXb(exp0: MonoAst.Expr, argTypes: Nel[Type])(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
 
     val argType = Type.mkPureCurriedArrow(argTypes, Type.Bool, exp0.loc)
 
@@ -1841,7 +1841,10 @@ object SpecializeAndLower {
     */
   private def liftXY(outVars: List[Symbol.VarSym], exp0: MonoAst.Expr, argTypes: List[Type], resultType: Type, loc: SourceLocation)(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
 
-    val argType = Type.mkPureCurriedArrow(argTypes, resultType, loc)
+    val argType = argTypes match {
+      case Nil => resultType
+      case t :: ts => Type.mkPureCurriedArrow(Nel(t, ts), resultType, loc)
+    }
 
     val returnType = Type.mkPureArrow(Type.mkVector(Types.Fixpoint.Boxed, loc), Type.mkVector(Type.mkVector(Types.Fixpoint.Boxed, loc), loc), loc)
 
@@ -1993,7 +1996,7 @@ object SpecializeAndLower {
     }
 
     val lambdaExp = curryFreshLambda(fvs, exp, loc)
-    val liftedExp = liftXb(lambdaExp, fvs.map(_._2))
+    val liftedExp = liftXb(lambdaExp, Nel.unsafeFrom(fvs.map(_._2)))
     val varExps = fvs.map(kv => mkVarSym(kv._1))
     val innerExp = liftedExp :: varExps
     mkTag(Enums.Fixpoint.Ast.Datalog.BodyPredicate, s"Guard$arity", innerExp, Types.Fixpoint.Ast.Datalog.BodyPredicate, loc)
@@ -2034,7 +2037,7 @@ object SpecializeAndLower {
 
     val lambdaExp = curryFreshLambda(fvs, exp, loc)
     // rawResultTpe, not exp.tpe (already enum/struct-rewritten) — see box's doc comment.
-    val liftedExp = liftX(lambdaExp, fvs.map(_._2), rawResultTpe)
+    val liftedExp = liftX(lambdaExp, Nel.unsafeFrom(fvs.map(_._2)), rawResultTpe)
 
     val varExps = fvs.map(kv => mkVarSym(kv._1))
     val innerExp = liftedExp :: varExps
@@ -2433,8 +2436,8 @@ object SpecializeAndLower {
     * where `"terms" == termsVar.text`.
     */
   private def mkUnboxedTerm(termsVar: Symbol.VarSym, tpe: Type, i: Int, loc: SourceLocation)(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
-    val outerGroundArrowTpe = Type.mkPureUncurriedArrow(List(Types.Fixpoint.Boxed), tpe, loc)
-    val innerGroundArrowTpe = Type.mkPureUncurriedArrow(List(Type.Int32, Types.Fixpoint.VectorOfBoxed), Types.Fixpoint.Boxed, loc)
+    val outerGroundArrowTpe = Type.mkPureUncurriedArrow(Nel.of(Types.Fixpoint.Boxed), tpe, loc)
+    val innerGroundArrowTpe = Type.mkPureUncurriedArrow(Nel.of(Type.Int32, Types.Fixpoint.VectorOfBoxed), Types.Fixpoint.Boxed, loc)
     MonoAst.Expr.ApplyDef(
       sym = lookupSym(Defs.Fixpoint.Boxable.Unbox, outerGroundArrowTpe),
       exps = List(

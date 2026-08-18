@@ -16,8 +16,7 @@
 
 package ca.uwaterloo.flix.language.phase.monomorph2
 
-import ca.uwaterloo.flix.api.Flix
-import ca.uwaterloo.flix.language.dbg.AstPrinter
+import ca.uwaterloo.flix.api.{CompilerConstants, Flix}
 import ca.uwaterloo.flix.util.FileOps
 import ca.uwaterloo.flix.util.tc.Debug
 
@@ -33,7 +32,7 @@ private[monomorph2] object MonomorphDebug {
   /** Writes `flows` as a Graphviz graph and a plain-text listing, both prefixed with stats. */
   object DebugFlows extends Debug[List[FlowConstraint]] {
     override def emit(name: String, flows: List[FlowConstraint])(implicit flix: Flix): Unit = {
-      val dir = AstPrinter.astFolderPath.resolve("monomorph2")
+      val dir = CompilerConstants.AstDirectory.resolve("monomorph2")
       val statLines = stats(flows)
       FileOps.writeString(dir.resolve("ConstraintCollection.dot"), statLines.map("// " + _).mkString("\n") + "\n\n" + toDot(flows))
       FileOps.writeString(dir.resolve("ConstraintCollection.txt"), statLines.mkString("\n") + "\n\n" + flowsToText(flows))
@@ -43,7 +42,7 @@ private[monomorph2] object MonomorphDebug {
   /** Writes `solution` as a plain-text listing of every symbol's solved ground tuples. */
   object DebugSolution extends Debug[Solution] {
     override def emit(name: String, solution: Solution)(implicit flix: Flix): Unit = {
-      val dir = AstPrinter.astFolderPath.resolve("monomorph2")
+      val dir = CompilerConstants.AstDirectory.resolve("monomorph2")
       FileOps.writeString(dir.resolve("ConstraintSolver.txt"), solutionToText(solution))
     }
   }
