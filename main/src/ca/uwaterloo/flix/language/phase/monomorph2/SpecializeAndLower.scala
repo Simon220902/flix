@@ -732,7 +732,7 @@ object SpecializeAndLower {
 
     case TypedAst.Expr.FixpointQueryWithSelect(exps, queryExp, selects, _, _, pred, tpe, eff, loc) =>
       // Synthesizes Fixpoint solver solve+facts calls.
-      lowerQueryWithSelect(exps, queryExp, selects, pred, subst(tpe), subst(eff), loc, env0, subst)
+      lowerQueryWithSelect(exps, queryExp, selects.length, pred, subst(tpe), subst(eff), loc, env0, subst)
 
     case TypedAst.Expr.FixpointSolveWithProject(exps, optPreds, mode, _, eff, loc) =>
       // Synthesizes Fixpoint solver solve+project calls.
@@ -1584,11 +1584,9 @@ object SpecializeAndLower {
   }
 
   /** Lowers a Datalog query-with-select to Fixpoint solver solve+facts calls. `tpe`/`eff` must arrive already substituted from the caller (fused walk). */
-  private def lowerQueryWithSelect(exps: List[TypedAst.Expr], queryExp: TypedAst.Expr, selects: List[TypedAst.Expr], pred: Name.Pred, tpe: Type, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: SpecializationTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
+  private def lowerQueryWithSelect(exps: List[TypedAst.Expr], queryExp: TypedAst.Expr, predArity: Int, pred: Name.Pred, tpe: Type, eff: Type, loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: SpecializationTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
     val loweredExps = exps.map(visitExp(_, env0, subst))
     val loweredQueryExp = visitExp(queryExp, env0, subst)
-
-    val predArity = selects.length
 
     // Define the name and type of the appropriate factsX function in Solver.flix
     val defTpe = Type.mkPureUncurriedArrow(List(Types.Fixpoint.Ast.Shared.PredSym, Types.Fixpoint.Ast.Datalog.Datalog), tpe, loc)
