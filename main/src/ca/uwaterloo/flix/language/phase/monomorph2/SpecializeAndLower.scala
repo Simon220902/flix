@@ -185,9 +185,13 @@ object SpecializeAndLower {
     *   - types are lowered and Datalog/channel expressions are lowered to the primitives.
     */
   private def visitExp(exp0: TypedAst.Expr, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: SpecializationTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = exp0 match {
-    case TypedAst.Expr.Cst(cst, tpe, loc) => MonoAst.Expr.Cst(cst, visitType(tpe, subst), loc)
+    case TypedAst.Expr.Cst(cst, tpe, loc) =>
+      val t = visitType(tpe, subst)
+      MonoAst.Expr.Cst(cst, t, loc)
 
-    case TypedAst.Expr.Var(sym, tpe, loc) => MonoAst.Expr.Var(env0(sym), visitType(tpe, subst), loc)
+    case TypedAst.Expr.Var(sym, tpe, loc) =>
+      val t = visitType(tpe, subst)
+      MonoAst.Expr.Var(env0(sym), t, loc)
 
     case TypedAst.Expr.Hole(sym, _, tpe, eff, loc) =>
       val t = visitType(tpe, subst)
@@ -415,8 +419,9 @@ object SpecializeAndLower {
     case TypedAst.Expr.StructNew(sym, fields0, region0, tpe, eff, loc) =>
       val t = subst(tpe)
       val newStructSym = lookupStructSym(sym, t)
-      val fields = fields0.map { case (symUse, v) =>
-        (new Symbol.StructFieldSym(newStructSym, symUse.sym.name, symUse.loc), visitExp(v, env0, subst))
+      val fields = fields0.map {
+        case (symUse, v) =>
+          (new Symbol.StructFieldSym(newStructSym, symUse.sym.name, symUse.loc), visitExp(v, env0, subst))
       }
       val (names, es) = fields.unzip
       val tLow = visitTypeSubstituted(t)
@@ -524,9 +529,9 @@ object SpecializeAndLower {
     case TypedAst.Expr.InvokeConstructor(constructor, exps, tpe, eff, loc) =>
       val es = exps.map(visitExp(_, env0, subst))
       val t = visitType(tpe, subst)
-      // Box primitive args where Java expects Object (e.g., `new SimpleEntry(42, true)`).
+      // Box primitive args to match the constructor's Object-typed parameters.
       val javaParamTypes = constructor.getParameterTypes
-      val boxedArgs = es.zip(javaParamTypes).map { case (arg, paramType) => boxIfNecessary(arg, paramType) }
+      val boxedArgs = ListOps.zip(es, javaParamTypes.toList).map { case (arg, paramType) => boxIfNecessary(arg, paramType) }
       MonoAst.Expr.ApplyAtomic(AtomicOp.InvokeConstructor(constructor), boxedArgs, t, subst(eff), loc)
 
     case TypedAst.Expr.InvokeSuperConstructor(constructor, exps, tpe, eff, loc) =>
@@ -541,7 +546,6 @@ object SpecializeAndLower {
       mkJavaInvoke(method, List(e), es, t, subst(eff), loc, AtomicOp.InvokeMethod.apply)
 
     case TypedAst.Expr.InvokeSuperMethod(method, exps, tpe, eff, loc) =>
-      // The super call is routed through the enclosing NewObject's this-ref (LocalContext).
       val es = exps.map(visitExp(_, env0, subst))
       val t = visitType(tpe, subst)
       (lctx.sym, lctx.thisRef) match {
@@ -709,7 +713,6 @@ object SpecializeAndLower {
       lowerInjectInto(exps, predsAndArities, loc, env0, subst)
 
     case TypedAst.Expr.ApplySig(symUse, exps, _, _, itpe0, tpe, eff, _, loc) =>
-      // Resolve the sig to its concrete instance def (or default impl), then emit as ApplyDef.
       val groundArrowTpe = subst(itpe0)
       val newSym = resolveSigSym(symUse.sym, groundArrowTpe)
       val es = exps.map(visitExp(_, env0, subst))
@@ -1143,7 +1146,7 @@ object SpecializeAndLower {
     * is the `AtomicOp` constructor and `receiver` is `List(thisRef)` or `Nil`.
     */
   private def mkJavaInvoke(method: java.lang.reflect.Method, receiver: List[MonoAst.Expr], args: List[MonoAst.Expr], t: Type, eff: Type, loc: SourceLocation, mkOp: java.lang.reflect.Method => AtomicOp): MonoAst.Expr = {
-    val boxedArgs = args.zip(method.getParameterTypes).map { case (arg, paramType) => boxIfNecessary(arg, paramType) }
+    val boxedArgs = ListOps.zip(args, method.getParameterTypes.toList).map { case (arg, paramType) => boxIfNecessary(arg, paramType) }
     val javaReturnType = method.getReturnType
     val needsUnbox = isPrimType(t) && !javaReturnType.isPrimitive
     val invokeType = if (needsUnbox) boxedWrapperType(t, loc) else t
@@ -1622,7 +1625,7 @@ object SpecializeAndLower {
 
   /** Lowers a Datalog inject-into to Fixpoint solver `projectInto` calls, one per predicate in `predsAndArities`. */
   private def lowerInjectInto(exps: List[TypedAst.Expr], predsAndArities: List[PredicateAndArity], loc: SourceLocation, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: SpecializationTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
-    val loweredExps = exps.zip(predsAndArities).map {
+    val loweredExps = ListOps.zip(exps, predsAndArities).map {
       case (exp, PredicateAndArity(pred, arity)) =>
         // The exp's own type/eff are TypedAst-level reads: substitute before use (fused walk).
         val expTpe = subst(exp.tpe)
