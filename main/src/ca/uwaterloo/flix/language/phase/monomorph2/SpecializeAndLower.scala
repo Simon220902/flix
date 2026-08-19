@@ -30,21 +30,24 @@ import ca.uwaterloo.flix.util.{InternalCompilerException, JvmUtils, Result}
 import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
 
 /**
-  * Fuses specialization and lowering into a single AST walk: [[visitDef]] both instantiates a
-  * def's types/symbols to their concrete (ground) form and lowers Datalog, channel, and other
-  * high-level constructs to runtime primitives, avoiding an intermediate specialized-but-not-yet-
-  * lowered `TypedAst`.
+  * Fuses specialization and lowering into a single AST walk: instantiates a declaration's
+  * types/symbols to their concrete (ground) form and lowers Datalog, channel, JVM-interop, and
+  * other high-level constructs to runtime primitives in the same pass.
   *
-  * Lowering here translates the Datalog subset into `Fixpoint.Ast.Datalog` values, Schema types
-  * into enum types (boxing values via `Boxable`), and channel expressions and `Sender`/`Receiver`
-  * types into the channel enum encoding.
+  * [[visitDef]]/[[lowerEnum]]/[[lowerStruct]]/[[lowerEffect]] are the four entry points
+  * [[Specialize.run]] calls.
+  *  Every call/tag/struct site here is resolved via [[Specialize]]'s `lookupSym`/`lookupCaseSym`/
+  *  `lookupStructSym`/`resolveSigSym`.
   *
-  * `ConstraintGen` predicts every def-lookup key and specialized symbol synthesized here — keep
-  * the two in sync.
+  * N.B. [[ConstraintGen]] needs to predict every specialized symbol synthesized here.
   */
 object SpecializeAndLower {
 
-  /** Lowers `tpe0`, replacing Schema types with the Datalog enum type and channel types with the channel enum type. */
+  /**
+    * Lowers the given type `tpe0`.
+    *
+    * Replaces schema types with the Datalog enum type and channel-related types with the channel enum type.
+    */
   private def lowerType(tpe0: Type): Type = tpe0.typeConstructor match {
     case Some(TypeConstructor.Schema) =>
       // Erase every Schema type, regardless of its polymorphic type applications, to the Datalog type.
@@ -89,11 +92,11 @@ object SpecializeAndLower {
 
   }
 
-  /** Composes `subst`, lowering, and [[Specialize.rewriteEnumStructType]] — the single call every type in the fused walk goes through. */
+  /** Grounds, lowers, and rewrites `t` to its specialized form. */
   private def visitType(t: Type, subst: StrictSubstitution)(implicit tables: SpecializationTables, root: TypedAst.Root, flix: Flix): Type =
     Specialize.rewriteEnumStructType(lowerType(subst(t)))
 
-  /** Same as [[visitType]], for call sites where `t` has already been substituted (only lowering + the rewrite remain). */
+  /** Lowers and rewrites `t` that has already been grounded. */
   private def visitTypeSubstituted(t: Type)(implicit tables: SpecializationTables): Type =
     Specialize.rewriteEnumStructType(lowerType(t))
 
@@ -117,33 +120,21 @@ object SpecializeAndLower {
     } else {
       defn0
     }
-    try {
-      defn match {
-        case TypedAst.Def(_, spec0, exp, loc) =>
-          val (fparams, env0) = specializeFormalParams(spec0.fparams, subst)
-          val fs = fparams.map(lowerFormalParam).map(Specialize.rewriteFormalParam)
-          val spec = spec0 match {
-            case TypedAst.Spec(doc, ann, mod, _, _, declaredScheme, retTpe, eff, _, _) =>
-              // `eff` is substituted but deliberately not lowered: this phase does not lower effects.
-              MonoAst.Spec(doc, ann, mod, fs, visitType(declaredScheme.base, subst), visitType(retTpe, subst), subst(eff), DefContext.Unknown)
-          }
-          val e = visitExp(exp, env0, subst)
-          MonoAst.Def(freshSym, spec, e, loc)
-      }
-    } catch {
-      case e: InternalCompilerException =>
-        throw InternalCompilerException(s"[in ${defn.sym} (subst: $subst)]: ${e.message}", e.loc)
+    defn match {
+      case TypedAst.Def(_, spec0, exp, loc) =>
+        val (fparams, env0) = specializeFormalParams(spec0.fparams, subst)
+        val fs = fparams.map(lowerFormalParam).map(Specialize.rewriteFormalParam)
+        val spec = spec0 match {
+          case TypedAst.Spec(doc, ann, mod, _, _, declaredScheme, retTpe, eff, _, _) =>
+            // `eff` is substituted but deliberately not lowered: this phase does not lower effects.
+            MonoAst.Spec(doc, ann, mod, fs, visitType(declaredScheme.base, subst), visitType(retTpe, subst), subst(eff), DefContext.Unknown)
+        }
+        val e = visitExp(exp, env0, subst)
+        MonoAst.Def(freshSym, spec, e, loc)
     }
   }
 
-  /**
-    * Lowers the given enum `enum0`.
-    *
-    * Case field types are routed through [[visitTypeSubstituted]], not bare [[lowerType]], so a
-    * nested enum/struct reference (e.g. `Set`'s field referencing `RedBlackTree[a]`) is rewritten
-    * to its own specialized sym too — otherwise a specialized declaration's fields would still
-    * point at generic originals that Step 1 stopped emitting.
-    */
+  /** Lowers the given enum `enum0`. */
   protected[monomorph2] def lowerEnum(enum0: TypedAst.Enum)(implicit tables: SpecializationTables): MonoAst.Enum = enum0 match {
     case TypedAst.Enum(doc, ann, mod, sym, tparams0, _, cases0, loc) =>
       val tparams = tparams0.map(lowerTypeParam)
@@ -155,9 +146,7 @@ object SpecializeAndLower {
       MonoAst.Enum(doc, ann, mod, sym, tparams, cases, loc)
   }
 
-  /**
-    * Lowers the given `effect`.
-    */
+  /** Lowers the given `effect`. */
   protected[monomorph2] def lowerEffect(effect: TypedAst.Effect)(implicit tables: SpecializationTables): MonoAst.Effect = effect match {
     case TypedAst.Effect(doc, ann, mod, sym, _, ops0, loc) =>
       // TODO EFFECT-TPARAMS use tparams
@@ -165,10 +154,7 @@ object SpecializeAndLower {
       MonoAst.Effect(doc, ann, mod, sym, ops, loc)
   }
 
-  /**
-    * Lowers the given struct `struct0`. Field types go through [[visitTypeSubstituted]] — see
-    * [[lowerEnum]]'s doc comment for why bare [[lowerType]] is not enough here.
-    */
+  /** Lowers the given struct `struct0`. */
   protected[monomorph2] def lowerStruct(struct0: TypedAst.Struct)(implicit tables: SpecializationTables): MonoAst.Struct = struct0 match {
     case TypedAst.Struct(doc, ann, mod, sym, tparams0, _, fields0, loc) =>
       val tparams = tparams0.map(lowerTypeParam)
@@ -178,19 +164,14 @@ object SpecializeAndLower {
       MonoAst.Struct(doc, ann, mod, sym, tparams, fields.toList, loc)
   }
 
-  /**
-    * Lowers the given `op`.
-    */
+  /** Lowers the given `op`. */
   private def lowerOp(op: TypedAst.Op)(implicit tables: SpecializationTables): MonoAst.Op = op match {
     case TypedAst.Op(sym, spec0, loc) =>
       val spec = lowerSpec(spec0)
       MonoAst.Op(sym, spec, loc)
   }
 
-  /**
-    * Lowers the given `spec0`. Every embedded type goes through [[visitTypeSubstituted]] — see
-    * [[lowerEnum]]'s doc comment for why bare [[lowerType]] is not enough here.
-    */
+  /** Lowers the given `spec0`. */
   private def lowerSpec(spec0: TypedAst.Spec)(implicit tables: SpecializationTables): MonoAst.Spec = spec0 match {
     case TypedAst.Spec(doc, ann, mod, _, fparams0, declaredScheme, retTpe, eff, _, _) =>
       val fs = fparams0.map(lowerFormalParam).map(Specialize.rewriteFormalParam)
@@ -902,10 +883,12 @@ object SpecializeAndLower {
       MonoAst.ExtMatchRule(p, e, loc)
   }
 
+  /** Lowers the given formal parameter `fparam`. */
   private def lowerFormalParam(fparam: TypedAst.FormalParam): MonoAst.FormalParam = fparam match {
     case TypedAst.FormalParam(bnd, tpe, _, _, loc0) => MonoAst.FormalParam(bnd.sym, lowerType(tpe), Occur.Unknown, loc0)
   }
 
+  /** Lowers the given type parameter `tparam`. */
   private def lowerTypeParam(tparam: TypedAst.TypeParam): MonoAst.TypeParam = tparam match {
     case TypedAst.TypeParam(name, sym, loc) =>
       MonoAst.TypeParam(name, sym, loc)
