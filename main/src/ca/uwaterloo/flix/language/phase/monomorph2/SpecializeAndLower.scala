@@ -73,14 +73,14 @@ object SpecializeAndLower {
     case Type.Apply(tpe1, tpe2, loc) =>
       val t1 = lowerType(tpe1)
       val t2 = lowerType(tpe2)
+      // Performance: Reuse tpe0, if possible.
       if ((t1 eq tpe1) && (t2 eq tpe2)) {
         tpe0
       } else {
         Type.Apply(t1, t2, loc)
       }
 
-    case Type.Alias(sym, args, t, loc) =>
-      Type.Alias(sym, args.map(lowerType), lowerType(t), loc)
+    case Type.Alias(_, _, _, loc) => throw InternalCompilerException("unexpected type alias", loc)
 
     case Type.AssocType(_, _, _, loc) => throw InternalCompilerException("unexpected associated type", loc)
 
