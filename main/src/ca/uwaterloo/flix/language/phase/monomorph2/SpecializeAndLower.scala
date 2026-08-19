@@ -954,9 +954,7 @@ object SpecializeAndLower {
   }
 
   /**
-    * Lowers `sym` from a restrictable enum sym into a regular enum sym — the base sym that
-    * [[Specialize.restrictableEnumEntries]] calls `Symbol.freshEnumSym` on to mint each
-    * specialized copy.
+    * Lowers `sym` from a restrictable enum sym into a regular enum sym.
     */
   private[monomorph2] def lowerRestrictableEnumSym(sym: Symbol.RestrictableEnumSym): Symbol.EnumSym =
     new Symbol.EnumSym(None, sym.namespace, sym.name, sym.loc)
