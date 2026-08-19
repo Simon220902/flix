@@ -895,14 +895,31 @@ object SpecializeAndLower {
   }
 
   /**
-    * Wraps `currentDef` with calls to the default handlers of each effect appearing in its
-    * signature. The order in which the handlers are applied is not defined.
+    * Wraps an entry point function with calls to the default handlers of each of the effects appearing in
+    * its signature. The order in which the handlers are applied is not defined and should not be relied upon.
     *
-    * E.g. with default handlers for effects A and B, `def f(...): tpe \ A + B = exp` becomes
-    * `def f(...): tpe \ (((ef - A) + IO) - B) + IO = handlerB(_ -> handlerA(_ -> exp))`.
+    * For example, if we had default handlers for some effects A and B:
+    *
+    * Transforms a function:
+    * {{{
+    *     def f(arg1: tpe1, ...): tpe \ ef = exp
+    * }}}
+    * Into:
+    * {{{
+    *     def f(arg1: tpe1, ...): tpe \ (((ef - A) + IO) - B) + IO =
+    *         handlerB(_ -> handlerA(_ ->exp))
+    * }}}
+    *
+    * Each of the wrappers:
+    *   - Removes the handled effect from the function's effect set and adds IO
+    *   - Creates a lambda (_ -> originalBody) and passes it to each handler
+    *   - Updates the function's type signature accordingly
+    *
+    * @param currentDef The entry point function definition to wrap
+    * @return The wrapped function definition with all necessary default effect handlers
     */
   private def wrapDefWithDefaultHandlers(currentDef: TypedAst.Def)(implicit root: TypedAst.Root, flix: Flix): TypedAst.Def = {
-    // Entry points are expected to have a concrete (ground) effect set; anything else is a bug.
+    // Entry points are expected to have a concrete (ground) effect set.
     val defEffects: CofiniteSet[Symbol.EffSym] = Type.eval(currentDef.spec.eff) match {
       case Result.Ok(s) => s
       case Result.Err(_) => throw InternalCompilerException("Unexpected illegal effect set on entry point", currentDef.spec.eff.loc)
@@ -2440,14 +2457,16 @@ object SpecializeAndLower {
   }
 
   /**
-    * A local context threaded through `visitExp` to carry information from an enclosing
-    * `NewObject` to nested `InvokeSuperMethod` expressions.
+    * A local context threaded through `lowerExp` to carry information from an
+    * enclosing `NewObject` to nested `InvokeSuperMethod` expressions.
     *
-    * `sym` is the enclosing anonymous class symbol (`Some` when visiting a `NewObject` method
-    * body, `None` otherwise), injected into `AtomicOp.InvokeSuperMethod` so the backend can
-    * generate the `CHECKCAST` and `INVOKEVIRTUAL super$methodName` instructions. `thisRef` is a
-    * `Var` expression referencing the `_this` parameter (the JvmMethod's first formal parameter),
-    * prepended to `InvokeSuperMethod` arguments so the backend receives the receiver object first.
+    * @param sym       The internal name of the enclosing anonymous class.
+    *                  Set to `Some` when lowering a `NewObject` method body; `None` otherwise.
+    *                  Injected into `AtomicOp.InvokeSuperMethod` so the backend can generate
+    *                  the `CHECKCAST` and `INVOKEVIRTUAL super$methodName` instructions.
+    * @param thisRef   A `Var` expression referencing the `_this` parameter (the first formal
+    *                  parameter of the JvmMethod). Prepended to `InvokeSuperMethod` arguments
+    *                  so the backend receives the receiver object as the first expression.
     */
   private case class LocalContext(sym: Option[Symbol.AnonClassSym], thisRef: Option[MonoAst.Expr])
 
