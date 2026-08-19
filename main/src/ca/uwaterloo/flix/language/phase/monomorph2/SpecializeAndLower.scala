@@ -100,33 +100,29 @@ object SpecializeAndLower {
   private def visitTypeSubstituted(t: Type)(implicit tables: SpecializationTables): Type =
     Specialize.rewriteEnumStructType(lowerType(t))
 
-  /** Specializes and lowers `defn0` under `subst` into the `MonoAst.Def` for the specialized symbol `freshSym`. */
+  /** Specializes and lowers `defn0` under `subst` into a `MonoAst.Def` with the specialized symbol `freshSym`. */
   protected[monomorph2] def visitDef(freshSym: Symbol.DefnSym, defn0: TypedAst.Def, subst: StrictSubstitution)(implicit tables: SpecializationTables, root: TypedAst.Root, flix: Flix): MonoAst.Def = {
     implicit val lctx: LocalContext = LocalContext.empty
-    // If `defn0` is an entry point, wrap it with its required default handlers before the rest of
-    // lowering, e.g. `def f(): Unit \ Assert = e` becomes `def f(): Unit \ IO = Assert.runWithIO(_ -> e)`.
-    // Entry points are non-parametric, so `subst` is empty here — but applying it to the spec's
-    // types first still matters: it canonicalizes them, and wrapInHandler builds defTable lookup
-    // keys from these fields (defTable keys are canonical — see wrapInHandler's own comment).
-    val defn = if (TypedAstOps.isEntryPoint(defn0)) {
-      val spec0 = defn0.spec
-      val spec = spec0.copy(
-        fparams = spec0.fparams.map(fp => fp.copy(tpe = subst(fp.tpe))),
-        declaredScheme = spec0.declaredScheme.copy(base = subst(spec0.declaredScheme.base)),
-        retTpe = subst(spec0.retTpe),
-        eff = subst(spec0.eff)
-      )
-      wrapDefWithDefaultHandlers(defn0.copy(spec = spec))
-    } else {
-      defn0
-    }
+    // If `defn0` is an entry point, wrap it with its required default handlers before the rest of lowering.
+    val defn =
+      if (TypedAstOps.isEntryPoint(defn0)) {
+        val spec0 = defn0.spec
+        val spec = spec0.copy(
+          fparams = spec0.fparams.map(fp => fp.copy(tpe = subst(fp.tpe))),
+          declaredScheme = spec0.declaredScheme.copy(base = subst(spec0.declaredScheme.base)),
+          retTpe = subst(spec0.retTpe),
+          eff = subst(spec0.eff)
+        )
+        wrapDefWithDefaultHandlers(defn0.copy(spec = spec))
+      } else {
+        defn0
+      }
     defn match {
       case TypedAst.Def(_, spec0, exp, loc) =>
         val (fparams, env0) = specializeFormalParams(spec0.fparams, subst)
         val fs = fparams.map(lowerFormalParam).map(Specialize.rewriteFormalParam)
         val spec = spec0 match {
           case TypedAst.Spec(doc, ann, mod, _, _, declaredScheme, retTpe, eff, _, _) =>
-            // `eff` is substituted but deliberately not lowered: this phase does not lower effects.
             MonoAst.Spec(doc, ann, mod, fs, visitType(declaredScheme.base, subst), visitType(retTpe, subst), subst(eff), DefContext.Unknown)
         }
         val e = visitExp(exp, env0, subst)
@@ -183,11 +179,10 @@ object SpecializeAndLower {
 
   /**
     * Specializes and lowers `exp0` in one fused walk:
-    *   - variables are renamed via `env0` (fresh syms, unique per specialization copy),
-    *   - every type is ground-instantiated via `subst` (the solver-provided substitution),
-    *   - def/sig/case/struct symbols are resolved against the solver solution (strict: a miss is
-    *     a "Solver gap" crash),
-    *   - types are lowered and channel/fixpoint expressions are lowered to the primitives.
+    *   - variables are renamed via `env0`,
+    *   - every type is ground-instantiated via `subst`,
+    *   - def/sig/case/struct symbols are resolved against the solver solution,
+    *   - types are lowered and Datalog/channel expressions are lowered to the primitives.
     */
   private def visitExp(exp0: TypedAst.Expr, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: SpecializationTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.Expr = exp0 match {
     case TypedAst.Expr.Cst(cst, tpe, loc) => MonoAst.Expr.Cst(cst, visitType(tpe, subst), loc)
@@ -223,7 +218,6 @@ object SpecializeAndLower {
       MonoAst.Expr.ApplyClo(e1, e2, t, subst(eff), loc)
 
     case TypedAst.Expr.ApplyDef(symUse, exps, _, itpe0, tpe, eff, _, loc) =>
-      // The instantiated arrow type is the solver-solution lookup key: keyed PRE-lowering.
       val groundArrowTpe = subst(itpe0)
       val newSym = lookupSym(symUse.sym, groundArrowTpe)
       val es = exps.map(visitExp(_, env0, subst))
@@ -352,16 +346,12 @@ object SpecializeAndLower {
       MonoAst.Expr.ExtMatch(e, rs, t, subst(eff), loc)
 
     case TypedAst.Expr.Tag(symUse, exps, tpe, eff, loc) =>
-      // The tag's own result type IS the enum's ground type at this construction site: the
-      // solver-solution lookup key (pre-lowering). Strict: a miss is a Solver gap.
       val t = subst(tpe)
       val newSym = lookupCaseSym(symUse.sym, t)
       val es = exps.map(visitExp(_, env0, subst))
       MonoAst.Expr.ApplyAtomic(AtomicOp.Tag(newSym), es, visitTypeSubstituted(t), subst(eff), loc)
 
     case TypedAst.Expr.RestrictableTag(symUse, exps, tpe, eff, loc) =>
-      // Same shape as Expr.Tag above: the tag's own (substituted, pre-lowering) type is the
-      // lookup key, and the rewrite runs after the lookup, not before.
       val t = subst(tpe)
       val newSym = lookupRestrictableCaseSym(symUse.sym, t)
       val es = exps.map(visitExp(_, env0, subst))
@@ -423,9 +413,6 @@ object SpecializeAndLower {
       MonoAst.Expr.ApplyAtomic(AtomicOp.ArrayStore, List(e1, e2, e3), Type.Unit, subst(eff), loc)
 
     case TypedAst.Expr.StructNew(sym, fields0, region0, tpe, eff, loc) =>
-      // The StructNew's own result type IS the struct's ground type at this construction site:
-      // the solver-solution lookup key (pre-lowering). Field syms are rebuilt against the
-      // specialized struct sym.
       val t = subst(tpe)
       val newStructSym = lookupStructSym(sym, t)
       val fields = fields0.map { case (symUse, v) =>
@@ -441,8 +428,6 @@ object SpecializeAndLower {
       }
 
     case TypedAst.Expr.StructGet(exp, field, tpe, eff, loc) =>
-      // Unlike Tag/StructNew (whose own result type IS the enum/struct type), StructGet's own
-      // `tpe` is the FIELD's type — the struct being accessed is `exp`'s type instead.
       val e = visitExp(exp, env0, subst)
       val newStructSym = lookupStructSym(field.sym.structSym, subst(exp.tpe))
       val newFieldSym = new Symbol.StructFieldSym(newStructSym, field.sym.name, field.loc)
