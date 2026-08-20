@@ -238,8 +238,7 @@ object SpecializeAndLower {
       MonoAst.Expr.ApplyOp(symUse.sym, es, t, subst(eff), loc)
 
     case TypedAst.Expr.Unary(sop, exp, tpe, eff, loc) => sop match {
-      // ReflectOps are resolved here, at specialization time: the reflected type is only known
-      // once `subst` has grounded it. (Specialization-time expansion, not a lowering transform.)
+      // ReflectOps are resolved here at specialization time since the reflected type is only known when it is grounded.
       case SemanticOp.ReflectOp.ReflectEff =>
         val expTpe = subst(exp.tpe)
         val typeArg = expTpe.typeArguments.headOption.getOrElse(
@@ -271,7 +270,9 @@ object SpecializeAndLower {
         val tagArg = if (caseName == "JvmObject") {
           val objType = Type.mkNative(classOf[java.lang.Object], loc)
           mkCast(e, objType, Type.Pure, loc)
-        } else { e }
+        } else {
+          e
+        }
         MonoAst.Expr.ApplyAtomic(AtomicOp.Tag(caseSym), List(tagArg), resultType, subst(eff), loc)
 
       case _ =>
@@ -469,14 +470,16 @@ object SpecializeAndLower {
       // Primitives never satisfy an instanceof check: evaluate for side effects and return false.
       val e = visitExp(exp, env0, subst)
       if (isPrimType(e.tpe)) {
+        // If it's a primitive type, evaluate the expression but return false
         MonoAst.Expr.Stm(List(e), MonoAst.Expr.Cst(Constant.Bool(false), Type.Bool, loc), Type.Bool, e.eff, loc)
       } else {
+        // If it's a reference type, then do the instanceof check
         MonoAst.Expr.ApplyAtomic(AtomicOp.InstanceOf(clazz), List(e), Type.Bool, e.eff, loc)
       }
 
     case TypedAst.Expr.CheckedCast(_, exp, tpe, eff, loc) =>
-      // We do *NOT* erase checked (i.e. safe) casts: in Java, `String` is a subtype of `Object`,
-      // but the Flix IR makes this upcast explicit, and mkCast decides cast vs. bytecode-verifier crash.
+      // Note: We do *NOT* erase checked (i.e. safe) casts.
+      // In Java, `String` is a subtype of `Object`, but the Flix IR makes this upcast _explicit_.
       val e = visitExp(exp, env0, subst)
       val t = visitType(tpe, subst)
       mkCast(e, t, subst(eff), loc)
@@ -490,7 +493,6 @@ object SpecializeAndLower {
       val e = visitExp(exp, env0, subst)
       val t = visitType(tpe, subst)
       mkCast(e, t, subst(eff), loc)
-
 
     case TypedAst.Expr.Throw(exp, tpe, eff, loc) =>
       val e = visitExp(exp, env0, subst)
@@ -581,9 +583,10 @@ object SpecializeAndLower {
       MonoAst.Expr.ApplyAtomic(AtomicOp.PutStaticField(field), List(e), t, subst(eff), loc)
 
     case TypedAst.Expr.NewObject(sym, clazz, tpe, eff, constructors, methods, loc) =>
-      // thisRef must use the FRESHENED fparam sym, so fparams are specialized before the body is
-      // visited. A fresh anonymous class sym per specialization avoids two specializations of an
-      // enclosing generic def (e.g. mk[String]/mk[Int32]) colliding on the same class name.
+      // Mint a fresh anonymous class symbol for each specialization. Otherwise distinct
+      // specializations of an enclosing generic def (e.g. `mk[String]` and `mk[Int32]`)
+      // would reuse the same anonymous class name and collide, so one specialization would
+      // run with the other's generated class.
       val freshSym = Symbol.mkFreshAnonClassSym(sym.loc)
       val cs = constructors.map {
         case TypedAst.JvmConstructor(cExp, cRetTpe, cEff, cLoc) =>
@@ -597,8 +600,10 @@ object SpecializeAndLower {
           val thisRef = MonoAst.Expr.Var(thisParam.sym, thisParam.tpe, loc)
           implicit val lctx: LocalContext = LocalContext(Some(freshSym), Some(thisRef))
           val e0 = visitExp(mExp, env0 ++ env1, subst)
-          // If this overrides a Java method whose erased return type is a reference but the Flix
-          // result is primitive, box it to match the erased signature (mirrors boxIfNecessary).
+          // If this overrides a Java method whose erased return type is a reference (e.g. `Object`
+          // for a generic interface method) but the Flix result is primitive, box it to match the
+          // erased signature. This mirrors the boxing applied to generic Java method calls (see
+          // `boxIfNecessary` in `mkJavaInvoke`), and the call site unboxes the result symmetrically.
           val e = overriddenJavaReturnType(clazz, mIdent.name, fs.tail.length) match {
             case Some(javaReturnType) => boxIfNecessary(e0, javaReturnType)
             case None => e0
@@ -1141,9 +1146,7 @@ object SpecializeAndLower {
   }
 
   /**
-    * Returns a call to Java `method`, boxing `args` and unboxing the result symmetrically (see
-    * `boxIfNecessary`/`unboxIfNecessary`). Shared by `InvokeMethod`/`InvokeStaticMethod` — `mkOp`
-    * is the `AtomicOp` constructor and `receiver` is `List(thisRef)` or `Nil`.
+    * Returns a call to Java `method`, boxing `args` and unboxing the result symmetrically.
     */
   private def mkJavaInvoke(method: java.lang.reflect.Method, receiver: List[MonoAst.Expr], args: List[MonoAst.Expr], t: Type, eff: Type, loc: SourceLocation, mkOp: java.lang.reflect.Method => AtomicOp): MonoAst.Expr = {
     val boxedArgs = ListOps.zip(args, method.getParameterTypes.toList).map { case (arg, paramType) => boxIfNecessary(arg, paramType) }
@@ -1165,8 +1168,17 @@ object SpecializeAndLower {
 
   /** Returns `true` if `method` is a Java auto-unboxing method (e.g., `intValue`, `booleanValue`). */
   private def isAutoUnboxMethod(method: java.lang.reflect.Method): Boolean = {
-    val autoUnboxMethodNames = Set("booleanValue", "charValue", "byteValue", "shortValue", "intValue", "longValue", "floatValue", "doubleValue")
-    method.getParameterCount == 0 && autoUnboxMethodNames.contains(method.getName)
+    method.getParameterCount == 0 && (method.getName match {
+      case "booleanValue" => true
+      case "charValue"    => true
+      case "byteValue"    => true
+      case "shortValue"   => true
+      case "intValue"     => true
+      case "longValue"    => true
+      case "floatValue"   => true
+      case "doubleValue"  => true
+      case _              => false
+    })
   }
 
 
