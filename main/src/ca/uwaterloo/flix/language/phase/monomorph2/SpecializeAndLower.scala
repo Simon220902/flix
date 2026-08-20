@@ -939,39 +939,43 @@ object SpecializeAndLower {
     * Wraps `defn` with `defaultHandler`: `def f(...): tpe \ ef = exp` becomes
     * `def f(...): tpe \ (ef - handledEffect) + IO = handler(_ -> exp)`.
     */
-  private def wrapInHandler(defn: TypedAst.Def, defaultHandler: DefaultHandler)(implicit flix: Flix): TypedAst.Def = {
-    val effLoc = defn.spec.eff.loc.asSynthetic
-    val baseTypeLoc = defn.spec.declaredScheme.base.loc.asSynthetic
-    val expLoc = defn.exp.loc.asSynthetic
-    val effDif = Type.mkDifference(defn.spec.eff, defaultHandler.handledEff, effLoc)
-    // Canonicalized: defTable keys are built via StrictSubstitution, which canonicalizes ground
-    // effects — the synthesized ApplyDef's itpe must match that same form or the lookup silently
-    // misses despite being semantically equal.
-    val eff = Canonicalization.canonicalEffect(Type.mkUnion(effDif, Type.IO, effLoc))
-    val tpe = Type.mkCurriedArrowWithEffect(defn.spec.fparams.map(_.tpe), eff, defn.spec.retTpe, baseTypeLoc)
-    val spec = defn.spec.copy(
-      declaredScheme = defn.spec.declaredScheme.copy(base = tpe),
-      eff = eff,
-    )
-    val innerLambda =
-      TypedAst.Expr.Lambda(
-        TypedAst.FormalParam(
-          TypedAst.Binder(Symbol.freshVarSym("_", BoundBy.FormalParam, expLoc)(RegionScope.Top, flix), Type.Unit),
-          Type.Unit,
-          TypeSource.Inferred,
-          Decreasing.NonDecreasing,
+  private def wrapInHandler(defn: TypedAst.Def, defaultHandler: DefaultHandler)(implicit flix: Flix): TypedAst.Def = defn match {
+    case TypedAst.Def(sym, spec0, exp, defLoc) =>
+      val effLoc = spec0.eff.loc.asSynthetic
+      val baseTypeLoc = spec0.declaredScheme.base.loc.asSynthetic
+      val expLoc = exp.loc.asSynthetic
+      val effDif = Type.mkDifference(spec0.eff, defaultHandler.handledEff, effLoc)
+      // Canonicalized: defTable keys are built via StrictSubstitution, which canonicalizes ground
+      // effects — the synthesized ApplyDef's itpe must match that same form or the lookup silently
+      // misses despite being semantically equal.
+      val eff = Canonicalization.canonicalEffect(Type.mkUnion(effDif, Type.IO, effLoc))
+      val tpe = Type.mkCurriedArrowWithEffect(spec0.fparams.map(_.tpe), eff, spec0.retTpe, baseTypeLoc)
+      val spec = spec0 match {
+        case TypedAst.Spec(doc, ann, mod, tparams, fparams, declaredScheme0, retTpe, _, tconstrs, econstrs) =>
+          val declaredScheme = declaredScheme0 match {
+            case Scheme(quantifiers, tconstrs1, econstrs1, _) => Scheme(quantifiers, tconstrs1, econstrs1, tpe)
+          }
+          TypedAst.Spec(doc, ann, mod, tparams, fparams, declaredScheme, retTpe, eff, tconstrs, econstrs)
+      }
+      val innerLambda =
+        TypedAst.Expr.Lambda(
+          TypedAst.FormalParam(
+            TypedAst.Binder(Symbol.freshVarSym("_", BoundBy.FormalParam, expLoc)(RegionScope.Top, flix), Type.Unit),
+            Type.Unit,
+            TypeSource.Inferred,
+            Decreasing.NonDecreasing,
+            expLoc
+          ),
+          exp,
+          Type.mkArrowWithEffect(Type.Unit, spec0.eff, spec0.retTpe, expLoc),
           expLoc
-        ),
-        defn.exp,
-        Type.mkArrowWithEffect(Type.Unit, defn.spec.eff, defn.spec.retTpe, expLoc),
-        expLoc
-      )
-    val handlerArrowType = Type.mkArrowWithEffect(innerLambda.tpe, eff, defn.spec.retTpe, expLoc)
-    // Embedded unresolved: visitExp's ApplyDef case resolves it later, like any other call site —
-    // resolving it here would make that re-lookup crash (the fresh sym isn't in allDefs).
-    val handlerDefSymUse = SymUse.DefSymUse(defaultHandler.handlerSym, expLoc)
-    val handlerCall = TypedAst.Expr.ApplyDef(handlerDefSymUse, List(innerLambda), List(innerLambda.tpe), handlerArrowType, defn.spec.retTpe, eff, ApplyPosition.NonTail, expLoc)
-    defn.copy(spec = spec, exp = handlerCall)
+        )
+      val handlerArrowType = Type.mkArrowWithEffect(innerLambda.tpe, eff, spec0.retTpe, expLoc)
+      // Embedded unresolved: visitExp's ApplyDef case resolves it later, like any other call site —
+      // resolving it here would make that re-lookup crash (the fresh sym isn't in allDefs).
+      val handlerDefSymUse = SymUse.DefSymUse(defaultHandler.handlerSym, expLoc)
+      val handlerCall = TypedAst.Expr.ApplyDef(handlerDefSymUse, List(innerLambda), List(innerLambda.tpe), handlerArrowType, spec0.retTpe, eff, ApplyPosition.NonTail, expLoc)
+      TypedAst.Def(sym, spec, handlerCall, defLoc)
   }
 
   /**
