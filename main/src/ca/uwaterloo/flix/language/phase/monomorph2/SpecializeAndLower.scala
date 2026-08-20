@@ -953,8 +953,15 @@ object SpecializeAndLower {
   }
 
   /**
-    * Wraps `defn` with `defaultHandler`: `def f(...): tpe \ ef = exp` becomes
-    * `def f(...): tpe \ (ef - handledEffect) + IO = handler(_ -> exp)`.
+    * Wraps `defn` with `defaultHandler`.
+    * Transforms a function:
+    * {{{
+    *     def f(...): tpe \ ef = exp
+    * }}}
+    * Into:
+    * {{{
+    *     def f(...): tpe \ (ef - handledEffect) + IO = handler(_ -> exp)
+    * }}}
     */
   private def wrapInHandler(defn: TypedAst.Def, defaultHandler: DefaultHandler)(implicit flix: Flix): TypedAst.Def = defn match {
     case TypedAst.Def(sym, spec0, exp, defLoc) =>
@@ -962,9 +969,7 @@ object SpecializeAndLower {
       val baseTypeLoc = spec0.declaredScheme.base.loc.asSynthetic
       val expLoc = exp.loc.asSynthetic
       val effDif = Type.mkDifference(spec0.eff, defaultHandler.handledEff, effLoc)
-      // Canonicalized: defTable keys are built via StrictSubstitution, which canonicalizes ground
-      // effects — the synthesized ApplyDef's itpe must match that same form or the lookup silently
-      // misses despite being semantically equal.
+      // Canonicalized to match defTable's canonicalized keys.
       val eff = Canonicalization.canonicalEffect(Type.mkUnion(effDif, Type.IO, effLoc))
       val tpe = Type.mkCurriedArrowWithEffect(spec0.fparams.map(_.tpe), eff, spec0.retTpe, baseTypeLoc)
       val spec = spec0 match {
@@ -988,8 +993,8 @@ object SpecializeAndLower {
           expLoc
         )
       val handlerArrowType = Type.mkArrowWithEffect(innerLambda.tpe, eff, spec0.retTpe, expLoc)
-      // Embedded unresolved: visitExp's ApplyDef case resolves it later, like any other call site —
-      // resolving it here would make that re-lookup crash (the fresh sym isn't in allDefs).
+      // Left unresolved: visitExp's ApplyDef case resolves it later, like any other call site.
+      // Pre-resolving here would crash, since root.defs has no entry for a fresh sym.
       val handlerDefSymUse = SymUse.DefSymUse(defaultHandler.handlerSym, expLoc)
       val handlerCall = TypedAst.Expr.ApplyDef(handlerDefSymUse, List(innerLambda), List(innerLambda.tpe), handlerArrowType, spec0.retTpe, eff, ApplyPosition.NonTail, expLoc)
       TypedAst.Def(sym, spec, handlerCall, defLoc)
