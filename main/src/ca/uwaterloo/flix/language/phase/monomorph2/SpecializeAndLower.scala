@@ -39,7 +39,7 @@ import ca.uwaterloo.flix.util.collection.{CofiniteSet, ListOps, Nel}
   *  Every call/tag/struct site here is resolved via [[Specialize]]'s `lookupSym`/`lookupCaseSym`/
   *  `lookupStructSym`/`resolveSigSym`.
   *
-  * N.B. [[ConstraintGen]] needs to predict every specialized symbol synthesized here.
+  * N.B.: [[ConstraintGen]] needs to predict every specialized symbol synthesized here.
   */
 object SpecializeAndLower {
 
@@ -2443,7 +2443,7 @@ object SpecializeAndLower {
   }
 
   /**
-    * A local context threaded through `lowerExp` to carry information from an
+    * A local context threaded through `visitExp` to carry information from an
     * enclosing `NewObject` to nested `InvokeSuperMethod` expressions.
     *
     * @param sym       The internal name of the enclosing anonymous class.
