@@ -347,8 +347,8 @@ object SpecializeAndLower {
 
     case TypedAst.Expr.Match(exp, rules, tpe, eff, loc) =>
       val e = visitExp(exp, env0, subst)
-      val t = visitType(tpe, subst)
       val rs = rules.map(visitMatchRule(_, env0, subst))
+      val t = visitType(tpe, subst)
       MonoAst.Expr.Match(e, rs, t, subst(eff), loc)
 
     case TypedAst.Expr.RestrictableChoose(_, exp, rules, tpe, eff, loc) =>
@@ -521,16 +521,19 @@ object SpecializeAndLower {
     case TypedAst.Expr.Handler(symUse, rules, bodyTpe, bodyEff0, handledEff, tpe, loc) =>
       // `handler sym { rules }` lowers to `handlerBody -> try handlerBody() with sym { rules }`.
       val bodySym = Symbol.freshVarSym("handlerBody", BoundBy.FormalParam, loc.asSynthetic)(RegionScope.Top, flix)
-      val rs = rules.map(visitHandlerRule(_, env0, subst))
-      val bt = visitType(bodyTpe, subst)
-      val t = visitType(tpe, subst)
       val bodyEff = subst(bodyEff0)
+      val bt = visitType(bodyTpe, subst)
       val bodyThunkType = Type.mkArrowWithEffect(Type.Unit, bodyEff, bt, loc.asSynthetic)
+      val param = MonoAst.FormalParam(bodySym, bodyThunkType, Occur.Unknown, loc.asSynthetic)
+
       val bodyVar = MonoAst.Expr.Var(bodySym, bodyThunkType, loc.asSynthetic)
       val body = MonoAst.Expr.ApplyClo(bodyVar, MonoAst.Expr.Cst(Constant.Unit, Type.Unit, loc.asSynthetic), bt, bodyEff, loc.asSynthetic)
-      val RunWith = MonoAst.Expr.RunWith(body, symUse, rs, bt, subst(handledEff), loc)
-      val param = MonoAst.FormalParam(bodySym, bodyThunkType, Occur.Unknown, loc.asSynthetic)
-      MonoAst.Expr.Lambda(param, RunWith, t, loc)
+      val rs = rules.map(visitHandlerRule(_, env0, subst))
+      val runWith = MonoAst.Expr.RunWith(body, symUse, rs, bt, subst(handledEff), loc)
+
+      val t = visitType(tpe, subst)
+
+      MonoAst.Expr.Lambda(param, runWith, t, loc)
 
     case TypedAst.Expr.RunWith(exp1, exp2, tpe, eff, loc) =>
       // `run exp1 with exp2` lowers to `exp2(_runWith -> exp1)`.
@@ -742,7 +745,7 @@ object SpecializeAndLower {
   }
 
   /**
-    * Specializes and lowers the given catch rule `rule0` (fresh binder, like every other binder).
+    * Specializes and lowers the given catch rule `rule0` (fresh binder).
     */
   private def visitCatchRule(rule: TypedAst.CatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: SpecializationTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.CatchRule = rule match {
     case TypedAst.CatchRule(bnd, clazz, exp, _) =>
@@ -785,16 +788,20 @@ object SpecializeAndLower {
       (MonoAst.Pattern.Wild(visitType(tpe, subst), loc), env0)
 
     case TypedAst.Pattern.Var(bnd, tpe, loc) =>
-      val env = if (env0.contains(bnd.sym)) env0 else env0 + (bnd.sym -> Symbol.freshVarSym(bnd.sym))
-      (MonoAst.Pattern.Var(env(bnd.sym), visitType(tpe, subst), Occur.Unknown, loc), env)
+      val newSym = Symbol.freshVarSym(bnd.sym)
+      val env =
+        if (env0.contains(bnd.sym)) {
+          env0
+        } else {
+          env0 + (bnd.sym -> newSym)
+        }
+      (MonoAst.Pattern.Var(newSym, visitType(tpe, subst), Occur.Unknown, loc), env)
 
     case TypedAst.Pattern.Cst(cst, tpe, loc) =>
       (MonoAst.Pattern.Cst(cst, visitType(tpe, subst), loc), env0)
 
     case TypedAst.Pattern.Tag(symUse, pats, tpe, loc) =>
       val (ps, env) = visitPats(pats, env0, subst)
-      // The pattern's own type IS the scrutinee's enum type: the solver-solution lookup key
-      // (pre-lowering). Strict: a miss is a Solver gap.
       val t = subst(tpe)
       val newSym = lookupCaseSym(symUse.sym, t)
       (MonoAst.Pattern.Tag(SymUse.CaseSymUse(newSym, symUse.loc), ps, visitTypeSubstituted(t), loc), env)
@@ -810,7 +817,7 @@ object SpecializeAndLower {
           (MonoAst.Pattern.Record.RecordLabelPattern(label, p1, visitType(tpe1, subst), loc1), env1)
       }.unzip
       val (patVal, env1) = visitPat(pat, env0, subst)
-      val env = (env1 :: envs).foldLeft(Map.empty[Symbol.VarSym, Symbol.VarSym])(_ ++ _)
+      val env = (env1 :: envs).flatten.toMap
       (MonoAst.Pattern.Record(psVal, patVal, visitType(tpe, subst), loc), env)
 
     case TypedAst.Pattern.Error(_, loc) =>
@@ -818,7 +825,7 @@ object SpecializeAndLower {
   }
 
   /**
-    * Specializes and lowers `ps`, threading the env through left-to-right binder freshening.
+    * Specializes and lowers `ps`, threading the env through binder freshening.
     */
   private def visitPats(ps: List[TypedAst.Pattern], env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: SpecializationTables, root: TypedAst.Root, flix: Flix): (List[MonoAst.Pattern], Map[Symbol.VarSym, Symbol.VarSym]) =
     ps.foldRight((Nil: List[MonoAst.Pattern], env0)) {
@@ -845,28 +852,35 @@ object SpecializeAndLower {
             case TypedAst.RestrictableChoosePattern.Wild(wildTpe, wildLoc) => MonoAst.Pattern.Wild(subst(wildTpe), wildLoc)
             case TypedAst.RestrictableChoosePattern.Error(_, errLoc) => throw InternalCompilerException("unexpected restrictable choose variable", errLoc)
           }
-          // Same shape as Pattern.Tag in visitPat: the pattern's own (substituted) type is the
-          // scrutinee's ground restrictable-enum type, i.e. the lookup key.
           val t = subst(tpe)
           val newSym = lookupRestrictableCaseSym(symUse.sym, t)
           val p = MonoAst.Pattern.Tag(SymUse.CaseSymUse(newSym, symUse.loc), termPatterns, visitTypeSubstituted(t), loc)
           MonoAst.MatchRule(p, None, visitExp(exp, env, subst))
+
         case TypedAst.RestrictableChoosePattern.Error(_, loc) => throw InternalCompilerException("unexpected error restrictable choose pattern", loc)
       }
   }
 
+  /**
+    * Specializes and lowers the given `ematch` pattern `pat0`, returning the fresh-binder env
+    * extension alongside.
+    */
   private def visitExtPat(pat0: TypedAst.ExtPattern, subst: StrictSubstitution)(implicit tables: SpecializationTables, root: TypedAst.Root, flix: Flix): (MonoAst.ExtPattern, Map[Symbol.VarSym, Symbol.VarSym]) = pat0 match {
     case TypedAst.ExtPattern.Default(loc) =>
       (MonoAst.ExtPattern.Default(loc), Map.empty)
 
     case TypedAst.ExtPattern.Tag(label, pats, loc) =>
       val (ps, symMaps) = pats.map(visitExtTagPat(_, subst)).unzip
-      (MonoAst.ExtPattern.Tag(label, ps, loc), symMaps.foldLeft(Map.empty[Symbol.VarSym, Symbol.VarSym])(_ ++ _))
+      (MonoAst.ExtPattern.Tag(label, ps, loc), symMaps.flatten.toMap)
 
     case TypedAst.ExtPattern.Error(loc) =>
       throw InternalCompilerException("unexpected error ext pattern", loc)
   }
 
+  /**
+    * Specializes and lowers the given `ematch` tag-argument pattern `pat0`, returning the
+    * fresh-binder env extension alongside.
+    */
   private def visitExtTagPat(pat0: TypedAst.ExtTagPattern, subst: StrictSubstitution)(implicit tables: SpecializationTables, root: TypedAst.Root, flix: Flix): (MonoAst.ExtTagPattern, Map[Symbol.VarSym, Symbol.VarSym]) = pat0 match {
     case TypedAst.ExtTagPattern.Wild(tpe, loc) =>
       (MonoAst.ExtTagPattern.Wild(visitType(tpe, subst), loc), Map.empty)
@@ -882,6 +896,9 @@ object SpecializeAndLower {
       throw InternalCompilerException("unexpected error ext pattern", loc)
   }
 
+  /**
+    * Specializes and lowers the given `ematch` rule `rule0`.
+    */
   private def visitExtMatchRule(rule0: TypedAst.ExtMatchRule, env0: Map[Symbol.VarSym, Symbol.VarSym], subst: StrictSubstitution)(implicit tables: SpecializationTables, lctx: LocalContext, root: TypedAst.Root, flix: Flix): MonoAst.ExtMatchRule = rule0 match {
     case TypedAst.ExtMatchRule(pat, exp, loc) =>
       val (p, env1) = visitExtPat(pat, subst)
