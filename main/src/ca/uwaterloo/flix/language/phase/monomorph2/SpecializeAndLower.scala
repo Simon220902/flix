@@ -645,16 +645,12 @@ object SpecializeAndLower {
       SpecializeAndLower.mkPutChannel(exp1, exp2, subst(innerExp1.tpe), subst(innerExp2.tpe), subst(eff), loc)
 
     case TypedAst.Expr.SelectChannel(rules0, default0, tpe, eff, loc) =>
-      // Synthesizes Concurrent.Channel admin/select calls (mkSelectChannel).
-      // NB: each rule's RAW substituted channel type is threaded alongside — same reasoning as
-      // GetChannel/PutChannel/ParYield above (the visited `chan` expr's own `.tpe` is already
-      // enum/struct-rewritten, which would corrupt the synthesized admin/get calls' lookup keys).
+      // N.B.: Each rule's RAW substituted channel type is threaded alongside the visited `chan` expr,
+      // since `chan`'s own `.tpe` is already enum/struct-rewritten.
       val rules = rules0.map {
         case TypedAst.SelectChannelRule(bnd, chan, exp, _) =>
           val freshSym = Symbol.freshVarSym(bnd.sym)
           val env1 = env0 + (bnd.sym -> freshSym)
-          // lowerType (Sender/Receiver -> Mpmc) applied up front: extractChannelTpe expects the
-          // already-lowered Mpmc[T, IO] shape, not the raw Receiver[T]/Sender[T] surface type.
           (freshSym, visitExp(chan, env1, subst), visitExp(exp, env1, subst), lowerType(subst(chan.tpe)))
       }
       val default = default0.map(visitExp(_, env0, subst))
@@ -668,10 +664,8 @@ object SpecializeAndLower {
       MonoAst.Expr.ApplyAtomic(AtomicOp.Spawn, List(e1, e2), t, subst(eff), loc)
 
     case TypedAst.Expr.ParYield(frags, exp, tpe, eff, loc) =>
-      // Synthesizes the channel plumbing for par-yield (mkParYield).
-      // NB: each fragment's RAW substituted type is threaded alongside the visited expr — the
-      // synthesized channel plumbing needs it for its own def-lookup keys (same reasoning as
-      // GetChannel/PutChannel above), since the visited expr's own `.tpe` is already rewritten.
+      // N.B.: Each fragment's RAW substituted type is threaded alongside the visited expr,
+      // since the visited expr's own `.tpe` is already rewritten.
       var curEnv = env0
       val fs = frags.map {
         case TypedAst.ParYieldFragment(pat, fragExp, fragLoc) =>
@@ -1267,7 +1261,9 @@ object SpecializeAndLower {
   }
 
   /**
-    * Returns a channel select expression:
+    * Make a channel select expression
+    *
+    * Channel select expressions are rewritten as follows:
     * {{{
     *  select {
     *    case x <- ?ch1 => ?handlech1
@@ -1307,15 +1303,16 @@ object SpecializeAndLower {
   }
 
   /**
-    * Returns the list of MpmcAdmin objects passed to `selectFrom`. Each case
+    * Make the list of MpmcAdmin objects which will be passed to `selectFrom`.
+    *
+    * For each case like
     * {{{ x <- ?ch1 => ?handlech1 }}}
-    * generates
+    * we generate
     * {{{ mpmcAdmin(x) }}}
     */
   private def mkChannelAdminList(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], loc: SourceLocation)(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
     val admins = ListOps.zip(rs, channels) map {
       case ((_, _, _, rawChanTpe), (chanSym, _)) =>
-        // groundArrowTpe/lookup key built from the RAW channel type — see SelectChannel case's doc comment.
         val groundArrowTpe = lowerType(Type.mkPureArrow(rawChanTpe, Types.Concurrent.Channel.MpmcAdmin, loc))
         val defnSym = lookupSym(Defs.Concurrent.Channel.MpmcAdmin, groundArrowTpe)
         MonoAst.Expr.ApplyDef(defnSym, List(MonoAst.Expr.Var(chanSym, visitTypeSubstituted(rawChanTpe), loc)), Specialize.rewriteEnumStructType(groundArrowTpe), Types.Concurrent.Channel.MpmcAdmin, Type.Pure, loc)
@@ -1324,11 +1321,14 @@ object SpecializeAndLower {
   }
 
   /**
-    * Returns a call to `selectFrom` given a list of MpmcAdmin objects and an optional default:
+    * Construct a call to `selectFrom` given a list of MpmcAdmin objects and optional default.
+    *
+    * Transforms
     * {{{ mpmcAdmin(ch1), mpmcAdmin(ch1), ... }}}
-    * becomes
+    * Into
     * {{{ selectFrom(mpmcAdmin(ch1) :: mpmcAdmin(ch2) :: ... :: Nil, false) }}}
-    * `false` is `true` instead when `default` is `Some`.
+    *
+    * The second parameter is `true` (blocking) when `default` is `None`, `false` otherwise.
     */
   private def mkChannelSelect(admins: MonoAst.Expr, default: Option[MonoAst.Expr], loc: SourceLocation)(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
     val locksType = Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc)
@@ -1344,9 +1344,11 @@ object SpecializeAndLower {
   }
 
   /**
-    * Returns the MatchRules for `rs`. The `i`'th
+    * Construct a sequence of MatchRules corresponding to the given SelectChannelRules
+    *
+    * Transforms the `i`'th
     * {{{ case x <- ?ch1 => ?handlech1 }}}
-    * becomes
+    * into
     * {{{
     * case (i, locks) =>
     *   let x = unsafeGetAndUnlock(ch1, locks);
@@ -1354,7 +1356,6 @@ object SpecializeAndLower {
     * }}}
     */
   private def mkChannelCases(rs: List[(Symbol.VarSym, MonoAst.Expr, MonoAst.Expr, Type)], channels: List[(Symbol.VarSym, MonoAst.Expr)], eff: Type, loc: SourceLocation)(implicit tables: SpecializationTables, root: TypedAst.Root, flix: Flix): List[MonoAst.MatchRule] = {
-    // RAW (lookup-key form) and rewritten (node-field form) both needed — see doc comment above.
     val locksTypeRaw = Types.List.mkList(Types.Concurrent.ReentrantLock.ReentrantLock, loc)
     val locksType = Specialize.rewriteEnumStructType(locksTypeRaw)
 
@@ -1362,7 +1363,6 @@ object SpecializeAndLower {
       case (((sym, _, exp, rawChanTpe), (chSym, _)), i) =>
         val locksSym = mkLetSym("locks", loc)
         val pat = mkTuplePattern(Nel(MonoAst.Pattern.Cst(Constant.Int32(i), Type.Int32, loc), List(MonoAst.Pattern.Var(locksSym, locksType, Occur.Unknown, loc))), loc)
-        // getTpe/groundArrowTpe/lookup key built from the RAW channel type — see SelectChannel's doc comment.
         val getTpe = extractChannelTpe(rawChanTpe)
         val groundArrowTpe = lowerType(Type.mkIoUncurriedArrow(Nel.of(rawChanTpe, locksTypeRaw), getTpe, loc))
         val args = List(MonoAst.Expr.Var(chSym, visitTypeSubstituted(rawChanTpe), loc), MonoAst.Expr.Var(locksSym, locksType, loc))
@@ -1374,9 +1374,11 @@ object SpecializeAndLower {
   }
 
   /**
-    * Returns the MatchRule for the optional default case, or an empty list if `default` is `None`:
+    * Construct additional MatchRule to handle the (optional) default case
+    * NB: Does not need to unlock because that is handled inside Concurrent/Channel.selectFrom.
+    *
+    * If `default` is `None` returns an empty list. Otherwise produces
     * {{{ case (-1, _) => ?default }}}
-    * No unlock is needed here — that's handled inside `Concurrent/Channel.selectFrom`.
     */
   private def mkSelectDefaultCase(default: Option[MonoAst.Expr], loc: SourceLocation)(implicit tables: SpecializationTables): List[MonoAst.MatchRule] = {
     default match {
@@ -1394,41 +1396,43 @@ object SpecializeAndLower {
     * Returns a desugared [[TypedAst.Expr.ParYield]] expression as a nested match-expression.
     */
   private def mkParYield(frags: List[(MonoAst.Pattern, MonoAst.Expr, Type, SourceLocation)], exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: SpecializationTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
-    // Only generate channels for n-1 fragments; the last fragment runs on the current thread.
+    // Only generate channels for n-1 fragments. We use the current thread for the last fragment.
     val fs = frags.init
     val last = frags.last
 
+    // Generate symbols for each channel.
     val chanSymsWithPatAndExp = fs.map { case (p, e, rawTpe, l) => (p, mkLetSym("channel", l.asSynthetic), e, rawTpe) }
 
+    // Make `GetChannel` exps for the spawnable exps.
     val waitExps = mkBoundParWaits(chanSymsWithPatAndExp, exp)
 
+    // Evaluate the last expression in the current thread (so just make let-binding)
     val desugaredYieldExp = mkLetMatch(last._1, last._2, waitExps)
 
+    // Generate channels and spawn exps.
     val chanSymsWithExp = chanSymsWithPatAndExp.map { case (_, s, e, rawTpe) => (s, e, rawTpe) }
     val blockExp = mkParChannels(desugaredYieldExp, chanSymsWithExp)
 
+    // Wrap everything in a purity cast.
     MonoAst.Expr.Cast(blockExp, lowerType(tpe), eff, loc.asSynthetic)
   }
 
   /**
-    * Returns a full `par yield` expression. `chanSymsWithExps` holds, per fragment, its channel
-    * sym, visited value expr, and RAW substituted type — the RAW type is needed for
-    * mkPutChannel/mkNewChannel's own def-lookup keys (see mkGetChannel's doc comment for why
-    * `e.tpe` alone, already enum/struct-rewritten, isn't safe to reuse here).
+    * Returns a full `par yield` expression.
     */
   private def mkParChannels(exp: MonoAst.Expr, chanSymsWithExps: List[(Symbol.VarSym, MonoAst.Expr, Type)])(implicit tables: SpecializationTables, root: TypedAst.Root, flix: Flix): MonoAst.Expr = {
-    // Builds `spawn ch <- exp` for each fragment.
+    // Make spawn expressions `spawn ch <- exp`.
     val spawns = chanSymsWithExps.foldRight(exp: MonoAst.Expr) {
       case ((sym, e, rawTpe), acc) =>
         val loc = e.loc.asSynthetic
-        val e1 = mkChannelExp(sym, rawTpe, loc)
-        val e2 = mkPutChannel(e1, e, mkChannelTpe(rawTpe, loc), rawTpe, Type.IO, loc)
+        val e1 = mkChannelExp(sym, rawTpe, loc) // The channel `ch`
+        val e2 = mkPutChannel(e1, e, mkChannelTpe(rawTpe, loc), rawTpe, Type.IO, loc) // The put exp: `ch <- exp0`.
         val e3 = MonoAst.Expr.Cst(Constant.Static, Type.mkRegionToStar(Type.IO, loc), loc)
-        val e4 = MonoAst.Expr.ApplyAtomic(AtomicOp.Spawn, List(e2, e3), Type.Unit, Type.IO, loc)
-        MonoAst.Expr.Stm(List(e4), acc, acc.tpe, Type.mkUnion(e4.eff, acc.eff, loc), loc)
+        val e4 = MonoAst.Expr.ApplyAtomic(AtomicOp.Spawn, List(e2, e3), Type.Unit, Type.IO, loc) // Spawn the put expression from above i.e. `spawn ch <- exp0`.
+        MonoAst.Expr.Stm(List(e4), acc, acc.tpe, Type.mkUnion(e4.eff, acc.eff, loc), loc) // Return a statement expression containing the other spawn expressions along with this one.
     }
 
-    // Wraps `spawns` in `let ch = chan 1;` bindings for each fragment's channel.
+    // Make let bindings `let ch = chan 1;`.
     chanSymsWithExps.foldRight(spawns: MonoAst.Expr) {
       case ((sym, e, rawTpe), acc) =>
         val loc = e.loc.asSynthetic
@@ -1437,7 +1441,9 @@ object SpecializeAndLower {
     }
   }
 
-  /** Returns a new channel expression. */
+  /**
+    * Make a new channel expression
+    */
   private def mkNewChannel(exp: MonoAst.Expr, tpe: Type, eff: Type, loc: SourceLocation)(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
     val groundArrowTpe = lowerType(Type.mkIoArrow(exp.tpe, tpe, loc))
     val defnSym = lookupSym(Defs.Concurrent.Channel.NewChannel, groundArrowTpe)
@@ -1489,17 +1495,16 @@ object SpecializeAndLower {
 
   /**
     * An expression for a channel variable called `sym`.
-    *
-    * `tpe` is the RAW element type; the constructed channel type is rewritten here so this Var's
-    * own type field matches how `mkNewChannel` actually specialized the channel `sym` is bound to
-    * (which rewrites its own return type) — otherwise the let-bound value and every subsequent
-    * reference to `sym` disagree on the channel's type (fresh sym vs. original).
     */
   private def mkChannelExp(sym: Symbol.VarSym, tpe: Type, loc: SourceLocation)(implicit tables: SpecializationTables): MonoAst.Expr = {
     MonoAst.Expr.Var(sym, Specialize.rewriteEnumStructType(mkChannelTpe(tpe, loc)), loc)
   }
 
-  /** Returns a list expression constructed from `exps` with type list of `elmType` (assumed specialized and lowered). */
+  /**
+    * Returns a list expression constructed from the given `exps` with type list of `elmType`.
+    *
+    * @param elmType is assumed to be specialized and lowered. (Not yet struct/enum type rewritten)
+    */
   private def mkList(exps: List[MonoAst.Expr], elmType: Type, loc: SourceLocation)(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
     val nil = mkNil(elmType, loc)
     exps.foldRight(nil) {
@@ -1507,34 +1512,26 @@ object SpecializeAndLower {
     }
   }
 
-  /** Returns a `Nil` expression with type list of `elmType` (assumed specialized and lowered). */
+  /**
+    * Returns a `Nil` expression with type list of `elmType`.
+    *
+    * @param elmType is assumed to be specialized and lowered. (Not yet struct/enum type rewritten)
+    */
   private def mkNil(elmType: Type, loc: SourceLocation)(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
     mkTag(Enums.List.List, "Nil", Nil, Types.List.mkList(elmType, loc), loc)
   }
 
   /**
-    * Returns a `Cons(hd, tail)` expression with type list of `elmType`.
-    *
-    * `elmType` is threaded explicitly from `mkList` rather than read off `tail.tpe`: once `mkTag`
-    * rewrites its own returned type (Step 2), `tail.tpe` for every cell but the innermost `Nil` is
-    * already POST-rewrite (fresh sym, `Nil` args) — using it as the next `lookupCaseSym` key would
-    * vacuously hit the "non-generic, keep original" branch and silently tag `Cons` with the wrong
-    * (unspecialized) case sym while `Nil` got the fresh one.
+    * returns a `Cons(hd, tail)` expression with type list of `elmType`.
     */
   private def mkCons(hd: MonoAst.Expr, tail: MonoAst.Expr, elmType: Type, loc: SourceLocation)(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
     mkTag(Enums.List.List, "Cons", List(hd, tail), Types.List.mkList(elmType, loc), loc)
   }
 
   /**
-    * Returns a pure tag expression for `sym`/`tag` wrapping `exps`. `tpe` is the specialized,
-    * lowered but NOT YET enum/struct-rewritten type, used both as `lookupCaseSym`'s key and
-    * (rewritten) as the returned node's own type.
+    * Returns a pure tag expression for the given `sym` and given `tag` with the given inner expression `exp`.
     *
-    * `sym` is almost always non-generic (Datalog/PredSym/etc. runtime AST nodes); the two
-    * actually-generic exceptions are `Enums.List.List` (`mkNil`/`mkCons`) and
-    * `Enums.Fixpoint.Ast.Shared.Denotation` (`mkDenotation`'s `Relational` case). Synthesizes its
-    * own `AtomicOp.Tag` node directly instead of going through `visitExp`'s Tag case, so it must
-    * do its own strict case-sym lookup and enum/struct-type rewrite.
+    * @param tpe is assumed to be specialized and lowered. (Not yet struct/enum type rewritten)
     */
   private def mkTag(sym: Symbol.EnumSym, tag: String, exps: List[MonoAst.Expr], tpe: Type, loc: SourceLocation)(implicit tables: SpecializationTables, root: TypedAst.Root): MonoAst.Expr = {
     val caseSym0 = findCaseSym(sym, tag)
@@ -1549,13 +1546,21 @@ object SpecializeAndLower {
   private def findCaseSym(sym: Symbol.EnumSym, name: String)(implicit root: TypedAst.Root): Symbol.CaseSym =
     root.enums(sym).cases.values.find(_.sym.name == name).get.sym
 
-  /** Returns `(t1, t2)` where `tpe = Concurrent.Channel.Mpmc[t1, t2]`. `tpe` is assumed specialized, but not lowered. */
+  /**
+    * Returns `(t1, t2)` where `tpe = Concurrent.Channel.Mpmc[t1, t2]`.
+    *
+    * @param tpe is assumed to be specialized, but not lowered.
+    */
   private def extractChannelTpe(tpe: Type): Type = tpe match {
     case Type.Apply(Type.Apply(Types.Concurrent.Channel.Mpmc, elmType, _), _, _) => elmType
     case _ => throw InternalCompilerException(s"Cannot interpret '$tpe' as a channel type", tpe.loc)
   }
 
-  /** Returns a tuple pattern of `patterns` (assumed to contain specialized and lowered types). */
+  /**
+    * Returns a TypedAst.Pattern representing a tuple of patterns.
+    *
+    * @param patterns are assumed to contain specialized and lowered types.
+    */
   private def mkTuplePattern(patterns: Nel[MonoAst.Pattern], loc: SourceLocation): MonoAst.Pattern = {
     MonoAst.Pattern.Tuple(patterns, Type.mkTuple(patterns.map(_.tpe), loc), loc)
   }
