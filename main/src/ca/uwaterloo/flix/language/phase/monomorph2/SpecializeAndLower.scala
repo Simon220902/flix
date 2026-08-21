@@ -704,19 +704,15 @@ object SpecializeAndLower {
       MonoAst.Expr.ApplyDef(defn, argExps, Types.Fixpoint.Solver.MergeType, resultType, subst(eff), loc)
 
     case TypedAst.Expr.FixpointQueryWithProvenance(exps, select, withh, tpe0, eff, loc) =>
-      // Synthesizes a call to the Fixpoint solver's provenanceOf function.
       lowerQueryWithProvenance(exps, select, withh, subst(tpe0), subst(eff), loc, env0, subst)
 
     case TypedAst.Expr.FixpointQueryWithSelect(exps, queryExp, selects, _, _, pred, tpe, eff, loc) =>
-      // Synthesizes Fixpoint solver solve+facts calls.
       lowerQueryWithSelect(exps, queryExp, selects.length, pred, subst(tpe), subst(eff), loc, env0, subst)
 
     case TypedAst.Expr.FixpointSolveWithProject(exps, optPreds, mode, _, eff, loc) =>
-      // Synthesizes Fixpoint solver solve+project calls.
       lowerSolveWithProject(exps, optPreds, mode, subst(eff), loc, env0, subst)
 
     case TypedAst.Expr.FixpointInjectInto(exps, predsAndArities, _, _, loc) =>
-      // Synthesizes Fixpoint solver projectInto calls.
       lowerInjectInto(exps, predsAndArities, loc, env0, subst)
 
     case TypedAst.Expr.ApplySig(symUse, exps, _, _, itpe0, tpe, eff, _, loc) =>
