@@ -264,31 +264,35 @@ object Specialize {
 
   /** Returns every def reachable from `root`. */
   private def mkAllDefs(root: TypedAst.Root): AllDefs = {
-    val allInstanceDefs: Map[Symbol.DefnSym, TypedAst.Def] = (for {
+    val instanceDefPairs = for {
       inst <- root.instances.values
       d    <- inst.defs
-    } yield d.sym -> d).toMap
+    } yield d.sym -> d
+    val allInstanceDefs: Map[Symbol.DefnSym, TypedAst.Def] = instanceDefPairs.toMap
 
-    val defToInst: Map[Symbol.DefnSym, TypedAst.Instance] = (for {
+    val defToInstPairs = for {
       inst <- root.instances.values
       d    <- inst.defs
-    } yield d.sym -> inst).toMap
+    } yield d.sym -> inst
+    val defToInst: Map[Symbol.DefnSym, TypedAst.Instance] = defToInstPairs.toMap
 
-    val defaultSigDefs: Map[Symbol.DefnSym, TypedAst.Def] = (for {
-      sig    <- root.sigs.values
-      exp    <- sig.exp
+    val defaultSigDefPairs = for {
+      sig <- root.sigs.values
+      exp <- sig.exp
     } yield {
       val defnSym = MonomorphHelpers.defaultSigImplSym(sig)
       defnSym -> TypedAst.Def(defnSym, sig.spec, exp, sig.sym.loc)
-    }).toMap
+    }
+    val defaultSigDefs: Map[Symbol.DefnSym, TypedAst.Def] = defaultSigDefPairs.toMap
 
-    val defaultSigTraitTparams: Map[Symbol.DefnSym, List[TypedAst.TypeParam]] = (for {
-      sig    <- root.sigs.values
-      _      <- sig.exp // Filters out sigs without a default impl.
+    val defaultSigTraitTparamPairs = for {
+      sig <- root.sigs.values
+      _   <- sig.exp // Filters out sigs without a default impl.
     } yield {
       val defnSym = MonomorphHelpers.defaultSigImplSym(sig)
       defnSym -> List(root.traits(sig.sym.trt).tparam)
-    }).toMap
+    }
+    val defaultSigTraitTparams: Map[Symbol.DefnSym, List[TypedAst.TypeParam]] = defaultSigTraitTparamPairs.toMap
 
     val prefixTparams: Map[Symbol.DefnSym, List[TypedAst.TypeParam]] =
       MapOps.mapValues(defToInst)(_.tparams) ++ defaultSigTraitTparams
