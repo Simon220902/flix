@@ -232,42 +232,43 @@ object ConstraintGen {
       val loc = defn.spec.eff.loc
       val defEffects = Canonicalization.evalEff(defn.spec.eff)
       val requiredHandlers = root.defaultHandlers.filter(h => defEffects.contains(h.handledSym))
-      requiredHandlers.foldLeft(defn.spec.eff) { case (eff, handler) =>
-        val handlerDef = root.defs(handler.handlerSym)
-        val handlerTparams = handlerDef.spec.tparams
-        // E.g. imagine we have this effect declaration:
-        // {{{
-        //   eff Ask {
-        //       def ask(): Int32
-        //   }
-        // }}}
-        // with this default handler declaration:
-        // {{{
-        //   mod Ask {
-        //       @DefaultHandler
-        //       def handle(f: Unit -> a \ ef): a \ (ef - Ask) + IO = ...
-        //   }
-        // }}}
-        // which will then be (implicitly) used at this entry point:
-        // {{{
-        //   def main(): Unit \ Ask + IO = println(Ask.ask())
-        // }}}
-        // `SpecializeAndLower` will synthesize a call `Ask.handle(() -> <main's body>)` around
-        // `main`, so we must create the flow:
-        // {{{
-        //   [Unit, Ask + IO] ~> Ask.handle
-        // }}}
-        //
-        // N.B. We use full unification rather than reading `a`/`ef` off fixed positions because
-        // a default handler's parameter type only has to be *equal* to `Unit -> a \ ef`, not
-        // written that way syntactically — e.g. `f: Unit -> a \ (ef + Pure)` is a valid handler
-        // parameter type too.
-        val concreteParamTpe = Type.mkArrowWithEffect(Type.Unit, eff, defn.spec.retTpe, loc)
-        val subst = ConstraintSolver2.fullyUnify(handlerDef.spec.fparams.head.tpe, concreteParamTpe, RegionScope.Top, RigidityEnv.empty)(root.eqEnv, flix)
-          .getOrElse(throw InternalCompilerException(s"Could not unify default handler '${handler.handlerSym}' against its call site.", loc))
-        val args = handlerTparams.map(tp => typeToMonoArg(subst(Type.Var(tp.sym, loc))))
-        sctx.addFlowConstraint(FlowConstraint(Instantiation(args), MonoVar.Def(handler.handlerSym)))
-        Canonicalization.canonicalEffect(Type.mkUnion(Type.mkDifference(eff, handler.handledEff, loc), Type.IO, loc))
+      requiredHandlers.foldLeft(defn.spec.eff) {
+        case (eff, handler) =>
+          val handlerDef = root.defs(handler.handlerSym)
+          val handlerTparams = handlerDef.spec.tparams
+          // E.g. imagine we have this effect declaration:
+          // {{{
+          //   eff Ask {
+          //       def ask(): Int32
+          //   }
+          // }}}
+          // with this default handler declaration:
+          // {{{
+          //   mod Ask {
+          //       @DefaultHandler
+          //       def handle(f: Unit -> a \ ef): a \ (ef - Ask) + IO = ...
+          //   }
+          // }}}
+          // which will then be (implicitly) used at this entry point:
+          // {{{
+          //   def main(): Unit \ Ask + IO = println(Ask.ask())
+          // }}}
+          // `SpecializeAndLower` will synthesize a call `Ask.handle(() -> <main's body>)` around
+          // `main`, so we must create the flow:
+          // {{{
+          //   [Unit, Ask + IO] ~> Ask.handle
+          // }}}
+          //
+          // N.B. We use full unification rather than reading `a`/`ef` off fixed positions because
+          // a default handler's parameter type only has to be *equal* to `Unit -> a \ ef`, not
+          // written that way syntactically — e.g. `f: Unit -> a \ (ef + Pure)` is a valid handler
+          // parameter type too.
+          val concreteParamTpe = Type.mkArrowWithEffect(Type.Unit, eff, defn.spec.retTpe, loc)
+          val subst = ConstraintSolver2.fullyUnify(handlerDef.spec.fparams.head.tpe, concreteParamTpe, RegionScope.Top, RigidityEnv.empty)(root.eqEnv, flix)
+            .getOrElse(throw InternalCompilerException(s"Could not unify default handler '${handler.handlerSym}' against its call site.", loc))
+          val args = handlerTparams.map(tp => typeToMonoArg(subst(Type.Var(tp.sym, loc))))
+          sctx.addFlowConstraint(FlowConstraint(Instantiation(args), MonoVar.Def(handler.handlerSym)))
+          Canonicalization.canonicalEffect(Type.mkUnion(Type.mkDifference(eff, handler.handledEff, loc), Type.IO, loc))
       }
       ()
     }

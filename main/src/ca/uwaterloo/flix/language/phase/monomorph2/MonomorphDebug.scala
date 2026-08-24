@@ -82,20 +82,21 @@ private[monomorph2] object MonomorphDebug {
     sb.append("\n")
 
     var seedCount = 0
-    flows.foreach { case FlowConstraint(Instantiation(args), dst) =>
-      val srcMVars = args.flatMap(collectMonoVars)
-      val label = args.map(monoArgLabel).mkString(", ")
-      if (srcMVars.isEmpty) {
-        val sid = s"seed$seedCount"
-        seedCount += 1
-        sb.append(s"""  $sid [label="${dotEscape(label)}", shape=plaintext];\n""")
-        sb.append(s"""  $sid -> ${dotId(dst)};\n""")
-      } else {
-        srcMVars.distinct.foreach {
-          src =>
-            sb.append(s"""  ${dotId(src)} -> ${dotId(dst)} [label="${dotEscape(label)}"];\n""")
+    flows.foreach {
+      case FlowConstraint(Instantiation(args), dst) =>
+        val srcMVars = args.flatMap(collectMonoVars)
+        val label = args.map(monoArgLabel).mkString(", ")
+        if (srcMVars.isEmpty) {
+          val sid = s"seed$seedCount"
+          seedCount += 1
+          sb.append(s"""  $sid [label="${dotEscape(label)}", shape=plaintext];\n""")
+          sb.append(s"""  $sid -> ${dotId(dst)};\n""")
+        } else {
+          srcMVars.distinct.foreach {
+            src =>
+              sb.append(s"""  ${dotId(src)} -> ${dotId(dst)} [label="${dotEscape(label)}"];\n""")
+          }
         }
-      }
     }
 
     sb.append("}\n")
@@ -125,15 +126,17 @@ private[monomorph2] object MonomorphDebug {
 
   /** Returns a plain-text listing of `flows`, one line per flow: `<args> -> <destination>`. */
   private def flowsToText(flows: List[FlowConstraint]): String =
-    flows.map { case FlowConstraint(Instantiation(args), dst) =>
-      s"${args.map(monoArgLabel).mkString(", ")} -> ${monoVarLabel(dst)}"
+    flows.map {
+      case FlowConstraint(Instantiation(args), dst) =>
+        s"${args.map(monoArgLabel).mkString(", ")} -> ${monoVarLabel(dst)}"
     }.sorted.mkString("\n")
 
   /** Returns a plain-text listing of `solution`: summary stats, then every solved tuple by category. */
   private def solutionToText(solution: Solution): String = {
     def section[K](title: String, mk: K => MonoVar, m: Map[K, List[GroundInstantiation]]): String = {
-      val lines = m.toList.map { case (k, tuples) =>
-        s"${monoVarLabel(mk(k))} -> ${tuples.map(t => s"[${t.args.mkString(", ")}]").sorted.mkString(", ")}"
+      val lines = m.toList.map {
+        case (k, tuples) =>
+          s"${monoVarLabel(mk(k))} -> ${tuples.map(t => s"[${t.args.mkString(", ")}]").sorted.mkString(", ")}"
       }.sorted
       s"$title (${m.size} symbols, ${m.values.map(_.size).sum} tuples):\n" + lines.mkString("\n")
     }
