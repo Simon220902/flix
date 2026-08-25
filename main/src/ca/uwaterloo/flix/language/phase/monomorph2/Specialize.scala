@@ -264,35 +264,31 @@ object Specialize {
 
   /** Returns every def reachable from `root`. */
   private def mkAllDefs(root: TypedAst.Root): AllDefs = {
-    val instanceDefPairs = for {
+    val allInstanceDefs: Map[Symbol.DefnSym, TypedAst.Def] = (for {
       inst <- root.instances.values
       d    <- inst.defs
-    } yield d.sym -> d
-    val allInstanceDefs: Map[Symbol.DefnSym, TypedAst.Def] = instanceDefPairs.toMap
+    } yield d.sym -> d).toMap
 
-    val defToInstPairs = for {
+    val defToInst: Map[Symbol.DefnSym, TypedAst.Instance] = (for {
       inst <- root.instances.values
       d    <- inst.defs
-    } yield d.sym -> inst
-    val defToInst: Map[Symbol.DefnSym, TypedAst.Instance] = defToInstPairs.toMap
+    } yield d.sym -> inst).toMap
 
-    val defaultSigDefPairs = for {
-      sig <- root.sigs.values
-      exp <- sig.exp
+    val defaultSigDefs: Map[Symbol.DefnSym, TypedAst.Def] = (for {
+      sig    <- root.sigs.values
+      exp    <- sig.exp
     } yield {
       val defnSym = MonomorphHelpers.defaultSigImplSym(sig)
       defnSym -> TypedAst.Def(defnSym, sig.spec, exp, sig.sym.loc)
-    }
-    val defaultSigDefs: Map[Symbol.DefnSym, TypedAst.Def] = defaultSigDefPairs.toMap
+    }).toMap
 
-    val defaultSigTraitTparamPairs = for {
-      sig <- root.sigs.values
-      _   <- sig.exp // Filters out sigs without a default impl.
+    val defaultSigTraitTparams: Map[Symbol.DefnSym, List[TypedAst.TypeParam]] = (for {
+      sig    <- root.sigs.values
+      _      <- sig.exp // Filters out sigs without a default impl.
     } yield {
       val defnSym = MonomorphHelpers.defaultSigImplSym(sig)
       defnSym -> List(root.traits(sig.sym.trt).tparam)
-    }
-    val defaultSigTraitTparams: Map[Symbol.DefnSym, List[TypedAst.TypeParam]] = defaultSigTraitTparamPairs.toMap
+    }).toMap
 
     val prefixTparams: Map[Symbol.DefnSym, List[TypedAst.TypeParam]] =
       MapOps.mapValues(defToInst)(_.tparams) ++ defaultSigTraitTparams
@@ -337,10 +333,9 @@ object Specialize {
       val substMap = ListOps.zip(enm.tparams, args).map { case (tp, ty) => tp.sym -> ty }.toMap
       val freshSym = Symbol.freshEnumSym(enm.sym)
       val subst = StrictSubstitution.mk(Substitution(substMap))
-      val newCases = enm.cases.map {
-        case (caseSym, TypedAst.Case(_, tpes, sc, cloc)) =>
-          val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, caseSym.ordinal, caseSym.loc)
-          newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
+      val newCases = enm.cases.map { case (caseSym, TypedAst.Case(_, tpes, sc, cloc)) =>
+        val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, caseSym.ordinal, caseSym.loc)
+        newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
       }
       val newEnum = TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc)
       (sym, args, freshSym, newEnum)
@@ -360,10 +355,9 @@ object Specialize {
       val substMap = ListOps.zip(enm.index :: enm.tparams, args).map { case (tp, ty) => tp.sym -> ty }.toMap
       val freshSym = Symbol.freshEnumSym(SpecializeAndLower.lowerRestrictableEnumSym(sym))
       val subst = StrictSubstitution.mk(Substitution(substMap))
-      val newCases = enm.cases.map {
-        case (caseSym, TypedAst.RestrictableCase(_, tpes, sc, cloc)) =>
-          val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, Symbol.CaseSym.NoOrdinal, caseSym.loc)
-          newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
+      val newCases = enm.cases.map { case (caseSym, TypedAst.RestrictableCase(_, tpes, sc, cloc)) =>
+        val newCaseSym = new Symbol.CaseSym(freshSym, caseSym.name, Symbol.CaseSym.NoOrdinal, caseSym.loc)
+        newCaseSym -> TypedAst.Case(newCaseSym, tpes.map(subst.apply), sc, cloc)
       }
       val newEnum = TypedAst.Enum(enm.doc, enm.ann, enm.mod, freshSym, Nil, enm.derives, newCases, enm.loc)
       (sym, args, freshSym, newEnum)
@@ -383,10 +377,9 @@ object Specialize {
       val substMap = ListOps.zip(struct.tparams, args).map { case (tp, ty) => tp.sym -> ty }.toMap
       val freshSym = Symbol.freshStructSym(struct.sym)
       val subst = StrictSubstitution.mk(Substitution(substMap))
-      val newFields = struct.fields.map {
-        case (fieldSym, TypedAst.StructField(_, tpe, floc)) =>
-          val newFieldSym = new Symbol.StructFieldSym(freshSym, fieldSym.name, fieldSym.loc)
-          newFieldSym -> TypedAst.StructField(newFieldSym, subst(tpe), floc)
+      val newFields = struct.fields.map { case (fieldSym, TypedAst.StructField(_, tpe, floc)) =>
+        val newFieldSym = new Symbol.StructFieldSym(freshSym, fieldSym.name, fieldSym.loc)
+        newFieldSym -> TypedAst.StructField(newFieldSym, subst(tpe), floc)
       }
       val newStruct = TypedAst.Struct(struct.doc, struct.ann, struct.mod, freshSym, Nil, struct.sc, newFields, struct.loc)
       (sym, args, freshSym, newStruct)
@@ -399,19 +392,19 @@ object Specialize {
     val AllDefs(allDefs, defToInst, defaultSigDefs, prefixTparams) = mkAllDefs(root)
 
     val entries = mkDefEntries(solution, allDefs, prefixTparams)
-    val defTableMap =
+    val defTableMap: Map[(Symbol.DefnSym, Type), Symbol.DefnSym] =
       entries.map { case (freshSym, defn, _, it) => (defn.sym, it) -> freshSym }.toMap
 
     val enumEntries = mkEnumEntries(solution)
-    val enumTableMap =
+    val enumTableMap: Map[(Symbol.EnumSym, List[Type]), Symbol.EnumSym] =
       enumEntries.map { case (sym, args, freshSym, _) => (sym, args) -> freshSym }.toMap
 
     val structEntries = mkStructEntries(solution)
-    val structTableMap =
+    val structTableMap: Map[(Symbol.StructSym, List[Type]), Symbol.StructSym] =
       structEntries.map { case (sym, args, freshSym, _) => (sym, args) -> freshSym }.toMap
 
     val restrictableEnumEntries = mkRestrictableEnumEntries(solution)
-    val restrictableEnumTableMap =
+    val restrictableEnumTableMap: Map[(Symbol.RestrictableEnumSym, List[Type]), Symbol.EnumSym] =
       restrictableEnumEntries.map { case (sym, args, freshSym, _) => (sym, args) -> freshSym }.toMap
 
     val is: Map[(Symbol.TraitSym, TypeConstructor), Instance] = MonomorphHelpers.mkInstanceMap(root.instances)
@@ -421,23 +414,23 @@ object Specialize {
     // Create specialized and lowered versions of the different families of declarations
 
     // Biggest-first scheduling to preload long-tailed jobs
-    def negativeLineCount(defn: TypedAst.Def): Int = defn.loc.startLine - defn.loc.endLine
+    def sortByLineSpan(defn: TypedAst.Def): Int = defn.loc.startLine - defn.loc.endLine
 
-    val nonParametricDefEntries = allDefs.filter {
-      case (sym, defn) =>
-        defn.spec.tparams.isEmpty &&
-          defToInst.get(sym).forall(_.tparams.isEmpty) &&
-          !defaultSigDefs.contains(sym)
-    }
     val nonParametricDefs: Map[Symbol.DefnSym, MonoAst.Def] =
-      ParOps.parMapWithPriority(nonParametricDefEntries, sortBy = ({ case (_, defn) => negativeLineCount(defn) }: ((Symbol.DefnSym, TypedAst.Def)) => Int)) {
+      ParOps.parMapWithPriority(allDefs.filter {
+        case (sym, defn) =>
+          defn.spec.tparams.isEmpty &&
+            defToInst.get(sym).forall(_.tparams.isEmpty) &&
+            !defaultSigDefs.contains(sym)
+        },
+        sortBy = ({ case (_, defn) => sortByLineSpan(defn) }: ((Symbol.DefnSym, TypedAst.Def)) => Int)) {
         case (sym, defn) => sym -> flix.profile(defn.sym, defn.loc) {
           SpecializeAndLower.visitDef(sym, defn, StrictSubstitution.empty)
         }
       }.toMap
 
     val specializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
-      ParOps.parMapWithPriority(entries, sortBy = ({ case (_, defn, _, _) => negativeLineCount(defn) }: ((Symbol.DefnSym, TypedAst.Def, StrictSubstitution, Type)) => Int)) {
+      ParOps.parMapWithPriority(entries, sortBy = ({ case (_, defn, _, _) => sortByLineSpan(defn) }: ((Symbol.DefnSym, TypedAst.Def, StrictSubstitution, Type)) => Int)) {
         case (freshSym, defn, subst, _) => freshSym -> flix.profile(defn.sym, defn.loc) {
           SpecializeAndLower.visitDef(freshSym, defn, subst)
         }
