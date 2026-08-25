@@ -21,6 +21,7 @@ import ca.uwaterloo.flix.language.ast.shared.{JConstructor, JMethod}
 import ca.uwaterloo.flix.language.ast.{AtomicOp, SimpleType}
 import ca.uwaterloo.flix.language.ast.JvmAst.*
 import ca.uwaterloo.flix.language.phase.jvm.Instructions.*
+import ca.uwaterloo.flix.language.phase.jvm.classes.GenResult
 import ca.uwaterloo.flix.language.phase.jvm.ClassMaker.Final.{IsFinal, NotFinal}
 import ca.uwaterloo.flix.language.phase.jvm.ClassMaker.Visibility.IsPublic
 import ca.uwaterloo.flix.language.phase.jvm.ClassMaker.Volatility.NotVolatile
@@ -28,7 +29,7 @@ import ca.uwaterloo.flix.util.InternalCompilerException
 import org.objectweb.asm.{MethodVisitor, Opcodes}
 
 import java.lang.constant.{ClassDesc, MethodTypeDesc}
-import java.lang.constant.ConstantDescs.CD_void
+import java.lang.constant.ConstantDescs.{CD_Object, CD_void}
 import scala.jdk.CollectionConverters.*
 
 /** Generates bytecode for anonymous classes (created through NewObject). */
@@ -81,8 +82,8 @@ object GenAnonymousClasses {
       val descriptor = m.javaSig match {
         case Some(jm) => jm.descriptor
         case None =>
-          val ret = if (m.tpe == SimpleType.Unit) CD_void else BackendType.toClassDesc(m.tpe)
-          MethodTypeDesc.of(ret, m.fparams.tail.map(fp => BackendType.toClassDesc(fp.tpe)) *)
+          val ret = if (m.tpe == SimpleType.Unit) CD_void else TypeDescs.toClassDesc(m.tpe)
+          MethodTypeDesc.of(ret, m.fparams.tail.map(fp => TypeDescs.toClassDesc(fp.tpe)) *)
       }
       cm.mkMethod(m.ann, ClassMaker.InstanceMethod(className, m.ident.name, descriptor), IsPublic, NotFinal, methodIns(abstractClass, cloField, descriptor.returnType(), m)(_, root))
     }
@@ -118,8 +119,8 @@ object GenAnonymousClasses {
 
   /** Returns the erased abstract arrow class for the given parameter types and return type. */
   private def erasedArrowType(paramTypes: List[SimpleType], retTpe: SimpleType): BackendObjType.AbstractArrow = {
-    val boxedResult = BackendType.Object
-    BackendObjType.AbstractArrow(paramTypes.map(BackendType.toErasedBackendType), boxedResult)
+    val boxedResult = CD_Object
+    BackendObjType.AbstractArrow(paramTypes.map(TypeDescs.toErasedClassDesc), boxedResult)
   }
 
   /**
@@ -163,13 +164,13 @@ object GenAnonymousClasses {
   /** Creates code to read the arguments, load it into the `cloField` closure, call that function, and returns. */
   private def methodIns(abstractClass: BackendObjType.AbstractArrow, cloField: ClassMaker.InstanceField, actualRes: ClassDesc, m: JvmMethod)(implicit mv: MethodVisitor, root: Root): Unit = {
     val functionAbstractClass = abstractClass.superClass
-    val returnType = BackendType.toBackendType(m.tpe)
+    val returnType = TypeDescs.toClassDesc(m.tpe)
 
     thisLoad()
     GETFIELD(cloField)
     INVOKEVIRTUAL(abstractClass.GetUniqueThreadClosureMethod)
     // Load the actual arguments into the erased closure arguments.
-    withNames(0, m.fparams.map(_.tpe).map(BackendType.toClassDesc)) {
+    withNames(0, m.fparams.map(_.tpe).map(TypeDescs.toClassDesc)) {
       case (_, args) =>
         for ((arg, i) <- args.zipWithIndex) {
           DUP()
@@ -178,7 +179,7 @@ object GenAnonymousClasses {
         }
     }
     // Invoke the closure, leaving its result on the stack in the representation of `m.tpe`.
-    BackendObjType.Result.unwindSuspensionFreeThunkToType(returnType, s"in anonymous class method ${m.ident.name}", m.loc)
+    GenResult.unwindSuspensionFreeThunkToType(returnType, s"in anonymous class method ${m.ident.name}", m.loc)
 
     // Return the value using the method's erased JVM return type (`actualRes`). Any boxing
     // needed to feed a primitive result into a reference (e.g. `Object`) return has already
