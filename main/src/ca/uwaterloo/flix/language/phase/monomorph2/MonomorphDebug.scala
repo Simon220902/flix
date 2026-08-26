@@ -48,7 +48,7 @@ private[monomorph2] object MonomorphDebug {
   }
 
   /** Returns a short human-readable label for `mvar`, e.g. `Def(map)`. */
-  private[monomorph2] def monoVarLabel(mvar: MonoVar): String = mvar match {
+  private def monoVarLabel(mvar: MonoVar): String = mvar match {
     case MonoVar.Def(sym)              => s"Def(${sym.name})"
     case MonoVar.Enum(sym)             => s"Enum(${sym.name})"
     case MonoVar.Sig(sym)              => s"Sig(${sym.name})"
