@@ -432,7 +432,7 @@ private[monomorph2] object Specialize {
     // Biggest-first scheduling to preload long-tailed jobs
     def sortByLineSpan(defn: TypedAst.Def): Int = defn.loc.startLine - defn.loc.endLine
 
-    val nonParametricDefs: Map[Symbol.DefnSym, MonoAst.Def] =
+    val nonParametricDefs =
       ParOps.parMapWithPriority(allDefs.filter {
         case (sym, defn) =>
           defn.spec.tparams.isEmpty &&
@@ -446,7 +446,7 @@ private[monomorph2] object Specialize {
         }
       }.toMap
 
-    val specializedDefs: Map[Symbol.DefnSym, MonoAst.Def] =
+    val specializedDefs =
       ParOps.parMapWithPriority(entries, sortBy = ({ case (_, defn, _, _) => sortByLineSpan(defn) }: ((Symbol.DefnSym, TypedAst.Def, StrictSubstitution, Type)) => Int)) {
         case (freshSym, defn, subst, _) => freshSym -> flix.profile(defn.sym, defn.loc) {
           SpecializeAndLower.visitDef(freshSym, defn, subst)
