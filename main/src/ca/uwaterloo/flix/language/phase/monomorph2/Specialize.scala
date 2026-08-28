@@ -428,7 +428,8 @@ private[monomorph2] object Specialize {
         case (sym, defn) =>
           defn.spec.tparams.isEmpty &&
             defToInst.get(sym).forall(_.tparams.isEmpty) &&
-            !defaultSigDefs.contains(sym)
+            !defaultSigDefs.contains(sym) &&
+            (defToInst.get(sym).isEmpty || solution.defs.contains(sym))
         },
         sortBy = ({ case (_, defn) => sortByLineSpan(defn) }: ((Symbol.DefnSym, TypedAst.Def)) => Int)) {
 
